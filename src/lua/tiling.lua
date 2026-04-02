@@ -4472,11 +4472,45 @@ function M.set_state(saved, pty_lookup)
     prise.request_frame()
 end
 
+---Return info about the currently active tab.
+---@return { index: integer, title: string, pane_count: integer }?
+function M.get_active_tab_info()
+    local tab = get_active_tab()
+    if not tab then
+        return nil
+    end
+
+    return {
+        index = state.active_tab,
+        title = get_tab_title(tab, true),
+        pane_count = #collect_tab_panes(tab),
+    }
+end
+
+---Return the 1-based index of the focused pane within the active tab.
+---@return integer?
+function M.get_focused_pane_index()
+    local tab = get_active_tab()
+    if not tab or not state.focused_id then
+        return nil
+    end
+
+    local panes = collect_tab_panes(tab)
+    for i, pane in ipairs(panes) do
+        if pane.id == state.focused_id then
+            return i
+        end
+    end
+
+    return nil
+end
+
 -- Export internal functions for testing
 M._test = {
     is_pane = is_pane,
     is_split = is_split,
     collect_panes = collect_panes,
+    collect_tab_panes = collect_tab_panes,
     find_node_path = find_node_path,
     get_first_leaf = get_first_leaf,
     get_last_leaf = get_last_leaf,
