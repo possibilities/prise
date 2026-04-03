@@ -518,6 +518,17 @@ The **data** table uses the same fields as PTY key events:
 - **ctrl**, **alt**, **shift**, **super** - Optional modifier flags
 - **release** - Optional key release flag
 
+**ui.send_mouse_to_focused(data)**
+:   Send a mouse event to the focused pane, or to the visible floating pane
+    when one is open.
+
+The **data** table uses the same fields as PTY mouse events:
+
+- **col**, **row** - Optional pane-relative coordinates
+- **button** - Optional mouse button name
+- **action** - Optional mouse action such as press, release, or move
+- **ctrl**, **alt**, **shift** - Optional modifier flags
+
 # SEE ALSO
 
 [prise(1)](prise.1.html), [prise(7)](prise.7.html)
