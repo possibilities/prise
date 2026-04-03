@@ -4472,6 +4472,15 @@ function M.set_state(saved, pty_lookup)
     prise.request_frame()
 end
 
+---Send a key event to the focused pane's PTY.
+---@param data table Key event data: {key, code?, ctrl?, alt?, shift?, super?}
+function M.send_key_to_focused(data)
+    local pty = get_visible_floating_pty() or get_focused_pty()
+    if pty then
+        pty:send_key(data)
+    end
+end
+
 -- Export internal functions for testing
 M._test = {
     is_pane = is_pane,
