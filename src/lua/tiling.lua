@@ -4497,6 +4497,7 @@ M._test = {
     get_last_leaf = get_last_leaf,
     format_palette_item = format_palette_item,
     build_custom_tab_infos = build_custom_tab_infos,
+    build_tab_bar_custom = build_tab_bar_custom,
     close_tab = close_tab,
     remove_pane_by_id = remove_pane_by_id,
     set_active_tab_index = set_active_tab_index,
