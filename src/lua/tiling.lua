@@ -4481,6 +4481,15 @@ function M.send_key_to_focused(data)
     end
 end
 
+---Send a mouse event to the focused pane's PTY.
+---@param data PtyMouseData Mouse event data: {x, y, button, event_type, mods?}
+function M.send_mouse_to_focused(data)
+    local pty = get_visible_floating_pty() or get_focused_pty()
+    if pty then
+        pty:send_mouse(data)
+    end
+end
+
 -- Export internal functions for testing
 M._test = {
     is_pane = is_pane,
