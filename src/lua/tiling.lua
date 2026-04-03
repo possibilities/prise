@@ -4521,4 +4521,20 @@ M._test = {
     end,
 }
 
+M._test.build_tab_bar_custom = build_tab_bar_custom
+M._test.set_state = function(test_state)
+    state.tabs = test_state.tabs or {}
+    state.active_tab = test_state.active_tab or 1
+    state.next_tab_id = test_state.next_tab_id or (#state.tabs + 1)
+    state.focused_id = test_state.focused_id
+    state.zoomed_pane_id = test_state.zoomed_pane_id
+    state.hovered_tab = nil
+    state.hovered_close_tab = nil
+    state.tab_regions = {}
+    state.tab_close_regions = {}
+end
+M._test.get_state = function()
+    return state
+end
+
 return M
