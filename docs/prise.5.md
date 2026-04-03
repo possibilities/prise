@@ -502,6 +502,22 @@ The tiling UI uses a leader key sequence. Press the leader key (default:
 
 The command palette (**Super+p**) provides fuzzy search for all commands.
 
+# TILING UI HELPERS
+
+The built-in tiling UI exposes helper methods that user configuration code can
+call directly.
+
+**ui.send_key_to_focused(data)**
+:   Send a key event to the focused pane, or to the visible floating pane when
+    one is open.
+
+The **data** table uses the same fields as PTY key events:
+
+- **key** - Key text to send
+- **code** - Optional key code name
+- **ctrl**, **alt**, **shift**, **super** - Optional modifier flags
+- **release** - Optional key release flag
+
 # SEE ALSO
 
 [prise(1)](prise.1.html), [prise(7)](prise.7.html)
