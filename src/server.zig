@@ -2106,6 +2106,26 @@ const Server = struct {
         return env_list;
     }
 
+    fn appendPriseSpawnEnv(self: *Server, env_list: *std.ArrayList([]const u8), pty_id: usize) !void {
+        const prise_str = try self.allocator.dupe(u8, "PRISE=1");
+        try env_list.append(self.allocator, prise_str);
+
+        var pty_id_env_buf: [32]u8 = undefined;
+        const pty_id_env = try std.fmt.bufPrint(&pty_id_env_buf, "PRISE_PTY={d}", .{pty_id});
+        const prise_pty_str = try self.allocator.dupe(u8, pty_id_env);
+        try env_list.append(self.allocator, prise_pty_str);
+
+        var pty_validity_env_buf: [48]u8 = undefined;
+        const pty_validity_env = try std.fmt.bufPrint(&pty_validity_env_buf, "PRISE_PTY_VALIDITY={d}", .{self.start_time_ms});
+        const prise_pty_validity_str = try self.allocator.dupe(u8, pty_validity_env);
+        try env_list.append(self.allocator, prise_pty_validity_str);
+
+        var socket_env_buf: [280]u8 = undefined;
+        const socket_env = try std.fmt.bufPrint(&socket_env_buf, "PRISE_SOCKET={s}", .{self.socket_path});
+        const prise_socket_str = try self.allocator.dupe(u8, socket_env);
+        try env_list.append(self.allocator, prise_socket_str);
+    }
+
     fn parseClosePtyParams(params: msgpack.Value) !usize {
         return parsePtyId(params);
     }
@@ -2152,6 +2172,48 @@ const Server = struct {
         return .{
             .id = @intCast(params.array[0].unsigned),
             .data = params.array[1].binary,
+        };
+    }
+
+    const RenameTabParams = struct {
+        pty_id: usize,
+        title: []const u8,
+        pty_validity: i64,
+    };
+
+    fn parseRenameTabParams(params: msgpack.Value) !RenameTabParams {
+        if (params != .map) return error.InvalidParams;
+
+        var pty_id: ?usize = null;
+        var title: ?[]const u8 = null;
+        var pty_validity: ?i64 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => return error.InvalidParams,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "title")) {
+                title = switch (kv.value) {
+                    .string => |value| value,
+                    else => return error.InvalidParams,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "pty_validity")) {
+                pty_validity = switch (kv.value) {
+                    .integer => |value| value,
+                    .unsigned => |value| @intCast(value),
+                    else => return error.InvalidParams,
+                };
+            }
+        }
+
+        return .{
+            .pty_id = pty_id orelse return error.MissingPtyId,
+            .title = title orelse return error.MissingTitle,
+            .pty_validity = pty_validity orelse return error.MissingPtyValidity,
         };
     }
 
@@ -2232,19 +2294,7 @@ const Server = struct {
         const pty_id = self.next_pty_id;
         self.next_pty_id += 1;
 
-        // Add prise environment variables
-        const prise_str = try self.allocator.dupe(u8, "PRISE=1");
-        try env_list.append(self.allocator, prise_str);
-
-        var pty_id_env_buf: [32]u8 = undefined;
-        const pty_id_env = try std.fmt.bufPrint(&pty_id_env_buf, "PRISE_PTY={d}", .{pty_id});
-        const prise_pty_str = try self.allocator.dupe(u8, pty_id_env);
-        try env_list.append(self.allocator, prise_pty_str);
-
-        var socket_env_buf: [280]u8 = undefined;
-        const socket_env = try std.fmt.bufPrint(&socket_env_buf, "PRISE_SOCKET={s}", .{self.socket_path});
-        const prise_socket_str = try self.allocator.dupe(u8, socket_env);
-        try env_list.append(self.allocator, prise_socket_str);
+        try self.appendPriseSpawnEnv(&env_list, pty_id);
 
         const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items), cwd);
 
@@ -2869,28 +2919,29 @@ const Server = struct {
     }
 
     fn handleRenameTab(self: *Server, requesting_client: ?*Client, params: msgpack.Value) !msgpack.Value {
-        if (params != .map) return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
+        const parsed = parseRenameTabParams(params) catch |err| {
+            const message = switch (err) {
+                error.InvalidParams => "invalid params",
+                error.MissingPtyId => "missing pty_id",
+                error.MissingTitle => "missing title",
+                error.MissingPtyValidity => "missing pty_validity",
+            };
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, message) };
+        };
 
-        var pty_id: ?usize = null;
-        var title: ?[]const u8 = null;
-
-        for (params.map) |kv| {
-            if (kv.key != .string) continue;
-            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
-                pty_id = switch (kv.value) {
-                    .integer => |i| @intCast(i),
-                    .unsigned => |u| @intCast(u),
-                    else => null,
-                };
-            } else if (std.mem.eql(u8, kv.key.string, "title")) {
-                title = if (kv.value == .string) kv.value.string else null;
-            }
+        if (parsed.pty_validity != self.start_time_ms) {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "stale shell environment; open a new shell") };
         }
 
-        const pid = pty_id orelse return msgpack.Value{ .string = try self.allocator.dupe(u8, "missing pty_id") };
-        const t = title orelse return msgpack.Value{ .string = try self.allocator.dupe(u8, "missing title") };
+        const pty_instance = self.ptys.get(parsed.pty_id) orelse {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
+        };
 
-        try self.sendRenameTab(pid, t, requesting_client);
+        pty_instance.terminal_mutex.lock();
+        defer pty_instance.terminal_mutex.unlock();
+        try pty_instance.setTitle(parsed.title);
+
+        try self.sendRenameTab(parsed.pty_id, parsed.title, requesting_client);
 
         return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
     }
@@ -3560,6 +3611,115 @@ test "prepareSpawnEnv" {
     try testing.expect(found_term);
     try testing.expect(found_colorterm);
     try testing.expect(found_existing);
+}
+
+fn initRenameTestServer(allocator: std.mem.Allocator, loop: *io.Loop, start_time_ms: i64) Server {
+    return .{
+        .allocator = allocator,
+        .loop = loop,
+        .listen_fd = -1,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .signal_pipe_fds = .{ -1, -1 },
+        .start_time_ms = start_time_ms,
+    };
+}
+
+fn initRenameTestPty(allocator: std.mem.Allocator, id: usize) Pty {
+    var pty_instance: Pty = undefined;
+    pty_instance.allocator = allocator;
+    pty_instance.id = id;
+    pty_instance.clients = std.ArrayList(*Client).empty;
+    pty_instance.running = std.atomic.Value(bool).init(true);
+    pty_instance.title = .empty;
+    pty_instance.cwd = .empty;
+    pty_instance.terminal_mutex = .{};
+    return pty_instance;
+}
+
+test "appendPriseSpawnEnv includes pty validity" {
+    const testing = std.testing;
+    var loop: io.Loop = undefined;
+    var server = initRenameTestServer(testing.allocator, &loop, 1234);
+    defer {
+        server.clients.deinit(testing.allocator);
+        server.ptys.deinit();
+    }
+
+    var env_list = std.ArrayList([]const u8).empty;
+    defer {
+        for (env_list.items) |item| testing.allocator.free(item);
+        env_list.deinit(testing.allocator);
+    }
+
+    try server.appendPriseSpawnEnv(&env_list, 42);
+
+    var found_pty = false;
+    var found_validity = false;
+    var found_socket = false;
+
+    for (env_list.items) |item| {
+        if (std.mem.eql(u8, item, "PRISE_PTY=42")) found_pty = true;
+        if (std.mem.eql(u8, item, "PRISE_PTY_VALIDITY=1234")) found_validity = true;
+        if (std.mem.eql(u8, item, "PRISE_SOCKET=/tmp/test.sock")) found_socket = true;
+    }
+
+    try testing.expect(found_pty);
+    try testing.expect(found_validity);
+    try testing.expect(found_socket);
+}
+
+test "handleRenameTab validates pty validity and updates title" {
+    const testing = std.testing;
+    var loop: io.Loop = undefined;
+    var server = initRenameTestServer(testing.allocator, &loop, 777);
+    defer {
+        server.clients.deinit(testing.allocator);
+        server.ptys.deinit();
+    }
+
+    var pty_instance = initRenameTestPty(testing.allocator, 42);
+    defer {
+        pty_instance.title.deinit(testing.allocator);
+        pty_instance.cwd.deinit(testing.allocator);
+        pty_instance.clients.deinit(testing.allocator);
+    }
+
+    try server.ptys.put(pty_instance.id, &pty_instance);
+
+    var valid_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 42 } },
+        .{ .key = .{ .string = "title" }, .value = .{ .string = "renamed" } },
+        .{ .key = .{ .string = "pty_validity" }, .value = .{ .integer = 777 } },
+    };
+    const ok = try server.handleRenameTab(null, .{ .map = &valid_params });
+    defer ok.deinit(testing.allocator);
+    try testing.expect(ok == .string);
+    try testing.expectEqualStrings("ok", ok.string);
+    try testing.expectEqualStrings("renamed", pty_instance.title.items);
+
+    var stale_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 42 } },
+        .{ .key = .{ .string = "title" }, .value = .{ .string = "wrong" } },
+        .{ .key = .{ .string = "pty_validity" }, .value = .{ .integer = 1 } },
+    };
+    const stale = try server.handleRenameTab(null, .{ .map = &stale_params });
+    defer stale.deinit(testing.allocator);
+    try testing.expect(stale == .string);
+    try testing.expectEqualStrings("stale shell environment; open a new shell", stale.string);
+
+    _ = server.ptys.remove(pty_instance.id);
+
+    var missing_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 42 } },
+        .{ .key = .{ .string = "title" }, .value = .{ .string = "missing" } },
+        .{ .key = .{ .string = "pty_validity" }, .value = .{ .integer = 777 } },
+    };
+    const missing = try server.handleRenameTab(null, .{ .map = &missing_params });
+    defer missing.deinit(testing.allocator);
+    try testing.expect(missing == .string);
+    try testing.expectEqualStrings("PTY not found", missing.string);
 }
 
 test "parseAttachPtyParams" {

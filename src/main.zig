@@ -23,6 +23,12 @@ const ParseResult = struct {
     new_session_name: ?[]const u8 = null,
 };
 
+const TabRenameContext = struct {
+    session_name: ?[]const u8,
+    pty_id: u32,
+    pty_validity: i64,
+};
+
 var log_file: ?std.fs.File = null;
 
 pub const std_options: std.Options = .{
@@ -420,18 +426,8 @@ fn handleTabCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator
             std.fs.File.stderr().writeAll("Missing title. Usage: prise tab rename <title>\n") catch {};
             return error.MissingArgument;
         };
-        const pty_id_str = posix.getenv("PRISE_PTY") orelse {
-            std.fs.File.stderr().writeAll("Not running inside prise (PRISE_PTY not set).\n") catch {};
-            return error.MissingArgument;
-        };
-        const pty_id = std.fmt.parseInt(u32, pty_id_str, 10) catch {
-            std.fs.File.stderr().writeAll("Invalid PRISE_PTY value.\n") catch {};
-            return error.InvalidArgument;
-        };
-        if (posix.getenv("PRISE_SESSION")) |session_name| {
-            try persistTabRename(allocator, session_name, pty_id, if (new_title.len > 0) new_title else null);
-        }
-        try renameTab(allocator, resolvePriseSocketPath(socket_path), pty_id, new_title);
+        const context = try getTabRenameContext();
+        try executeTabRename(allocator, resolvePriseSocketPath(socket_path), null, context, new_title);
         return null;
     } else {
         var buf: [256]u8 = undefined;
@@ -468,6 +464,32 @@ fn resolvePriseSocketPath(default_socket_path: []const u8) []const u8 {
     return posix.getenv("PRISE_SOCKET") orelse default_socket_path;
 }
 
+fn getTabRenameContext() !TabRenameContext {
+    const pty_id_str = posix.getenv("PRISE_PTY") orelse {
+        std.fs.File.stderr().writeAll("Not running inside prise (PRISE_PTY not set).\n") catch {};
+        return error.MissingArgument;
+    };
+    const pty_validity_str = posix.getenv("PRISE_PTY_VALIDITY") orelse {
+        std.fs.File.stderr().writeAll("Not running inside prise (PRISE_PTY_VALIDITY not set).\n") catch {};
+        return error.MissingArgument;
+    };
+
+    const pty_id = std.fmt.parseInt(u32, pty_id_str, 10) catch {
+        std.fs.File.stderr().writeAll("Invalid PRISE_PTY value.\n") catch {};
+        return error.InvalidArgument;
+    };
+    const pty_validity = std.fmt.parseInt(i64, pty_validity_str, 10) catch {
+        std.fs.File.stderr().writeAll("Invalid PRISE_PTY_VALIDITY value.\n") catch {};
+        return error.InvalidArgument;
+    };
+
+    return .{
+        .session_name = posix.getenv("PRISE_SESSION"),
+        .pty_id = pty_id,
+        .pty_validity = pty_validity,
+    };
+}
+
 fn persistTabRename(allocator: std.mem.Allocator, session_name: []const u8, pty_id: u32, title: ?[]const u8) !void {
     const result = getSessionsDir(allocator) catch |err| switch (err) {
         error.NoSessionsFound => return,
@@ -477,16 +499,58 @@ fn persistTabRename(allocator: std.mem.Allocator, session_name: []const u8, pty_
     var dir = result.dir;
     dir.close();
 
+    try persistTabRenameInSessionsDir(allocator, result.path, session_name, pty_id, title);
+}
+
+fn persistTabRenameInSessionsDir(
+    allocator: std.mem.Allocator,
+    sessions_dir_path: []const u8,
+    session_name: []const u8,
+    pty_id: u32,
+    title: ?[]const u8,
+) !void {
     const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{session_name});
     defer allocator.free(file_name);
 
-    const session_path = try std.fs.path.join(allocator, &.{ result.path, file_name });
+    const session_path = try std.fs.path.join(allocator, &.{ sessions_dir_path, file_name });
     defer allocator.free(session_path);
 
     _ = try session_json.updateTabTitleFile(allocator, session_path, pty_id, title);
 }
 
-fn renameTab(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32, title: []const u8) !void {
+fn executeTabRename(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    sessions_dir_path: ?[]const u8,
+    context: TabRenameContext,
+    new_title: []const u8,
+) !void {
+    try renameTab(allocator, socket_path, context.pty_id, context.pty_validity, new_title);
+
+    if (context.session_name) |session_name| {
+        const title = if (new_title.len > 0) new_title else null;
+        if (sessions_dir_path) |dir_path| {
+            try persistTabRenameInSessionsDir(allocator, dir_path, session_name, context.pty_id, title);
+        } else {
+            try persistTabRename(allocator, session_name, context.pty_id, title);
+        }
+    }
+}
+
+fn readRpcResponseMessage(allocator: std.mem.Allocator, sock: posix.fd_t) !rpc.Message {
+    var response_buf: [4096]u8 = undefined;
+    const n = try posix.read(sock, &response_buf);
+    if (n == 0) return error.NoResponse;
+    return rpc.decodeMessage(allocator, response_buf[0..n]);
+}
+
+fn renameTab(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    pty_id: u32,
+    pty_validity: i64,
+    title: []const u8,
+) !void {
     const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
         log.err("Failed to create socket: {}", .{err});
         return error.SocketError;
@@ -500,14 +564,15 @@ fn renameTab(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32,
     posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
         if (err == error.ConnectionRefused or err == error.FileNotFound) {
             std.fs.File.stderr().writeAll("Server not running.\n") catch {};
-            return;
+            return error.ServerNotRunning;
         }
         return err;
     };
 
-    var map_items = [_]msgpack.Value.KeyValue{
+    var map_items = [3]msgpack.Value.KeyValue{
         .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } },
         .{ .key = .{ .string = "title" }, .value = .{ .string = title } },
+        .{ .key = .{ .string = "pty_validity" }, .value = .{ .integer = pty_validity } },
     };
     const params = msgpack.Value{ .map = &map_items };
     const request = try msgpack.encode(allocator, .{ 0, 1, "rename_tab", params });
@@ -515,9 +580,39 @@ fn renameTab(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32,
 
     _ = try posix.write(sock, request);
 
-    // Read response to complete the RPC exchange
-    var response_buf: [4096]u8 = undefined;
-    _ = posix.read(sock, &response_buf) catch {};
+    const msg = readRpcResponseMessage(allocator, sock) catch |err| {
+        switch (err) {
+            error.NoResponse => std.fs.File.stderr().writeAll("No response from server.\n") catch {},
+            else => log.err("Failed to read rename_tab response: {}", .{err}),
+        }
+        return err;
+    };
+    defer msg.deinit(allocator);
+
+    if (msg != .response) {
+        std.fs.File.stderr().writeAll("Unexpected response type.\n") catch {};
+        return error.InvalidResponse;
+    }
+
+    if (msg.response.err) |err_val| {
+        const err_str = if (err_val == .string) err_val.string else "unknown error";
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "Server error: {s}\n", .{err_str}) catch return error.ServerError;
+        std.fs.File.stderr().writeAll(text) catch {};
+        return error.ServerError;
+    }
+
+    if (msg.response.result != .string) {
+        std.fs.File.stderr().writeAll("Invalid response format.\n") catch {};
+        return error.InvalidResponse;
+    }
+
+    if (!std.mem.eql(u8, msg.response.result.string, "ok")) {
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "Error: {s}\n", .{msg.response.result.string}) catch return error.RenameRejected;
+        std.fs.File.stderr().writeAll(text) catch {};
+        return error.RenameRejected;
+    }
 }
 
 fn runClient(allocator: std.mem.Allocator, socket_path: []const u8, args: ParseResult) !void {
@@ -919,6 +1014,275 @@ fn findMostRecentSession(allocator: std.mem.Allocator) ![]const u8 {
 
     log.err("No session files found", .{});
     return error.NoSessionsFound;
+}
+
+const testing = std.testing;
+
+const TestSessionsDir = struct {
+    tmp: testing.TmpDir,
+    home_path: []const u8,
+    sessions_path: []const u8,
+
+    fn init(allocator: std.mem.Allocator) !TestSessionsDir {
+        var tmp = testing.tmpDir(.{});
+        const home_path = try tmp.parent_dir.realpathAlloc(allocator, &tmp.sub_path);
+        errdefer allocator.free(home_path);
+
+        const relative_sessions_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/.local/state/prise/sessions",
+            .{tmp.sub_path},
+        );
+        defer allocator.free(relative_sessions_path);
+
+        try tmp.parent_dir.makePath(relative_sessions_path);
+
+        const sessions_path = try std.fs.path.join(
+            allocator,
+            &.{ home_path, ".local", "state", "prise", "sessions" },
+        );
+        errdefer allocator.free(sessions_path);
+
+        return .{
+            .tmp = tmp,
+            .home_path = home_path,
+            .sessions_path = sessions_path,
+        };
+    }
+
+    fn deinit(self: *TestSessionsDir, allocator: std.mem.Allocator) void {
+        allocator.free(self.home_path);
+        allocator.free(self.sessions_path);
+        self.tmp.cleanup();
+    }
+};
+
+const RenameTestServer = struct {
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    response_bytes: []const u8,
+    request_bytes: ?[]u8 = null,
+    run_error: ?anyerror = null,
+    thread: ?std.Thread = null,
+
+    fn start(self: *RenameTestServer) !void {
+        self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
+    }
+
+    fn join(self: *RenameTestServer) !void {
+        const thread = self.thread orelse return;
+        thread.join();
+        self.thread = null;
+        if (self.run_error) |err| return err;
+    }
+
+    fn deinit(self: *RenameTestServer) void {
+        if (self.request_bytes) |request_bytes| self.allocator.free(request_bytes);
+        self.allocator.free(self.response_bytes);
+    }
+
+    fn threadMain(self: *RenameTestServer) void {
+        self.run() catch |err| {
+            self.run_error = err;
+        };
+    }
+
+    fn run(self: *RenameTestServer) !void {
+        posix.unlink(self.socket_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+
+        const listen_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        defer posix.close(listen_fd);
+        defer posix.unlink(self.socket_path) catch {};
+
+        var addr: posix.sockaddr.un = undefined;
+        addr.family = posix.AF.UNIX;
+        @memcpy(addr.path[0..self.socket_path.len], self.socket_path);
+        addr.path[self.socket_path.len] = 0;
+
+        try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        try posix.listen(listen_fd, 1);
+
+        const conn_fd = try posix.accept(listen_fd, null, null, 0);
+        defer posix.close(conn_fd);
+
+        var request_buf: [4096]u8 = undefined;
+        const n = try posix.read(conn_fd, &request_buf);
+        if (n == 0) return error.NoRequest;
+
+        self.request_bytes = try self.allocator.dupe(u8, request_buf[0..n]);
+        _ = try posix.write(conn_fd, self.response_bytes);
+    }
+};
+
+fn writeSessionFile(
+    allocator: std.mem.Allocator,
+    sessions_path: []const u8,
+    session_name: []const u8,
+    json: []const u8,
+) !void {
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{session_name});
+    defer allocator.free(file_name);
+
+    const session_path = try std.fs.path.join(allocator, &.{ sessions_path, file_name });
+    defer allocator.free(session_path);
+
+    const file = try std.fs.createFileAbsolute(session_path, .{});
+    defer file.close();
+    try file.writeAll(json);
+}
+
+fn readSessionFile(
+    allocator: std.mem.Allocator,
+    sessions_path: []const u8,
+    session_name: []const u8,
+) ![]u8 {
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{session_name});
+    defer allocator.free(file_name);
+
+    const session_path = try std.fs.path.join(allocator, &.{ sessions_path, file_name });
+    defer allocator.free(session_path);
+
+    const file = try std.fs.openFileAbsolute(session_path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, 1024 * 1024);
+}
+
+fn expectSavedTabTitle(json: []const u8, expected_title: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const tabs = parsed.value.object.get("tabs").?.array.items;
+    try testing.expectEqualStrings(expected_title, tabs[0].object.get("title").?.string);
+}
+
+fn expectRenameRequest(request_bytes: []const u8, expected_pty_id: u32, expected_validity: i64, expected_title: []const u8) !void {
+    const msg = try rpc.decodeMessage(testing.allocator, request_bytes);
+    defer msg.deinit(testing.allocator);
+
+    try testing.expect(msg == .request);
+    try testing.expectEqualStrings("rename_tab", msg.request.method);
+
+    var pty_id: ?u32 = null;
+    var pty_validity: ?i64 = null;
+    var title: ?[]const u8 = null;
+
+    for (msg.request.params.map) |kv| {
+        if (kv.key != .string) continue;
+        if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+            pty_id = switch (kv.value) {
+                .unsigned => |value| @intCast(value),
+                .integer => |value| @intCast(value),
+                else => null,
+            };
+        } else if (std.mem.eql(u8, kv.key.string, "pty_validity")) {
+            pty_validity = switch (kv.value) {
+                .integer => |value| value,
+                .unsigned => |value| @intCast(value),
+                else => null,
+            };
+        } else if (std.mem.eql(u8, kv.key.string, "title")) {
+            title = if (kv.value == .string) kv.value.string else null;
+        }
+    }
+
+    try testing.expectEqual(expected_pty_id, pty_id.?);
+    try testing.expectEqual(expected_validity, pty_validity.?);
+    try testing.expectEqualStrings(expected_title, title.?);
+}
+
+fn waitForSocketPath(socket_path: []const u8) !void {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        std.fs.accessAbsolute(socket_path, .{}) catch {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            continue;
+        };
+        return;
+    }
+
+    return error.SocketStartupTimeout;
+}
+
+test "executeTabRename persists saved title after acknowledged RPC" {
+    var sessions_dir = try TestSessionsDir.init(testing.allocator);
+    defer sessions_dir.deinit(testing.allocator);
+
+    try writeSessionFile(testing.allocator, sessions_dir.sessions_path, "demo",
+        \\{"tabs":[{"id":1,"title":"old","root":{"type":"pane","id":10,"pty_id":42}}],"active_tab":1}
+    );
+
+    const socket_path = try std.fs.path.join(testing.allocator, &.{ sessions_dir.home_path, "rename.sock" });
+    defer testing.allocator.free(socket_path);
+
+    var test_server: RenameTestServer = .{
+        .allocator = testing.allocator,
+        .socket_path = socket_path,
+        .response_bytes = try msgpack.encode(testing.allocator, .{ 1, 1, null, "ok" }),
+    };
+    defer test_server.deinit();
+
+    try test_server.start();
+    defer test_server.join() catch {};
+    try waitForSocketPath(socket_path);
+
+    try executeTabRename(
+        testing.allocator,
+        socket_path,
+        sessions_dir.sessions_path,
+        .{ .session_name = "demo", .pty_id = 42, .pty_validity = 1234 },
+        "renamed",
+    );
+    try test_server.join();
+
+    const updated = try readSessionFile(testing.allocator, sessions_dir.sessions_path, "demo");
+    defer testing.allocator.free(updated);
+    try expectSavedTabTitle(updated, "renamed");
+    try expectRenameRequest(test_server.request_bytes.?, 42, 1234, "renamed");
+}
+
+test "executeTabRename leaves session json unchanged on rejected RPC" {
+    var sessions_dir = try TestSessionsDir.init(testing.allocator);
+    defer sessions_dir.deinit(testing.allocator);
+
+    try writeSessionFile(testing.allocator, sessions_dir.sessions_path, "demo",
+        \\{"tabs":[{"id":1,"title":"old","root":{"type":"pane","id":10,"pty_id":42}}],"active_tab":1}
+    );
+
+    const socket_path = try std.fs.path.join(testing.allocator, &.{ sessions_dir.home_path, "rename.sock" });
+    defer testing.allocator.free(socket_path);
+
+    var test_server: RenameTestServer = .{
+        .allocator = testing.allocator,
+        .socket_path = socket_path,
+        .response_bytes = try msgpack.encode(
+            testing.allocator,
+            .{ 1, 1, null, "stale shell environment; open a new shell" },
+        ),
+    };
+    defer test_server.deinit();
+
+    try test_server.start();
+    defer test_server.join() catch {};
+    try waitForSocketPath(socket_path);
+
+    try testing.expectError(
+        error.RenameRejected,
+        executeTabRename(
+            testing.allocator,
+            socket_path,
+            sessions_dir.sessions_path,
+            .{ .session_name = "demo", .pty_id = 42, .pty_validity = 5678 },
+            "renamed",
+        ),
+    );
+    try test_server.join();
+
+    const updated = try readSessionFile(testing.allocator, sessions_dir.sessions_path, "demo");
+    defer testing.allocator.free(updated);
+    try expectSavedTabTitle(updated, "old");
 }
 
 test {
