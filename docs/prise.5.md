@@ -502,6 +502,20 @@ The tiling UI uses a leader key sequence. Press the leader key (default:
 
 The command palette (**Super+p**) provides fuzzy search for all commands.
 
+# TILING UI HELPERS
+
+The built-in tiling UI exposes helper methods that user configuration code can
+call directly.
+
+**ui.get_active_tab_info()**
+:   Return information about the active tab as a table with **index**,
+    **title**, and **pane_count**, or **nil** when no tab is active. The pane
+    count includes floating panes.
+
+**ui.get_focused_pane_index()**
+:   Return the 1-based index of the focused pane within the active tab, or
+    **nil** when no pane is focused.
+
 # SEE ALSO
 
 [prise(1)](prise.1.html), [prise(7)](prise.7.html)
