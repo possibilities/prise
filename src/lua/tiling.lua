@@ -4473,7 +4473,7 @@ function M.set_state(saved, pty_lookup)
 end
 
 ---Send a key event to the focused pane's PTY.
----@param data table Key event data: {key, code?, ctrl?, alt?, shift?, super?}
+---@param data PtyKeyData Key event data: {key, code?, ctrl?, alt?, shift?, super?}
 function M.send_key_to_focused(data)
     local pty = get_visible_floating_pty() or get_focused_pty()
     if pty then
