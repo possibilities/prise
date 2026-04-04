@@ -155,6 +155,9 @@ const Pty = struct {
     // Pointer to server for callbacks (opaque to avoid circular type dependency)
     server_ptr: *anyopaque = undefined,
 
+    // Command to write to PTY after first output (consumed on use)
+    cmd: ?[]const u8 = null,
+
     fn init(allocator: std.mem.Allocator, id: usize, process_instance: pty.Process, size: pty.Winsize) !*Pty {
         // Precondition: terminal size must be positive (zero would crash ghostty-vt)
         std.debug.assert(size.ws_col > 0);
@@ -2248,6 +2251,10 @@ const Server = struct {
         const pty_instance = try Pty.init(self.allocator, pty_id, process, parsed.size);
         pty_instance.server_ptr = self;
 
+        if (parsed.cmd) |cmd| {
+            pty_instance.cmd = try self.allocator.dupe(u8, cmd);
+        }
+
         try self.ptys.put(pty_id, pty_instance);
         std.debug.assert(self.ptys.count() <= LIMITS.PTYS_MAX);
 
@@ -3089,6 +3096,17 @@ const Server = struct {
                     return;
                 }
 
+                // Write pending cmd on first output (shell is producing bytes = ready for input)
+                if (pty_instance.cmd) |cmd| {
+                    _ = posix.write(pty_instance.process.master, cmd) catch |err| {
+                        log.err("Failed to write cmd to PTY {}: {}", .{ pty_instance.id, err });
+                    };
+                    _ = posix.write(pty_instance.process.master, "\n") catch {};
+                    server.allocator.free(cmd);
+                    pty_instance.cmd = null;
+                    log.info("Wrote cmd to PTY {}", .{pty_instance.id});
+                }
+
                 const now = std.time.milliTimestamp();
                 // 8ms (~120fps) balances responsiveness with efficiency. Lower values
                 // increase CPU usage with diminishing perceptual benefit; higher values
@@ -3144,6 +3162,11 @@ const Server = struct {
         if (pty_instance.read_thread) |thread| {
             thread.join();
             pty_instance.read_thread = null;
+        }
+
+        if (pty_instance.cmd) |cmd| {
+            self.allocator.free(cmd);
+            pty_instance.cmd = null;
         }
 
         // Free PTY resources
@@ -3540,6 +3563,18 @@ test "parseSpawnPtyParams" {
     try testing.expectEqualStrings("work", p4.session.?);
     try testing.expectEqualStrings("new", p4.tab.?);
     try testing.expectEqualStrings("claude", p4.title.?);
+
+    // With cmd param
+    var params_with_cmd = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 30 } },
+        .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 120 } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .string = "echo hello" } },
+    };
+    const p5 = Server.parseSpawnPtyParams(.{ .map = &params_with_cmd });
+    try testing.expectEqualStrings("echo hello", p5.cmd.?);
+
+    // Without cmd param - null
+    try testing.expectEqual(@as(?[]const u8, null), p1.cmd);
 }
 
 test "prepareSpawnEnv" {

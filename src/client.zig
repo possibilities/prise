@@ -2470,9 +2470,9 @@ pub const App = struct {
             try env_array.append(self.allocator, .{ .string = env_str });
         }
 
-        var num_params: usize = 4;
-        if (opts.cwd != null) num_params += 1;
-        if (opts.cmd != null) num_params += 1;
+        const has_cwd = opts.cwd != null;
+        const has_cmd = opts.cmd != null;
+        const num_params: usize = 4 + @as(usize, @intFromBool(has_cwd)) + @as(usize, @intFromBool(has_cmd));
         var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, num_params);
         defer self.allocator.free(map_items);
 
