@@ -115,6 +115,7 @@ local utils = require("utils")
 ---@field clock_timer? Timer
 ---@field pending_split? { direction: "row"|"col" }
 ---@field pending_new_tab? boolean
+---@field pending_title_renames table<number, string>
 ---@field next_split_id number
 ---@field palette PaletteState
 ---@field rename RenameState
@@ -141,6 +142,10 @@ local utils = require("utils")
 ---@class PtyExitedEvent
 ---@field type "pty_exited"
 ---@field data { id: number }
+
+---@class PtySpawnedEvent
+---@field type "pty_spawned"
+---@field data { id: number, cwd: string, session?: string, tab?: string, title?: string }
 
 ---@class KeyPressEvent
 ---@field type "key_press"
@@ -389,6 +394,7 @@ local state = {
     clock_timer = nil,
     pending_split = nil,
     pending_new_tab = false,
+    pending_title_renames = {}, -- [pty_id] = title string from spawn placement
     next_split_id = 1,
     -- Command palette
     palette = {
@@ -2781,6 +2787,17 @@ function M.update(event)
         update_pty_focus(old_focused_id, state.focused_id)
         prise.request_frame()
         prise.save() -- Auto-save on pane added
+
+        -- Apply any queued title rename from spawn placement
+        local rename = state.pending_title_renames[new_pane.id]
+        if rename then
+            local tab = get_active_tab()
+            if tab then
+                tab.title = rename
+                prise.save()
+            end
+            state.pending_title_renames[new_pane.id] = nil
+        end
     elseif event.type == "key_press" then
         -- Handle command palette
         if state.palette.visible then
@@ -3189,6 +3206,26 @@ function M.update(event)
         local was_last = remove_pane_by_id(id)
         if not was_last then
             prise.save()
+        end
+    elseif event.type == "pty_spawned" then
+        local data = event.data
+        prise.log.info("Lua: pty_spawned " .. data.id)
+
+        -- If placement fields present, auto-adopt this PTY
+        if data.session or data.tab or data.title then
+            if data.session then
+                local current = prise.get_session_name()
+                if current ~= data.session then
+                    prise.switch_session(data.session)
+                end
+            end
+            if data.tab == "new" then
+                state.pending_new_tab = true
+            end
+            prise.attach(data.id)
+            if data.title then
+                state.pending_title_renames[data.id] = data.title
+            end
         end
     elseif event.type == "mouse" then
         local d = event.data

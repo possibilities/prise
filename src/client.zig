@@ -213,6 +213,7 @@ pub const ServerAction = union(enum) {
     redraw: msgpack.Value,
     attached: struct { new_pty_id: i64, old_pty_id: ?u32 = null },
     pty_exited: struct { pty_id: u32, status: u32 },
+    pty_spawned: struct { pty_id: u32, cwd: []const u8, session: ?[]const u8 = null, tab: ?[]const u8 = null, title: ?[]const u8 = null },
     cwd_changed: struct { pty_id: u32, cwd: []const u8 },
     detached,
     color_query: ColorQueryTarget,
@@ -393,6 +394,8 @@ pub const ClientLogic = struct {
             return .{ .redraw = notif.params };
         } else if (std.mem.eql(u8, notif.method, "pty_exited")) {
             return parsePtyExited(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "pty_spawned")) {
+            return parsePtySpawned(notif.params);
         } else if (std.mem.eql(u8, notif.method, "cwd_changed")) {
             return try handleCwdChanged(state, notif.params);
         } else if (std.mem.eql(u8, notif.method, "color_query")) {
@@ -468,6 +471,38 @@ pub const ClientLogic = struct {
             else => 0,
         };
         return .{ .pty_exited = .{ .pty_id = pty_id, .status = status } };
+    }
+
+    fn parsePtySpawned(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+
+        var pty_id: ?u32 = null;
+        var cwd: []const u8 = "";
+        var session: ?[]const u8 = null;
+        var tab: ?[]const u8 = null;
+        var title: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "id")) {
+                pty_id = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "cwd") and kv.value == .string) {
+                cwd = kv.value.string;
+            } else if (std.mem.eql(u8, kv.key.string, "session") and kv.value == .string) {
+                session = kv.value.string;
+            } else if (std.mem.eql(u8, kv.key.string, "tab") and kv.value == .string) {
+                tab = kv.value.string;
+            } else if (std.mem.eql(u8, kv.key.string, "title") and kv.value == .string) {
+                title = kv.value.string;
+            }
+        }
+
+        const id = pty_id orelse return .none;
+        return .{ .pty_spawned = .{ .pty_id = id, .cwd = cwd, .session = session, .tab = tab, .title = title } };
     }
 
     fn handleCwdChanged(state: *ClientState, params: msgpack.Value) !ServerAction {
@@ -2282,6 +2317,12 @@ pub const App = struct {
                                     }
                                     app.deleteCurrentSession();
                                 }
+                            },
+                            .pty_spawned => |info| {
+                                log.info("PTY {} spawned with cwd {s}", .{ info.pty_id, info.cwd });
+                                app.ui.update(.{ .pty_spawned = .{ .id = info.pty_id, .cwd = info.cwd, .session = info.session, .tab = info.tab, .title = info.title } }) catch |err| {
+                                    log.err("Failed to update UI with pty_spawned: {}", .{err});
+                                };
                             },
                             .cwd_changed => |info| {
                                 log.debug("CWD changed for PTY {}: {s}", .{ info.pty_id, info.cwd });

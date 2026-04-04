@@ -2048,7 +2048,7 @@ const Server = struct {
     /// Timestamp (ms since epoch) when server started - used to detect server restarts
     start_time_ms: i64 = 0,
 
-    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value, macos_option_as_alt: key_encode.OptionAsAlt, cmd: ?[]const u8 } {
+    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value, macos_option_as_alt: key_encode.OptionAsAlt, cmd: ?[]const u8, session: ?[]const u8, tab: ?[]const u8, title: ?[]const u8 } {
         var rows: u16 = 24;
         var cols: u16 = 80;
         var attach: bool = false;
@@ -2056,6 +2056,9 @@ const Server = struct {
         var env: ?[]const msgpack.Value = null;
         var macos_option_as_alt: key_encode.OptionAsAlt = .false;
         var cmd: ?[]const u8 = null;
+        var session: ?[]const u8 = null;
+        var tab: ?[]const u8 = null;
+        var title: ?[]const u8 = null;
 
         if (params == .map) {
             for (params.map) |kv| {
@@ -2074,6 +2077,12 @@ const Server = struct {
                     macos_option_as_alt = parseMacosOptionAsAlt(kv.value);
                 } else if (std.mem.eql(u8, kv.key.string, "cmd") and kv.value == .string) {
                     cmd = kv.value.string;
+                } else if (std.mem.eql(u8, kv.key.string, "session") and kv.value == .string) {
+                    session = kv.value.string;
+                } else if (std.mem.eql(u8, kv.key.string, "tab") and kv.value == .string) {
+                    tab = kv.value.string;
+                } else if (std.mem.eql(u8, kv.key.string, "title") and kv.value == .string) {
+                    title = kv.value.string;
                 }
             }
         }
@@ -2090,6 +2099,9 @@ const Server = struct {
             .env = env,
             .macos_option_as_alt = macos_option_as_alt,
             .cmd = cmd,
+            .session = session,
+            .tab = tab,
+            .title = title,
         };
     }
 
@@ -2274,6 +2286,9 @@ const Server = struct {
         }
 
         log.info("Created PTY {} with PID {}", .{ pty_id, process.pid });
+
+        // Send pty_spawned notification to all clients
+        try self.sendPtySpawned(pty_id, cwd orelse "", parsed.session, parsed.tab, parsed.title);
 
         return msgpack.Value{ .unsigned = pty_id };
     }
@@ -2815,6 +2830,46 @@ const Server = struct {
         defer self.allocator.free(msg_bytes);
 
         std.log.info("Sending pty_exited for session {} status {}", .{ pty_id, exit_status });
+
+        // Send to all clients
+        for (self.clients.items) |client| {
+            try client.sendData(self.loop, msg_bytes);
+        }
+    }
+
+    /// Build and send pty_spawned notification to all clients
+    fn sendPtySpawned(self: *Server, pty_id: usize, cwd: []const u8, session: ?[]const u8, tab: ?[]const u8, title: ?[]const u8) !void {
+        var field_count: usize = 2; // id + cwd always present
+        if (session != null) field_count += 1;
+        if (tab != null) field_count += 1;
+        if (title != null) field_count += 1;
+
+        const params = try self.allocator.alloc(msgpack.Value.KeyValue, field_count);
+        defer self.allocator.free(params);
+
+        var idx: usize = 0;
+        params[idx] = .{ .key = .{ .string = "id" }, .value = .{ .unsigned = pty_id } };
+        idx += 1;
+        params[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+        idx += 1;
+        if (session) |s| {
+            params[idx] = .{ .key = .{ .string = "session" }, .value = .{ .string = s } };
+            idx += 1;
+        }
+        if (tab) |t| {
+            params[idx] = .{ .key = .{ .string = "tab" }, .value = .{ .string = t } };
+            idx += 1;
+        }
+        if (title) |t| {
+            params[idx] = .{ .key = .{ .string = "title" }, .value = .{ .string = t } };
+            idx += 1;
+        }
+
+        const params_value = msgpack.Value{ .map = params };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "pty_spawned", params_value });
+        defer self.allocator.free(msg_bytes);
+
+        log.info("Sending pty_spawned for pty {}", .{pty_id});
 
         // Send to all clients
         for (self.clients.items) |client| {
@@ -3446,6 +3501,9 @@ test "parseSpawnPtyParams" {
     try testing.expectEqual(@as(u16, 80), p1.size.ws_col);
     try testing.expectEqual(false, p1.attach);
     try testing.expectEqual(@as(?[]const u8, null), p1.cwd);
+    try testing.expectEqual(@as(?[]const u8, null), p1.session);
+    try testing.expectEqual(@as(?[]const u8, null), p1.tab);
+    try testing.expectEqual(@as(?[]const u8, null), p1.title);
 
     // Full params
     var params = [_]msgpack.Value.KeyValue{
@@ -3469,6 +3527,19 @@ test "parseSpawnPtyParams" {
     try testing.expectEqual(@as(u16, 30), p3.size.ws_row);
     try testing.expectEqual(@as(u16, 120), p3.size.ws_col);
     try testing.expectEqualStrings("/tmp", p3.cwd.?);
+
+    // With placement fields
+    var params_with_placement = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 24 } },
+        .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 80 } },
+        .{ .key = .{ .string = "session" }, .value = .{ .string = "work" } },
+        .{ .key = .{ .string = "tab" }, .value = .{ .string = "new" } },
+        .{ .key = .{ .string = "title" }, .value = .{ .string = "claude" } },
+    };
+    const p4 = Server.parseSpawnPtyParams(.{ .map = &params_with_placement });
+    try testing.expectEqualStrings("work", p4.session.?);
+    try testing.expectEqualStrings("new", p4.tab.?);
+    try testing.expectEqualStrings("claude", p4.title.?);
 }
 
 test "prepareSpawnEnv" {
