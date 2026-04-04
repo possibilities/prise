@@ -335,6 +335,12 @@ ui.setup({
 return ui
 ```
 
+# TILING UI HELPERS
+
+**ui.get_theme()**
+:   Return the resolved theme table with defaults merged with user overrides
+    from **setup()**. Keys match the properties listed in the THEME section.
+
 # BUILT-IN ACTIONS
 
 The following actions can be used as values in the **keybinds** table.
