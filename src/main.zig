@@ -686,7 +686,7 @@ fn fetchPtyValidity(allocator: std.mem.Allocator, socket_path: []const u8) !i64 
 /// Spawn a detached PTY on the server via spawn_pty RPC.
 /// Sends the client's full environment and cwd so the spawned shell
 /// inherits PATH and other vars (matching spawnInitialPty behavior).
-fn spawnDetachedPty(allocator: std.mem.Allocator, socket_path: []const u8) !u64 {
+fn spawnDetachedPty(allocator: std.mem.Allocator, socket_path: []const u8, session_name: []const u8) !u64 {
     const sock = try connectToServer(socket_path);
     defer posix.close(sock);
 
@@ -705,6 +705,10 @@ fn spawnDetachedPty(allocator: std.mem.Allocator, socket_path: []const u8) !u64 
         const env_str = try std.fmt.allocPrint(arena_alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
         try env_array.append(allocator, .{ .string = env_str });
     }
+
+    // Add PRISE_SESSION so the spawned shell knows its session name
+    const session_env = try std.fmt.allocPrint(arena_alloc, "PRISE_SESSION={s}", .{session_name});
+    try env_array.append(allocator, .{ .string = session_env });
 
     // Get client cwd
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -782,7 +786,7 @@ fn writeNewSessionFile(allocator: std.mem.Allocator, name: []const u8, pty_valid
 /// Create a detached session: fetch server info, spawn PTY, write session file.
 fn createDetachedSession(allocator: std.mem.Allocator, socket_path: []const u8, name: []const u8) !void {
     const pty_validity = try fetchPtyValidity(allocator, socket_path);
-    const pty_id = try spawnDetachedPty(allocator, socket_path);
+    const pty_id = try spawnDetachedPty(allocator, socket_path, name);
     try writeNewSessionFile(allocator, name, pty_validity, pty_id);
 
     var buf: [256]u8 = undefined;
