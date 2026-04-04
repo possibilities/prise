@@ -190,3 +190,19 @@ assert(#item == 20, "format_palette_item: correct width")
 item = t.format_palette_item("Very Long Command Name", "C-x", 10)
 -- Width is too small, should use minimum padding of 2
 assert(item == "Very Long Command Name  C-x", "format_palette_item: minimum padding")
+
+-- === get_theme ===
+
+-- Test: get_theme returns default theme without setup
+local theme = tiling.get_theme()
+assert(theme ~= nil, "get_theme: returns table")
+assert(theme.accent == "#89b4fa", "get_theme: default accent")
+assert(theme.bg1 == "#1e1e2e", "get_theme: default bg1")
+assert(theme.fg_bright == "#cdd6f4", "get_theme: default fg_bright")
+assert(theme.green == "#a6e3a1", "get_theme: default green")
+
+-- Test: get_theme returns merged theme after setup with overrides
+tiling.setup({ theme = { accent = "#ff0000" } })
+theme = tiling.get_theme()
+assert(theme.accent == "#ff0000", "get_theme: override applied")
+assert(theme.bg1 == "#1e1e2e", "get_theme: defaults preserved after override")
