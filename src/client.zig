@@ -2481,8 +2481,8 @@ pub const App = struct {
         map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = opts.attach } };
         map_items[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
         var idx: usize = 4;
-        if (opts.cwd) |cwd| {
-            map_items[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+        if (opts.cwd) |cwd_val| {
+            map_items[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd_val } };
             idx += 1;
         }
         if (opts.cmd) |cmd| {
