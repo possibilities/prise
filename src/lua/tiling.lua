@@ -183,7 +183,7 @@ local utils = require("utils")
 ---@field type "cwd_changed"
 ---@field data table
 
----@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent
+---@alias Event PtyAttachEvent|PtySpawnedEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
