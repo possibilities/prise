@@ -684,16 +684,44 @@ fn fetchPtyValidity(allocator: std.mem.Allocator, socket_path: []const u8) !i64 
 }
 
 /// Spawn a detached PTY on the server via spawn_pty RPC.
+/// Sends the client's full environment and cwd so the spawned shell
+/// inherits PATH and other vars (matching spawnInitialPty behavior).
 fn spawnDetachedPty(allocator: std.mem.Allocator, socket_path: []const u8) !u64 {
     const sock = try connectToServer(socket_path);
     defer posix.close(sock);
 
-    var map_items = [3]msgpack.Value.KeyValue{
-        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 24 } },
-        .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 80 } },
-        .{ .key = .{ .string = "attach" }, .value = .{ .boolean = false } },
-    };
-    const params = msgpack.Value{ .map = &map_items };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Collect client environment as "KEY=VALUE" strings
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+
+    var env_array = std.ArrayList(msgpack.Value).empty;
+    defer env_array.deinit(allocator);
+    var env_it = env_map.iterator();
+    while (env_it.next()) |entry| {
+        const env_str = try std.fmt.allocPrint(arena_alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+        try env_array.append(allocator, .{ .string = env_str });
+    }
+
+    // Get client cwd
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = posix.getcwd(&cwd_buf) catch null;
+
+    const param_count: usize = if (cwd != null) 5 else 4;
+    var map_items = try allocator.alloc(msgpack.Value.KeyValue, param_count);
+    defer allocator.free(map_items);
+    map_items[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 24 } };
+    map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 80 } };
+    map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = false } };
+    map_items[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
+    if (cwd) |c| {
+        map_items[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = c } };
+    }
+
+    const params = msgpack.Value{ .map = map_items };
     const request = try msgpack.encode(allocator, .{ 0, 1, "spawn_pty", params });
     defer allocator.free(request);
 
