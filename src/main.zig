@@ -20,6 +20,8 @@ const ParseResult = struct {
     attach_session: ?[]const u8 = null,
     /// Session name for a new session (user-specified)
     new_session_name: ?[]const u8 = null,
+    /// Create session without attaching (-d/--detached)
+    detached: bool = false,
 };
 
 var log_file: ?std.fs.File = null;
@@ -103,6 +105,21 @@ pub fn main() !void {
         if (result.attach_session) |s| allocator.free(s);
         if (result.new_session_name) |s| allocator.free(s);
     }
+
+    if (result.detached) {
+        createDetachedSession(allocator, socket_path, result.new_session_name.?) catch |err| {
+            if (err == error.ServerNotRunning) {
+                try std.fs.File.stderr().writeAll(
+                    \\Server not running. Start with:
+                    \\    prise serve
+                    \\
+                );
+            }
+            return;
+        };
+        return;
+    }
+
     runClient(allocator, socket_path, result) catch |err| {
         var log_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 
@@ -163,6 +180,8 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?ParseResul
                 return error.SessionAlreadyExists;
             }
             result.new_session_name = try allocator.dupe(u8, name);
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detached")) {
+            result.detached = true;
         } else if (std.mem.eql(u8, arg, "serve")) {
             initLogFile("server.log");
             try server.startServer(allocator, socket_path);
@@ -183,6 +202,11 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?ParseResul
             try printHelp();
             return error.UnknownCommand;
         }
+    }
+
+    if (result.detached and result.new_session_name == null) {
+        printSessionNameError("error: --detached requires -s/--session <name>\n");
+        return error.MissingArgument;
     }
 
     return result;
@@ -251,6 +275,7 @@ fn printHelp() !void {
         \\
         \\Options:
         \\  -s, --session <name>  Create a new session with the specified name
+        \\  -d, --detached        With -s, create session without attaching
         \\  -h, --help            Show this help message
         \\  -v, --version         Show version
         \\
@@ -597,6 +622,145 @@ fn deleteSession(allocator: std.mem.Allocator, name: []const u8) !void {
     };
 
     try stdout.interface.print("Deleted session '{s}'.\n", .{name});
+}
+
+/// Connect to the prise server socket. Caller must close the returned fd.
+fn connectToServer(socket_path: []const u8) !posix.fd_t {
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        return error.SocketError;
+    };
+    errdefer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            std.fs.File.stderr().writeAll("Server not running.\n") catch {};
+            return error.ServerNotRunning;
+        }
+        return err;
+    };
+
+    return sock;
+}
+
+/// Send an RPC request and decode the response.
+fn sendRpcRequest(allocator: std.mem.Allocator, sock: posix.fd_t, request: []const u8) !rpc.Message {
+    _ = try posix.write(sock, request);
+
+    var response_buf: [4096]u8 = undefined;
+    const n = try posix.read(sock, &response_buf);
+    if (n == 0) return error.NoResponse;
+
+    return rpc.decodeMessage(allocator, response_buf[0..n]);
+}
+
+/// Fetch pty_validity from the server via get_server_info RPC.
+fn fetchPtyValidity(allocator: std.mem.Allocator, socket_path: []const u8) !i64 {
+    const sock = try connectToServer(socket_path);
+    defer posix.close(sock);
+
+    const request = try msgpack.encode(allocator, .{ 0, 1, "get_server_info", .{} });
+    defer allocator.free(request);
+
+    const msg = try sendRpcRequest(allocator, sock, request);
+    defer msg.deinit(allocator);
+
+    if (msg != .response) return error.InvalidResponse;
+    if (msg.response.err != null) return error.ServerError;
+    if (msg.response.result != .map) return error.InvalidResponse;
+
+    for (msg.response.result.map) |kv| {
+        if (kv.key == .string and std.mem.eql(u8, kv.key.string, "pty_validity")) {
+            if (kv.value == .integer) return kv.value.integer;
+            if (kv.value == .unsigned) return @intCast(kv.value.unsigned);
+        }
+    }
+
+    return error.InvalidResponse;
+}
+
+/// Spawn a detached PTY on the server via spawn_pty RPC.
+fn spawnDetachedPty(allocator: std.mem.Allocator, socket_path: []const u8) !u64 {
+    const sock = try connectToServer(socket_path);
+    defer posix.close(sock);
+
+    var map_items = [3]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 24 } },
+        .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 80 } },
+        .{ .key = .{ .string = "attach" }, .value = .{ .boolean = false } },
+    };
+    const params = msgpack.Value{ .map = &map_items };
+    const request = try msgpack.encode(allocator, .{ 0, 1, "spawn_pty", params });
+    defer allocator.free(request);
+
+    const msg = try sendRpcRequest(allocator, sock, request);
+    defer msg.deinit(allocator);
+
+    if (msg != .response) return error.InvalidResponse;
+    if (msg.response.err != null) return error.ServerError;
+
+    // spawn_pty returns unsigned pty_id on success, string on error
+    if (msg.response.result == .unsigned) return msg.response.result.unsigned;
+    if (msg.response.result == .string) {
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "error: {s}\n", .{msg.response.result.string}) catch return error.SpawnFailed;
+        std.fs.File.stderr().writeAll(text) catch {};
+        return error.SpawnFailed;
+    }
+
+    return error.InvalidResponse;
+}
+
+/// Write a minimal session JSON file for a single-pane detached session.
+fn writeNewSessionFile(allocator: std.mem.Allocator, name: []const u8, pty_validity: i64, pty_id: u64) !void {
+    const home = posix.getenv("HOME") orelse return error.NoHomeDirectory;
+    const sessions_dir = try std.fs.path.join(allocator, &.{ home, ".local", "state", "prise", "sessions" });
+    defer allocator.free(sessions_dir);
+
+    // Ensure sessions directory exists (same pattern as client.zig)
+    std.fs.makeDirAbsolute(sessions_dir) catch |err| {
+        if (err != error.PathAlreadyExists) {
+            const parent = try std.fs.path.join(allocator, &.{ home, ".local", "state", "prise" });
+            defer allocator.free(parent);
+            std.fs.makeDirAbsolute(parent) catch |e| {
+                if (e != error.PathAlreadyExists) return e;
+            };
+            std.fs.makeDirAbsolute(sessions_dir) catch |e| {
+                if (e != error.PathAlreadyExists) return e;
+            };
+        }
+    };
+
+    const json = try std.fmt.allocPrint(allocator,
+        \\{{"pty_validity":{d},"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":{d}}}}}],"active_tab":1}}
+    , .{ pty_validity, pty_id });
+    defer allocator.free(json);
+
+    const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{name});
+    defer allocator.free(filename);
+
+    const path = try std.fs.path.join(allocator, &.{ sessions_dir, filename });
+    defer allocator.free(path);
+
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(json);
+}
+
+/// Create a detached session: fetch server info, spawn PTY, write session file.
+fn createDetachedSession(allocator: std.mem.Allocator, socket_path: []const u8, name: []const u8) !void {
+    const pty_validity = try fetchPtyValidity(allocator, socket_path);
+    const pty_id = try spawnDetachedPty(allocator, socket_path);
+    try writeNewSessionFile(allocator, name, pty_validity, pty_id);
+
+    var buf: [256]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+    try stdout.interface.print("Created session '{s}'.\n", .{name});
 }
 
 fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {
