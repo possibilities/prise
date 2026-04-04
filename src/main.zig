@@ -648,14 +648,39 @@ fn connectToServer(socket_path: []const u8) !posix.fd_t {
 }
 
 /// Send an RPC request and decode the response.
+/// Skips any notification messages (type 2) that arrive before the response,
+/// since the server may broadcast notifications to all clients including
+/// the ephemeral connection used for this RPC.
 fn sendRpcRequest(allocator: std.mem.Allocator, sock: posix.fd_t, request: []const u8) !rpc.Message {
     _ = try posix.write(sock, request);
 
     var response_buf: [4096]u8 = undefined;
-    const n = try posix.read(sock, &response_buf);
-    if (n == 0) return error.NoResponse;
+    var buf_len: usize = 0;
 
-    return rpc.decodeMessage(allocator, response_buf[0..n]);
+    while (true) {
+        const n = try posix.read(sock, response_buf[buf_len..]);
+        if (n == 0) return error.NoResponse;
+        buf_len += n;
+
+        // Process all complete messages in the buffer
+        while (buf_len > 0) {
+            const result = rpc.decodeMessageWithSize(allocator, response_buf[0..buf_len]) catch |err| switch (err) {
+                error.UnexpectedEndOfInput => break, // incomplete message, read more
+                else => return err,
+            };
+
+            if (result.message == .response) return result.message;
+
+            // Skip notification, shift remaining data
+            result.message.deinit(allocator);
+            const consumed = result.bytes_consumed;
+            const remaining = buf_len - consumed;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, response_buf[0..remaining], response_buf[consumed..buf_len]);
+            }
+            buf_len = remaining;
+        }
+    }
 }
 
 /// Fetch pty_validity from the server via get_server_info RPC.
@@ -714,15 +739,16 @@ fn spawnDetachedPty(allocator: std.mem.Allocator, socket_path: []const u8, sessi
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = posix.getcwd(&cwd_buf) catch null;
 
-    const param_count: usize = if (cwd != null) 5 else 4;
+    const param_count: usize = if (cwd != null) 6 else 5;
     var map_items = try allocator.alloc(msgpack.Value.KeyValue, param_count);
     defer allocator.free(map_items);
     map_items[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 24 } };
     map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 80 } };
     map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = false } };
     map_items[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
+    map_items[4] = .{ .key = .{ .string = "session" }, .value = .{ .string = session_name } };
     if (cwd) |c| {
-        map_items[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = c } };
+        map_items[5] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = c } };
     }
 
     const params = msgpack.Value{ .map = map_items };
