@@ -90,6 +90,8 @@ pub const UI = struct {
     rename_session_ctx: *anyopaque = undefined,
     delete_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
     delete_session_ctx: *anyopaque = undefined,
+    create_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
+    create_session_ctx: *anyopaque = undefined,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -266,6 +268,11 @@ pub const UI = struct {
         self.delete_session_callback = cb;
     }
 
+    pub fn setCreateSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void) void {
+        self.create_session_ctx = ctx;
+        self.create_session_callback = cb;
+    }
+
     pub fn getNextSessionName(self: *UI) ![]const u8 {
         const home = std.posix.getenv("HOME") orelse return self.allocator.dupe(u8, AMORY_NAMES[0]);
 
@@ -399,6 +406,10 @@ pub const UI = struct {
         // Register switch_session
         lua.pushFunction(ziglua.wrap(switchSession));
         lua.setField(-2, "switch_session");
+
+        // Register create_session
+        lua.pushFunction(ziglua.wrap(createSession));
+        lua.setField(-2, "create_session");
 
         // Register log
         lua.createTable(0, 4);
@@ -704,6 +715,41 @@ pub const UI = struct {
             lua.pushBoolean(true);
         } else {
             log.warn("switchSession: no callback registered", .{});
+            lua.pushBoolean(false);
+        }
+        return 1;
+    }
+
+    fn createSession(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        lua.pop(1);
+
+        const session_name_lua = lua.toString(1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+
+        const session_name = ui.allocator.dupe(u8, session_name_lua) catch {
+            log.warn("createSession: failed to allocate session name", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        defer ui.allocator.free(session_name);
+
+        log.info("createSession: called with name='{s}'", .{session_name});
+
+        if (ui.create_session_callback) |cb| {
+            cb(ui.create_session_ctx, session_name) catch {
+                lua.pushBoolean(false);
+                return 1;
+            };
+            lua.pushBoolean(true);
+        } else {
+            log.warn("createSession: no callback registered", .{});
             lua.pushBoolean(false);
         }
         return 1;

@@ -1013,6 +1013,14 @@ pub const App = struct {
             }
         }.switchCb);
 
+        // Register create_session callback
+        self.ui.setCreateSessionCallback(self, struct {
+            fn createCb(ctx: *anyopaque, session_name: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.createSession(session_name);
+            }
+        }.createCb);
+
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
         try self.handleVaxisEvent(.{ .winsize = ws });
@@ -2697,6 +2705,52 @@ pub const App = struct {
         self.vx = vaxis.Vaxis.init(self.allocator, .{}) catch return err;
         self.vx.enterAltScreen(writer) catch {};
         return err;
+    }
+
+    /// Create a new empty session and switch to it.
+    /// Writes a minimal session file, then exec's into the new session.
+    pub fn createSession(self: *App, name: []const u8) !void {
+        std.debug.assert(name.len > 0);
+
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        // Ensure directory exists
+        std.fs.makeDirAbsolute(state_dir) catch |e| {
+            if (e != error.PathAlreadyExists) {
+                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
+                std.fs.makeDirAbsolute(parent) catch |e2| {
+                    if (e2 != error.PathAlreadyExists) return e2;
+                };
+                std.fs.makeDirAbsolute(state_dir) catch |e2| {
+                    if (e2 != error.PathAlreadyExists) return e2;
+                };
+            }
+        };
+
+        var dir = try std.fs.openDirAbsolute(state_dir, .{});
+        defer dir.close();
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{name});
+        defer self.allocator.free(filename);
+
+        // Write minimal session JSON with pty_validity=0 to force fresh PTY spawning
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "/tmp";
+        var json_buf: [1024]u8 = undefined;
+        const json = std.fmt.bufPrint(&json_buf,
+            \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":"{s}"}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
+        , .{cwd}) catch return error.NameTooLong;
+
+        const file = try dir.createFile(filename, .{});
+        defer file.close();
+        try file.writeAll(json);
+
+        log.info("Created session file '{s}'", .{name});
+
+        // Switch to the new session (saves current + exec's into new)
+        try self.switchToSession(name);
     }
 
     pub fn deleteCurrentSession(self: *App) void {

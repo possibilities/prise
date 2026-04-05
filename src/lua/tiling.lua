@@ -3231,15 +3231,9 @@ function M.update(event)
                 if current ~= data.session then
                     local ok = prise.switch_session(data.session)
                     if not ok then
-                        -- Session doesn't exist — create fresh
-                        prise.save()
-                        state.tabs = {}
-                        state.active_tab = 1
-                        state.next_tab_id = 1
-                        state.focused_id = nil
-                        state.zoomed_pane_id = nil
-                        state.next_split_id = 1
-                        prise.rename_session(prise.get_session_name(), data.session)
+                        -- Session doesn't exist — create and switch to it
+                        prise.create_session(data.session)
+                        return
                     end
                 end
             end
