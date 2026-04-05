@@ -197,3 +197,112 @@ assert(#item == 20, "format_palette_item: correct width")
 item = t.format_palette_item("Very Long Command Name", "C-x", 10)
 -- Width is too small, should use minimum padding of 2
 assert(item == "Very Long Command Name  C-x", "format_palette_item: minimum padding")
+
+-- === get_active_tab_info / get_focused_pane_index ===
+
+-- Access internal state via debug.getupvalue on tiling.update
+do
+    local state_ref
+    for i = 1, 256 do
+        local name, val = debug.getupvalue(tiling.update, i)
+        if not name then
+            break
+        end
+        if name == "state" then
+            state_ref = val
+            break
+        end
+    end
+    assert(state_ref, "could not find state upvalue")
+
+    -- Save original state to restore later
+    local orig_tabs = state_ref.tabs
+    local orig_active = state_ref.active_tab
+    local orig_focused = state_ref.focused_id
+
+    -- Helper to reset state after each test
+    local function reset()
+        state_ref.tabs = orig_tabs
+        state_ref.active_tab = orig_active
+        state_ref.focused_id = orig_focused
+    end
+
+    -- -- get_active_tab_info -- --
+
+    -- Test: get_active_tab_info with single pane tab
+    local p1 = mock_pane(1)
+    state_ref.tabs = { mock_tab(p1) }
+    state_ref.active_tab = 1
+    state_ref.focused_id = 1
+    local info = tiling.get_active_tab_info()
+    assert(info ~= nil, "get_active_tab_info: single pane not nil")
+    assert(info.index == 1, "get_active_tab_info: index is 1")
+    assert(type(info.title) == "string", "get_active_tab_info: title is string")
+    assert(info.pane_count == 1, "get_active_tab_info: pane_count is 1")
+
+    -- Test: get_active_tab_info with no tabs
+    state_ref.tabs = {}
+    state_ref.active_tab = 1
+    info = tiling.get_active_tab_info()
+    assert(info == nil, "get_active_tab_info: no tabs returns nil")
+
+    -- Test: get_active_tab_info with 3-pane split
+    local three_split = mock_split(1, "col", {
+        mock_pane(1),
+        mock_split(2, "row", {
+            mock_pane(2),
+            mock_pane(3),
+        }),
+    })
+    state_ref.tabs = { mock_tab(three_split) }
+    state_ref.active_tab = 1
+    state_ref.focused_id = 1
+    info = tiling.get_active_tab_info()
+    assert(info ~= nil, "get_active_tab_info: 3-pane not nil")
+    assert(info.pane_count == 3, "get_active_tab_info: 3-pane count")
+
+    -- Test: get_active_tab_info with floating pane
+    local float_pane = mock_pane(9)
+    state_ref.tabs = { mock_tab(mock_pane(1), float_pane) }
+    state_ref.active_tab = 1
+    state_ref.focused_id = 1
+    info = tiling.get_active_tab_info()
+    assert(info ~= nil, "get_active_tab_info: floating not nil")
+    assert(info.pane_count == 2, "get_active_tab_info: floating included in count")
+
+    -- -- get_focused_pane_index -- --
+
+    -- Test: get_focused_pane_index with focused on first pane
+    local split_two = mock_split(1, "row", { mock_pane(10), mock_pane(20) })
+    state_ref.tabs = { mock_tab(split_two) }
+    state_ref.active_tab = 1
+    state_ref.focused_id = 10
+    local idx = tiling.get_focused_pane_index()
+    assert(idx == 1, "get_focused_pane_index: first pane returns 1")
+
+    -- Test: get_focused_pane_index with focused on second pane
+    state_ref.focused_id = 20
+    idx = tiling.get_focused_pane_index()
+    assert(idx == 2, "get_focused_pane_index: second pane returns 2")
+
+    -- Test: get_focused_pane_index with no focused pane
+    state_ref.focused_id = nil
+    idx = tiling.get_focused_pane_index()
+    assert(idx == nil, "get_focused_pane_index: nil focused returns nil")
+
+    -- Test: get_focused_pane_index with no tabs
+    state_ref.tabs = {}
+    state_ref.active_tab = 1
+    state_ref.focused_id = 10
+    idx = tiling.get_focused_pane_index()
+    assert(idx == nil, "get_focused_pane_index: no tabs returns nil")
+
+    -- Test: get_focused_pane_index with pane not in active tab
+    state_ref.tabs = { mock_tab(mock_pane(10)) }
+    state_ref.active_tab = 1
+    state_ref.focused_id = 99
+    idx = tiling.get_focused_pane_index()
+    assert(idx == nil, "get_focused_pane_index: pane not in tab returns nil")
+
+    reset()
+end
