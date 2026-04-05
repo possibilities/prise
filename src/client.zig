@@ -215,6 +215,7 @@ pub const ServerAction = union(enum) {
     pty_exited: struct { pty_id: u32, status: u32 },
     cwd_changed: struct { pty_id: u32, cwd: []const u8 },
     detached,
+    session_switch_requested: []const u8,
     color_query: ColorQueryTarget,
     server_info: struct { pty_validity: i64 },
     copy_to_clipboard: []const u8,
@@ -397,6 +398,18 @@ pub const ClientLogic = struct {
             return try handleCwdChanged(state, notif.params);
         } else if (std.mem.eql(u8, notif.method, "color_query")) {
             return parseColorQuery(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "session_switch")) {
+            return parseSessionSwitch(notif.params);
+        }
+        return .none;
+    }
+
+    fn parseSessionSwitch(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+        for (params.map) |kv| {
+            if (kv.key == .string and std.mem.eql(u8, kv.key.string, "session")) {
+                if (kv.value == .string) return .{ .session_switch_requested = kv.value.string };
+            }
         }
         return .none;
     }
@@ -2341,6 +2354,10 @@ pub const App = struct {
                             },
                             .server_info => {
                                 try app.onServerInfoReceived();
+                            },
+                            .session_switch_requested => |target| {
+                                log.info("Session switch requested to '{s}'", .{target});
+                                try app.switchToSession(target);
                             },
                             .copy_to_clipboard => |text| {
                                 app.copyToClipboard(text);
