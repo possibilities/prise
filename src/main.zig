@@ -868,7 +868,7 @@ fn createMinimalSession(allocator: std.mem.Allocator, name: []const u8) !void {
                 if (e != error.PathAlreadyExists) return e;
             };
             // Retry opening
-            const dir = try std.fs.openDirAbsolute(state_dir, .{ .iterate = true });
+            var dir = try std.fs.openDirAbsolute(state_dir, .{ .iterate = true });
             // Can't use getSessionsDir return type easily, just write directly
             defer dir.close();
             var filename_buf: [256]u8 = undefined;
