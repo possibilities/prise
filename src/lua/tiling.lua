@@ -1574,8 +1574,11 @@ local function finalize_layout(pending)
     -- Swap in new state
     state.tabs = new_tabs
     state.next_tab_id = #new_tabs + 1
+    ---@diagnostic disable-next-line: assign-type-mismatch
     state.floating.width = new_floating_width
+    ---@diagnostic disable-next-line: assign-type-mismatch
     state.floating.height = new_floating_height
+    ---@diagnostic disable-next-line: assign-type-mismatch
     state.floating.visible = new_floating_visible
     state.zoomed_pane_id = nil
 

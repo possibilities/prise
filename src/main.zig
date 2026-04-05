@@ -1024,6 +1024,40 @@ fn findMostRecentSession(allocator: std.mem.Allocator) ![]const u8 {
     return error.NoSessionsFound;
 }
 
+// Note: parseArgs cannot be unit-tested without refactoring to accept
+// an argument iterator instead of calling std.process.argsWithAllocator.
+
+test "ParseResult defaults" {
+    const result: ParseResult = .{};
+    try std.testing.expect(result.detached == false);
+    try std.testing.expect(result.attach_session == null);
+    try std.testing.expect(result.new_session_name == null);
+}
+
+test "validateSessionName accepts valid names" {
+    try validateSessionName("my-session");
+    try validateSessionName("session_1");
+    try validateSessionName("abc123");
+    try validateSessionName("a");
+    try validateSessionName("A-Z_0-9");
+}
+
+test "validateSessionName rejects empty name" {
+    try std.testing.expectError(error.SessionNameEmpty, validateSessionName(""));
+}
+
+test "validateSessionName rejects names over 64 chars" {
+    const long_name = "a" ** 65;
+    try std.testing.expectError(error.SessionNameTooLong, validateSessionName(long_name));
+}
+
+test "validateSessionName rejects invalid characters" {
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has space"));
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has/slash"));
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has.dot"));
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has@at"));
+}
+
 test {
     _ = @import("io/mock.zig");
     _ = @import("server.zig");
