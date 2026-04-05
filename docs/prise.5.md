@@ -34,6 +34,7 @@ ui.setup({
     keybinds = { ... },
     layouts = { ... },
     default_layout = "...",
+    keep_attached = true,
 })
 
 return ui
@@ -250,6 +251,21 @@ Example:
 ```lua
 ui.setup({
     macos_option_as_alt = "true",
+})
+```
+
+# KEEP ATTACHED
+
+**keep_attached**
+:   When the last pane in the last tab exits, switch to another session instead
+    of exiting. When no other sessions exist, prise exits normally. Default:
+    **true**
+
+Example:
+
+```lua
+ui.setup({
+    keep_attached = false,  -- Exit when last pane closes
 })
 ```
 
