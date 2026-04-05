@@ -1574,9 +1574,9 @@ local function finalize_layout(pending)
     -- Swap in new state
     -- LuaLS treats the secondary return values as optional because the failure path
     -- above returns `nil` for the whole tuple. Narrow them after the `new_tabs` guard.
-    assert(new_floating_width ~= nil, "Layout: missing floating width after successful build")
-    assert(new_floating_height ~= nil, "Layout: missing floating height after successful build")
-    assert(new_floating_visible ~= nil, "Layout: missing floating visibility after successful build")
+    ---@cast new_floating_width number
+    ---@cast new_floating_height number
+    ---@cast new_floating_visible boolean
     state.tabs = new_tabs
     state.next_tab_id = #new_tabs + 1
     state.floating.width = new_floating_width
