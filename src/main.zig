@@ -40,6 +40,14 @@ pub const std_options: std.Options = .{
 
 var log_buffer: [4096]u8 = undefined;
 
+/// Write directly to the log file, bypassing std.log. Silent when log_file
+/// is null (e.g. during tests) so messages don't leak into test runner stderr.
+fn logDirect(comptime format: []const u8, args: anytype) void {
+    const file = log_file orelse return;
+    const msg = std.fmt.bufPrint(&log_buffer, format ++ "\n", args) catch return;
+    _ = file.write(msg) catch {};
+}
+
 fn fileLogFn(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.enum_literal),
@@ -426,6 +434,7 @@ fn handleTabCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator
             std.fs.File.stderr().writeAll("Missing title. Usage: prise tab rename <title>\n") catch {};
             return error.MissingArgument;
         };
+        initLogFile("client.log");
         const context = try getTabRenameContext();
         try executeTabRename(allocator, resolvePriseSocketPath(socket_path), null, context, new_title);
         return null;
@@ -563,7 +572,7 @@ fn renameTab(
 
     posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
         if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            std.fs.File.stderr().writeAll("Server not running.\n") catch {};
+            logDirect("Server not running", .{});
             return error.ServerNotRunning;
         }
         return err;
@@ -582,35 +591,31 @@ fn renameTab(
 
     const msg = readRpcResponseMessage(allocator, sock) catch |err| {
         switch (err) {
-            error.NoResponse => std.fs.File.stderr().writeAll("No response from server.\n") catch {},
-            else => log.err("Failed to read rename_tab response: {}", .{err}),
+            error.NoResponse => logDirect("No response from server", .{}),
+            else => logDirect("Failed to read rename_tab response: {}", .{err}),
         }
         return err;
     };
     defer msg.deinit(allocator);
 
     if (msg != .response) {
-        std.fs.File.stderr().writeAll("Unexpected response type.\n") catch {};
+        logDirect("Unexpected response type", .{});
         return error.InvalidResponse;
     }
 
     if (msg.response.err) |err_val| {
         const err_str = if (err_val == .string) err_val.string else "unknown error";
-        var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "Server error: {s}\n", .{err_str}) catch return error.ServerError;
-        std.fs.File.stderr().writeAll(text) catch {};
+        logDirect("Server error: {s}", .{err_str});
         return error.ServerError;
     }
 
     if (msg.response.result != .string) {
-        std.fs.File.stderr().writeAll("Invalid response format.\n") catch {};
+        logDirect("Invalid response format", .{});
         return error.InvalidResponse;
     }
 
     if (!std.mem.eql(u8, msg.response.result.string, "ok")) {
-        var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "Error: {s}\n", .{msg.response.result.string}) catch return error.RenameRejected;
-        std.fs.File.stderr().writeAll(text) catch {};
+        logDirect("{s}", .{msg.response.result.string});
         return error.RenameRejected;
     }
 }
