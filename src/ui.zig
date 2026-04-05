@@ -697,8 +697,9 @@ pub const UI = struct {
         log.info("switchSession: called with target_session='{s}'", .{target_session});
 
         if (ui.switch_session_callback) |cb| {
-            cb(ui.switch_session_ctx, target_session) catch |err| {
-                lua.raiseErrorStr("Failed to switch session: %s", .{@errorName(err).ptr});
+            cb(ui.switch_session_ctx, target_session) catch {
+                lua.pushBoolean(false);
+                return 1;
             };
             lua.pushBoolean(true);
         } else {

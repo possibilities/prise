@@ -630,6 +630,18 @@ local function find_tab_for_pane(pane_id)
     return nil
 end
 
+---Find a tab by its title
+---@param title string
+---@return integer?, Tab?
+local function find_tab_by_title(title)
+    for i, tab in ipairs(state.tabs) do
+        if tab.title == title then
+            return i, tab
+        end
+    end
+    return nil
+end
+
 ---Collect all panes in a node tree
 ---@param node? Node
 ---@param acc? Pane[]
@@ -3213,16 +3225,42 @@ function M.update(event)
 
         -- If placement fields present, auto-adopt this PTY
         if data.session or data.tab or data.title then
+            -- 1. Session: switch or create
             if data.session then
                 local current = prise.get_session_name()
                 if current ~= data.session then
-                    prise.switch_session(data.session)
+                    local ok = prise.switch_session(data.session)
+                    if not ok then
+                        -- Session doesn't exist — create fresh
+                        prise.save()
+                        state.tabs = {}
+                        state.active_tab = 1
+                        state.next_tab_id = 1
+                        state.focused_id = nil
+                        state.zoomed_pane_id = nil
+                        state.next_split_id = 1
+                        prise.rename_session(prise.get_session_name(), data.session)
+                    end
                 end
             end
-            if data.tab == "new" then
+
+            -- 2. Tab: find by name or create
+            if data.tab and data.tab ~= "<new>" then
+                local idx = find_tab_by_title(data.tab)
+                if idx then
+                    set_active_tab_index(idx)
+                else
+                    state.pending_new_tab = true
+                end
+            else
+                -- nil or "<new>" — always create a new tab
                 state.pending_new_tab = true
             end
+
+            -- 3. Attach the PTY
             prise.attach(data.id)
+
+            -- 4. Name the tab (for new tabs, or rename if title differs)
             if data.title then
                 state.pending_title_renames[data.id] = data.title
             end
@@ -4540,6 +4578,7 @@ M._test = {
     get_state = function()
         return state
     end,
+    find_tab_by_title = find_tab_by_title,
 }
 
 return M
