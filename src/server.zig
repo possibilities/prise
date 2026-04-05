@@ -2228,10 +2228,25 @@ const Server = struct {
             }
         }
 
-        const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items), cwd);
-
+        // Assign PTY ID before spawn so we can set env vars
         const pty_id = self.next_pty_id;
         self.next_pty_id += 1;
+
+        // Add prise environment variables
+        const prise_str = try self.allocator.dupe(u8, "PRISE=1");
+        try env_list.append(self.allocator, prise_str);
+
+        var pty_id_env_buf: [32]u8 = undefined;
+        const pty_id_env = try std.fmt.bufPrint(&pty_id_env_buf, "PRISE_PTY={d}", .{pty_id});
+        const prise_pty_str = try self.allocator.dupe(u8, pty_id_env);
+        try env_list.append(self.allocator, prise_pty_str);
+
+        var socket_env_buf: [280]u8 = undefined;
+        const socket_env = try std.fmt.bufPrint(&socket_env_buf, "PRISE_SOCKET={s}", .{self.socket_path});
+        const prise_socket_str = try self.allocator.dupe(u8, socket_env);
+        try env_list.append(self.allocator, prise_socket_str);
+
+        const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items), cwd);
 
         const pty_instance = try Pty.init(self.allocator, pty_id, process, parsed.size);
         pty_instance.server_ptr = self;
@@ -2633,6 +2648,8 @@ const Server = struct {
             return self.handleGetSelection(params);
         } else if (std.mem.eql(u8, method, "clear_selection")) {
             return self.handleClearSelection(params);
+        } else if (std.mem.eql(u8, method, "rename_tab")) {
+            return self.handleRenameTab(client, params);
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "unknown method") };
         }
@@ -2848,6 +2865,52 @@ const Server = struct {
             if (attached) {
                 try client.sendData(self.loop, msg_bytes);
             }
+        }
+    }
+
+    fn handleRenameTab(self: *Server, requesting_client: ?*Client, params: msgpack.Value) !msgpack.Value {
+        if (params != .map) return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
+
+        var pty_id: ?usize = null;
+        var title: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "title")) {
+                title = if (kv.value == .string) kv.value.string else null;
+            }
+        }
+
+        const pid = pty_id orelse return msgpack.Value{ .string = try self.allocator.dupe(u8, "missing pty_id") };
+        const t = title orelse return msgpack.Value{ .string = try self.allocator.dupe(u8, "missing title") };
+
+        try self.sendRenameTab(pid, t, requesting_client);
+
+        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+    }
+
+    /// Broadcast rename_tab notification to all clients
+    fn sendRenameTab(self: *Server, pty_id: usize, title: []const u8, exclude_client: ?*Client) !void {
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } };
+        map_items[1] = .{ .key = .{ .string = "title" }, .value = .{ .string = title } };
+
+        const map_params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "rename_tab", map_params });
+        defer self.allocator.free(msg_bytes);
+
+        for (self.clients.items) |client| {
+            if (exclude_client) |excluded| {
+                if (client == excluded) continue;
+            }
+            try client.sendData(self.loop, msg_bytes);
         }
     }
 

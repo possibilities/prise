@@ -6,6 +6,7 @@ const build_options = @import("build_options");
 const io = @import("io.zig");
 const msgpack = @import("msgpack.zig");
 const rpc = @import("rpc.zig");
+const session_json = @import("session_json.zig");
 const server = @import("server.zig");
 const client = @import("client.zig");
 const posix = std.posix;
@@ -178,6 +179,9 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?ParseResul
         } else if (std.mem.eql(u8, arg, "pty")) {
             _ = try handlePtyCommand(allocator, &args, socket_path);
             return null;
+        } else if (std.mem.eql(u8, arg, "tab")) {
+            _ = try handleTabCommand(allocator, &args, socket_path);
+            return null;
         } else {
             log.err("Unknown command: {s}", .{arg});
             try printHelp();
@@ -248,6 +252,7 @@ fn printHelp() !void {
         \\  serve      Start the server in the foreground
         \\  session    Manage sessions (attach, list, rename, delete)
         \\  pty        Manage PTYs (list, kill)
+        \\  tab        Manage tabs (rename)
         \\
         \\Options:
         \\  -s, --session <name>  Create a new session with the specified name
@@ -399,6 +404,120 @@ fn handlePtyCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator
         try printPtyHelpTo(std.fs.File.stderr());
         return error.UnknownCommand;
     }
+}
+
+fn handleTabCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator, socket_path: []const u8) !?ParseResult {
+    const subcmd = args.next() orelse {
+        try printTabHelp();
+        return error.MissingCommand;
+    };
+
+    if (std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "-h")) {
+        try printTabHelp();
+        return null;
+    } else if (std.mem.eql(u8, subcmd, "rename")) {
+        const new_title = args.next() orelse {
+            std.fs.File.stderr().writeAll("Missing title. Usage: prise tab rename <title>\n") catch {};
+            return error.MissingArgument;
+        };
+        const pty_id_str = posix.getenv("PRISE_PTY") orelse {
+            std.fs.File.stderr().writeAll("Not running inside prise (PRISE_PTY not set).\n") catch {};
+            return error.MissingArgument;
+        };
+        const pty_id = std.fmt.parseInt(u32, pty_id_str, 10) catch {
+            std.fs.File.stderr().writeAll("Invalid PRISE_PTY value.\n") catch {};
+            return error.InvalidArgument;
+        };
+        if (posix.getenv("PRISE_SESSION")) |session_name| {
+            try persistTabRename(allocator, session_name, pty_id, if (new_title.len > 0) new_title else null);
+        }
+        try renameTab(allocator, resolvePriseSocketPath(socket_path), pty_id, new_title);
+        return null;
+    } else {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Unknown tab command: {s}\n\n", .{subcmd}) catch return error.UnknownCommand;
+        std.fs.File.stderr().writeAll(msg) catch {};
+        try printTabHelpTo(std.fs.File.stderr());
+        return error.UnknownCommand;
+    }
+}
+
+fn printTabHelp() !void {
+    try printTabHelpTo(std.fs.File.stdout());
+}
+
+fn printTabHelpTo(file: std.fs.File) !void {
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(&buf);
+    defer writer.interface.flush() catch {};
+    try writer.interface.print(
+        \\prise tab - Manage tabs
+        \\
+        \\Usage: prise tab <command> [args]
+        \\
+        \\Commands:
+        \\  rename <title>           Set the tab title (run from within prise)
+        \\
+        \\Options:
+        \\  -h, --help               Show this help message
+        \\
+    , .{});
+}
+
+fn resolvePriseSocketPath(default_socket_path: []const u8) []const u8 {
+    return posix.getenv("PRISE_SOCKET") orelse default_socket_path;
+}
+
+fn persistTabRename(allocator: std.mem.Allocator, session_name: []const u8, pty_id: u32, title: ?[]const u8) !void {
+    const result = getSessionsDir(allocator) catch |err| switch (err) {
+        error.NoSessionsFound => return,
+        else => return err,
+    };
+    defer allocator.free(result.path);
+    var dir = result.dir;
+    dir.close();
+
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{session_name});
+    defer allocator.free(file_name);
+
+    const session_path = try std.fs.path.join(allocator, &.{ result.path, file_name });
+    defer allocator.free(session_path);
+
+    _ = try session_json.updateTabTitleFile(allocator, session_path, pty_id, title);
+}
+
+fn renameTab(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32, title: []const u8) !void {
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        return error.SocketError;
+    };
+    defer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            std.fs.File.stderr().writeAll("Server not running.\n") catch {};
+            return;
+        }
+        return err;
+    };
+
+    var map_items = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } },
+        .{ .key = .{ .string = "title" }, .value = .{ .string = title } },
+    };
+    const params = msgpack.Value{ .map = &map_items };
+    const request = try msgpack.encode(allocator, .{ 0, 1, "rename_tab", params });
+    defer allocator.free(request);
+
+    _ = try posix.write(sock, request);
+
+    // Read response to complete the RPC exchange
+    var response_buf: [4096]u8 = undefined;
+    _ = posix.read(sock, &response_buf) catch {};
 }
 
 fn runClient(allocator: std.mem.Allocator, socket_path: []const u8, args: ParseResult) !void {
@@ -805,6 +924,7 @@ fn findMostRecentSession(allocator: std.mem.Allocator) ![]const u8 {
 test {
     _ = @import("io/mock.zig");
     _ = @import("server.zig");
+    _ = @import("session_json.zig");
     _ = @import("msgpack.zig");
     _ = @import("rpc.zig");
     _ = @import("pty.zig");

@@ -52,6 +52,14 @@ Manage sessions.
 **prise session rename** *old-name* *new-name*
 :   Rename a session.
 
+## tab
+
+Manage tabs.
+
+**prise tab rename** *title*
+:   Rename the current tab when run inside prise. Pass an empty string to clear
+    the explicit tab title and fall back to the automatic title.
+
 # OPTIONS
 
 **-h**, **--help**
