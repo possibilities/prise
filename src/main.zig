@@ -879,8 +879,8 @@ fn createMinimalSession(allocator: std.mem.Allocator, name: []const u8) !void {
             const cwd = posix.getcwd(&cwd_buf) catch "/tmp";
             var json_buf: [1024]u8 = undefined;
             const json = std.fmt.bufPrint(&json_buf,
-                \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":"{s}"}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
-            , .{cwd}) catch return error.NameTooLong;
+                \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":{f}}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
+            , .{std.json.fmt(cwd, .{})}) catch return error.NameTooLong;
             try file.writeAll(json);
             return;
         }
@@ -898,8 +898,8 @@ fn createMinimalSession(allocator: std.mem.Allocator, name: []const u8) !void {
 
     var json_buf: [1024]u8 = undefined;
     const json = std.fmt.bufPrint(&json_buf,
-        \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":"{s}"}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
-    , .{cwd}) catch return error.NameTooLong;
+        \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":{f}}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
+    , .{std.json.fmt(cwd, .{})}) catch return error.NameTooLong;
 
     const file = try dir.createFile(filename, .{});
     defer file.close();
