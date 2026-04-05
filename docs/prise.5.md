@@ -516,6 +516,19 @@ call directly.
 :   Return the 1-based index of the focused pane within the active tab, or
     **nil** when no pane is focused.
 
+Example:
+
+```lua
+local ui = require("prise").tiling()
+
+local tab = ui.get_active_tab_info()
+if tab then
+    local pane_idx = ui.get_focused_pane_index()
+    print(string.format("Tab %d: %s (pane %d/%d)",
+        tab.index, tab.title, pane_idx or 0, tab.pane_count))
+end
+```
+
 # SEE ALSO
 
 [prise(1)](prise.1.html), [prise(7)](prise.7.html)
