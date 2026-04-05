@@ -169,4 +169,21 @@ function M.setup_prise_mock()
     return mock
 end
 
+---Get the internal state table from tiling via debug.getupvalue.
+---Searches upvalues of tiling.update for "state".
+---@param tiling_module table The tiling module
+---@return table
+function M.get_state(tiling_module)
+    for i = 1, 256 do
+        local name, val = debug.getupvalue(tiling_module.update, i)
+        if not name then
+            break
+        end
+        if name == "state" then
+            return val
+        end
+    end
+    error("could not find state upvalue on tiling.update")
+end
+
 return M
