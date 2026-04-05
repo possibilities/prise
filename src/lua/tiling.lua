@@ -1862,7 +1862,8 @@ local function resize_pane(dimension, delta_ratio)
 end
 
 ---@param direction "left"|"right"|"up"|"down"
-local function move_focus(direction)
+---@param wrap? boolean
+local function move_focus(direction, wrap)
     local root = get_active_root()
     if not state.focused_id or not root then
         return
@@ -1906,6 +1907,21 @@ local function move_focus(direction)
                     sibling_node = node.children[idx - 1]
                     break
                 end
+            end
+        end
+    end
+
+    -- Wrapping fallback: find outermost matching split, pick opposite edge
+    if not sibling_node and wrap then
+        for i = 1, #path - 1 do
+            local node = path[i]
+            if node.type == "split" and node.direction == target_split_type then
+                if forward then
+                    sibling_node = node.children[1]
+                else
+                    sibling_node = node.children[#node.children]
+                end
+                break
             end
         end
     end
@@ -2043,6 +2059,30 @@ local commands = {
         shortcut = key_prefix .. " j",
         action = function()
             move_focus("down")
+        end,
+    },
+    {
+        name = "Focus Left (Wrap)",
+        action = function()
+            move_focus("left", true)
+        end,
+    },
+    {
+        name = "Focus Right (Wrap)",
+        action = function()
+            move_focus("right", true)
+        end,
+    },
+    {
+        name = "Focus Up (Wrap)",
+        action = function()
+            move_focus("up", true)
+        end,
+    },
+    {
+        name = "Focus Down (Wrap)",
+        action = function()
+            move_focus("down", true)
         end,
     },
     {
@@ -2375,6 +2415,18 @@ action_handlers = {
     end,
     focus_down = function()
         move_focus("down")
+    end,
+    focus_left_wrap = function()
+        move_focus("left", true)
+    end,
+    focus_right_wrap = function()
+        move_focus("right", true)
+    end,
+    focus_up_wrap = function()
+        move_focus("up", true)
+    end,
+    focus_down_wrap = function()
+        move_focus("down", true)
     end,
     close_pane = function()
         local root = get_active_root()
@@ -4507,6 +4559,15 @@ M._test = {
     -- Returns a direct reference to internal state, not a copy
     get_state = function()
         return state
+    end,
+    move_focus = move_focus,
+    set_test_state = function(tabs, active_tab, focused_id)
+        state.tabs = tabs
+        state.active_tab = active_tab
+        state.focused_id = focused_id
+    end,
+    get_focused_id = function()
+        return state.focused_id
     end,
 }
 

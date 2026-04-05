@@ -190,3 +190,60 @@ assert(#item == 20, "format_palette_item: correct width")
 item = t.format_palette_item("Very Long Command Name", "C-x", 10)
 -- Width is too small, should use minimum padding of 2
 assert(item == "Very Long Command Name  C-x", "format_palette_item: minimum padding")
+
+-- === move_focus (wrap) ===
+
+---Helper to set up a single-tab layout for focus tests
+---@param root Pane|Split
+---@param focused_id integer
+local function setup_focus_test(root, focused_id)
+    t.set_state({
+        tabs = { { id = 1, root = root, last_focused_id = focused_id } },
+        active_tab = 1,
+        focused_id = focused_id,
+    })
+end
+
+-- Test: row wrap forward — [A | B], focus B, right wrap → A
+local row_ab = mock_split(1, "row", { mock_pane(1), mock_pane(2) })
+setup_focus_test(row_ab, 2)
+t.move_focus("right", true)
+assert(t.get_state().focused_id == 1, "move_focus wrap: row forward wraps to first child")
+
+-- Test: row wrap backward — [A | B], focus A, left wrap → B
+row_ab = mock_split(1, "row", { mock_pane(1), mock_pane(2) })
+setup_focus_test(row_ab, 1)
+t.move_focus("left", true)
+assert(t.get_state().focused_id == 2, "move_focus wrap: row backward wraps to last child")
+
+-- Test: col wrap forward — [A / B], focus B, down wrap → A
+local col_ab = mock_split(1, "col", { mock_pane(1), mock_pane(2) })
+setup_focus_test(col_ab, 2)
+t.move_focus("down", true)
+assert(t.get_state().focused_id == 1, "move_focus wrap: col forward wraps to first child")
+
+-- Test: col wrap backward — [A / B], focus A, up wrap → B
+col_ab = mock_split(1, "col", { mock_pane(1), mock_pane(2) })
+setup_focus_test(col_ab, 1)
+t.move_focus("up", true)
+assert(t.get_state().focused_id == 2, "move_focus wrap: col backward wraps to last child")
+
+-- Test: nested — [A | [B / C]], focus B, right wrap → A
+local nested_wrap = mock_split(1, "row", {
+    mock_pane(1),
+    mock_split(2, "col", { mock_pane(2), mock_pane(3) }),
+})
+setup_focus_test(nested_wrap, 2)
+t.move_focus("right", true)
+assert(t.get_state().focused_id == 1, "move_focus wrap: nested row wraps to first child")
+
+-- Test: single pane no-op — single pane, right wrap → no change
+setup_focus_test(mock_pane(1), 1)
+t.move_focus("right", true)
+assert(t.get_state().focused_id == 1, "move_focus wrap: single pane is no-op")
+
+-- Test: non-wrapping unchanged — [A | B], focus B, right without wrap → no change
+row_ab = mock_split(1, "row", { mock_pane(1), mock_pane(2) })
+setup_focus_test(row_ab, 2)
+t.move_focus("right")
+assert(t.get_state().focused_id == 2, "move_focus: non-wrapping at edge is no-op")
