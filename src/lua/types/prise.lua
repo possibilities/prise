@@ -26,7 +26,7 @@ local prise = {}
 ---@field set_state? fun(saved: table?, pty_lookup: fun(id: number): Pty?) Restore UI state
 ---@field setup? fun(opts: table?) Configure the UI (optional)
 ---@field get_macos_option_as_alt? fun(): boolean Return whether macOS Option should act as Alt
----@field execute_action fun(name: string) Execute a built-in action by name
+---@field execute_action? fun(name: string) Execute a built-in action by name
 
 ---Load the tiling UI module
 ---@return PriseUI
