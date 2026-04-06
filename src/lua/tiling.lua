@@ -1097,8 +1097,9 @@ local function remove_pane_by_id(id)
                 local current = prise.get_session_name()
                 for _, s in ipairs(sessions) do
                     if s ~= current then
-                        prise.switch_session(s)
-                        return true
+                        if prise.switch_session(s) then
+                            return true
+                        end
                     end
                 end
             end

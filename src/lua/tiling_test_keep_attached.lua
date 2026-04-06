@@ -14,13 +14,19 @@ local keep_attached_calls = {}
 ---@param sessions string[]? Sessions that list_sessions returns
 ---@param current string Current session name
 ---@param keep boolean Config value for keep_attached
-local function setup_keep_attached_test(sessions, current, keep)
+---@param fail_sessions string[]? Session names where switch_session returns false
+local function setup_keep_attached_test(sessions, current, keep, fail_sessions)
     keep_attached_calls = {}
+    local fail_set = {}
+    for _, s in ipairs(fail_sessions or {}) do
+        fail_set[s] = true
+    end
     prise_mock.exit = function()
         table.insert(keep_attached_calls, "exit")
     end
     prise_mock.switch_session = function(name)
         table.insert(keep_attached_calls, "switch:" .. name)
+        return not fail_set[name]
     end
     prise_mock.list_sessions = function()
         return sessions
@@ -53,6 +59,21 @@ setup_keep_attached_test(nil, "test", true)
 tiling.update({ type = "pty_exited", data = { id = 1 } })
 assert(#keep_attached_calls == 1, "keep_attached nil sessions: exactly one action taken")
 assert(keep_attached_calls[1] == "exit", "keep_attached nil sessions: exits when list returns nil")
+
+-- Test: keep_attached=true tries next session when first switch fails
+setup_keep_attached_test({ "alpha", "test", "beta" }, "test", true, { "alpha" })
+tiling.update({ type = "pty_exited", data = { id = 1 } })
+assert(#keep_attached_calls == 2, "keep_attached fallback: tried two sessions")
+assert(keep_attached_calls[1] == "switch:alpha", "keep_attached fallback: tried alpha first")
+assert(keep_attached_calls[2] == "switch:beta", "keep_attached fallback: fell through to beta")
+
+-- Test: keep_attached=true exits when all switches fail
+setup_keep_attached_test({ "alpha", "test", "beta" }, "test", true, { "alpha", "beta" })
+tiling.update({ type = "pty_exited", data = { id = 1 } })
+assert(#keep_attached_calls == 3, "keep_attached all fail: tried both then exited")
+assert(keep_attached_calls[1] == "switch:alpha", "keep_attached all fail: tried alpha")
+assert(keep_attached_calls[2] == "switch:beta", "keep_attached all fail: tried beta")
+assert(keep_attached_calls[3] == "exit", "keep_attached all fail: exits after all fail")
 
 -- Test: keep_attached=false always exits
 setup_keep_attached_test({ "alpha", "test", "beta" }, "test", false)
