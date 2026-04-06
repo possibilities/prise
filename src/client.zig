@@ -1398,15 +1398,6 @@ pub const App = struct {
     }
 
     pub fn sendResize(self: *App, pty_id: u32, rows: u16, cols: u16) !void {
-        // Check if surface is already at correct size
-        if (self.surfaces.get(pty_id)) |surface| {
-            // Only check if this is the active surface
-            if (surface.rows == rows and surface.cols == cols) return;
-
-            // Update surface immediately
-            try surface.resize(rows, cols);
-        }
-
         const msgid = self.state.next_msgid;
         self.state.next_msgid += 1;
 

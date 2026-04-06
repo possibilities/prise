@@ -155,6 +155,12 @@ const Pty = struct {
     // Pointer to server for callbacks (opaque to avoid circular type dependency)
     server_ptr: *anyopaque = undefined,
 
+    // The client whose dimensions control the PTY size.
+    // Only resize requests from this client are applied; others are ignored.
+    // Updated on attach (newest client becomes owner) and detach (falls back
+    // to first remaining client).
+    size_owner: ?*Client = null,
+
     fn init(allocator: std.mem.Allocator, id: usize, process_instance: pty.Process, size: pty.Winsize) !*Pty {
         // Precondition: terminal size must be positive (zero would crash ghostty-vt)
         std.debug.assert(size.ws_col > 0);
@@ -269,6 +275,9 @@ const Pty = struct {
         const prev_len = self.clients.items.len;
         try self.clients.append(allocator, client);
 
+        // Most recently attached client becomes size owner
+        self.size_owner = client;
+
         // Postcondition: client count increased by exactly one
         std.debug.assert(self.clients.items.len == prev_len + 1);
     }
@@ -277,6 +286,11 @@ const Pty = struct {
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
                 _ = self.clients.swapRemove(i);
+
+                // If the removed client was size owner, transfer to first remaining
+                if (self.size_owner == client) {
+                    self.size_owner = if (self.clients.items.len > 0) self.clients.items[0] else null;
+                }
                 return;
             }
         }
@@ -1322,11 +1336,27 @@ const Client = struct {
         };
 
         if (self.server.ptys.get(pty_id)) |pty_instance| {
+            self.promoteSizeOwner(pty_instance);
+
             _ = posix.write(pty_instance.process.master, input_data) catch |err| {
                 log.err("Write to PTY failed: {}", .{err});
             };
         } else {
             log.warn("write_pty notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Promote this client to size owner for all attached PTYs.
+    /// Mirrors tmux: interacting with any pane makes this client control
+    /// the terminal size for every pane, not just the one receiving input.
+    fn promoteSizeOwner(self: *Client, trigger_pty: *Pty) void {
+        if (trigger_pty.size_owner == self) return;
+
+        log.info("promoting client {} to size owner (triggered by pty={})", .{ self.fd, trigger_pty.id });
+        for (self.attached_ptys.items) |pid| {
+            if (self.server.ptys.get(pid)) |pty_inst| {
+                pty_inst.size_owner = self;
+            }
         }
     }
 
@@ -1393,6 +1423,8 @@ const Client = struct {
         const key_map = notif.params.array[1];
 
         if (self.server.ptys.get(pty_id)) |pty_instance| {
+            self.promoteSizeOwner(pty_instance);
+
             const action: ghostty_vt.input.KeyAction = if (is_release) .release else .press;
             const key = key_parse.parseKeyMapWithAction(key_map, action) catch |err| {
                 log.err("Failed to parse key map: {}", .{err});
@@ -1687,6 +1719,12 @@ const Client = struct {
         }
 
         if (self.server.ptys.get(pty_id)) |pty_instance| {
+            // Only the size owner's resize requests are applied
+            if (pty_instance.size_owner != self) {
+                log.info("resize_pty: ignoring from non-owner client {} for pty={}", .{ self.fd, pty_id });
+                return;
+            }
+
             pty_instance.terminal_mutex.lock();
 
             log.info("resize_pty: pty={} requested={}x{} ({}x{}px) current_terminal={}x{}", .{
@@ -2348,6 +2386,12 @@ const Server = struct {
         const pty_instance = self.ptys.get(args.id) orelse {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
         };
+
+        // Only the size owner's resize requests are applied
+        if (pty_instance.size_owner != client) {
+            log.info("resize_pty request: ignoring from non-owner client {} for pty={}", .{ client.fd, args.id });
+            return msgpack.Value.nil;
+        }
 
         // Lock mutex before any terminal state access to avoid race with read thread
         pty_instance.terminal_mutex.lock();
