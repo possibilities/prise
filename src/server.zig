@@ -2543,68 +2543,63 @@ const Server = struct {
 
     fn handleGetServerInfo(self: *Server) !msgpack.Value {
         const entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
-        entries[0] = .{
-            .key = .{ .string = try self.allocator.dupe(u8, "version") },
-            .value = .{ .string = try self.allocator.dupe(u8, main.version) },
-        };
-        entries[1] = .{
-            .key = .{ .string = try self.allocator.dupe(u8, "pty_validity") },
-            .value = .{ .integer = self.start_time_ms },
-        };
+        @memset(entries, .{ .key = .nil, .value = .nil });
+        errdefer {
+            for (entries) |kv| {
+                kv.key.deinit(self.allocator);
+                kv.value.deinit(self.allocator);
+            }
+            self.allocator.free(entries);
+        }
+
+        entries[0].key = .{ .string = try self.allocator.dupe(u8, "version") };
+        entries[0].value = .{ .string = try self.allocator.dupe(u8, main.version) };
+        entries[1].key = .{ .string = try self.allocator.dupe(u8, "pty_validity") };
+        entries[1].value = .{ .integer = self.start_time_ms };
+
         return .{ .map = entries };
     }
 
     fn handleListPtys(self: *Server) !msgpack.Value {
         const pty_count = self.ptys.count();
         const ptys_array = try self.allocator.alloc(msgpack.Value, pty_count);
-        errdefer self.allocator.free(ptys_array);
 
         var i: usize = 0;
+        var ptys_owned = true;
+        errdefer {
+            if (ptys_owned) {
+                for (ptys_array[0..i]) |entry| entry.deinit(self.allocator);
+                self.allocator.free(ptys_array);
+            }
+        }
+
         var iter = self.ptys.iterator();
         while (iter.next()) |entry| {
-            const pty_instance = entry.value_ptr.*;
-            const pty_entries = try self.allocator.alloc(msgpack.Value.KeyValue, 4);
-
-            // Lock mutex to safely dupe cwd and title (read thread may reallocate)
-            const cwd_str, const title_str = blk: {
-                pty_instance.terminal_mutex.lock();
-                defer pty_instance.terminal_mutex.unlock();
-                const cwd = try self.allocator.dupe(u8, pty_instance.cwd.items);
-                errdefer self.allocator.free(cwd);
-                const title = try self.allocator.dupe(u8, pty_instance.title.items);
-                break :blk .{ cwd, title };
-            };
-
-            pty_entries[0] = .{
-                .key = .{ .string = try self.allocator.dupe(u8, "id") },
-                .value = .{ .unsigned = @intCast(pty_instance.id) },
-            };
-            pty_entries[1] = .{
-                .key = .{ .string = try self.allocator.dupe(u8, "cwd") },
-                .value = .{ .string = cwd_str },
-            };
-            pty_entries[2] = .{
-                .key = .{ .string = try self.allocator.dupe(u8, "title") },
-                .value = .{ .string = title_str },
-            };
-            pty_entries[3] = .{
-                .key = .{ .string = try self.allocator.dupe(u8, "attached_client_count") },
-                .value = .{ .unsigned = @intCast(pty_instance.clients.items.len) },
-            };
-
-            ptys_array[i] = .{ .map = pty_entries };
+            ptys_array[i] = .{ .map = try buildPtyEntry(self.allocator, entry.value_ptr.*) };
             i += 1;
         }
 
         const result_entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
-        result_entries[0] = .{
-            .key = .{ .string = try self.allocator.dupe(u8, "pty_validity") },
-            .value = .{ .integer = self.start_time_ms },
-        };
-        result_entries[1] = .{
-            .key = .{ .string = try self.allocator.dupe(u8, "ptys") },
-            .value = .{ .array = ptys_array },
-        };
+        @memset(result_entries, .{ .key = .nil, .value = .nil });
+        errdefer {
+            for (result_entries) |kv| {
+                kv.key.deinit(self.allocator);
+                kv.value.deinit(self.allocator);
+            }
+            self.allocator.free(result_entries);
+        }
+
+        result_entries[0].key = .{ .string = try self.allocator.dupe(u8, "pty_validity") };
+        result_entries[0].value = .{ .integer = self.start_time_ms };
+        result_entries[1].key = .{ .string = try self.allocator.dupe(u8, "ptys") };
+        result_entries[1].value = .{ .array = ptys_array };
+
+        // Ownership of ptys_array transferred into result_entries[1].value.
+        // Disable the outer errdefer so it won't double-free — the
+        // result_entries errdefer frees the array recursively via .deinit
+        // on the .array variant.
+        ptys_owned = false;
+
         return .{ .map = result_entries };
     }
 
@@ -3107,6 +3102,29 @@ const Server = struct {
         self.allocator.destroy(pty_instance);
     }
 };
+
+fn buildPtyEntry(allocator: std.mem.Allocator, pty_instance: *const Pty) ![]msgpack.Value.KeyValue {
+    const entries = try allocator.alloc(msgpack.Value.KeyValue, 4);
+    @memset(entries, .{ .key = .nil, .value = .nil });
+    errdefer {
+        for (entries) |kv| {
+            kv.key.deinit(allocator);
+            kv.value.deinit(allocator);
+        }
+        allocator.free(entries);
+    }
+
+    entries[0].key = .{ .string = try allocator.dupe(u8, "id") };
+    entries[0].value = .{ .unsigned = @intCast(pty_instance.id) };
+    entries[1].key = .{ .string = try allocator.dupe(u8, "cwd") };
+    entries[1].value = .{ .string = try allocator.dupe(u8, pty_instance.cwd.items) };
+    entries[2].key = .{ .string = try allocator.dupe(u8, "title") };
+    entries[2].value = .{ .string = try allocator.dupe(u8, pty_instance.title.items) };
+    entries[3].key = .{ .string = try allocator.dupe(u8, "attached_client_count") };
+    entries[3].value = .{ .unsigned = @intCast(pty_instance.clients.items.len) };
+
+    return entries;
+}
 
 pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     std.log.info("Starting server on {s}", .{socket_path});
