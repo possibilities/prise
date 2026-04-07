@@ -2569,10 +2569,10 @@ const Server = struct {
             const cwd_str, const title_str = blk: {
                 pty_instance.terminal_mutex.lock();
                 defer pty_instance.terminal_mutex.unlock();
-                break :blk .{
-                    try self.allocator.dupe(u8, pty_instance.cwd.items),
-                    try self.allocator.dupe(u8, pty_instance.title.items),
-                };
+                const cwd = try self.allocator.dupe(u8, pty_instance.cwd.items);
+                errdefer self.allocator.free(cwd);
+                const title = try self.allocator.dupe(u8, pty_instance.title.items);
+                break :blk .{ cwd, title };
             };
 
             pty_entries[0] = .{
