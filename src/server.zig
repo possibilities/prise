@@ -2789,8 +2789,10 @@ const Server = struct {
             pty_instance.terminal_mutex.lock();
             defer pty_instance.terminal_mutex.unlock();
             if (!pty_instance.cwd_dirty) break :blk @as(?[]u8, null);
+            const cwd_copy = self.allocator.dupe(u8, pty_instance.cwd.items) catch
+                break :blk @as(?[]u8, null);
             pty_instance.cwd_dirty = false;
-            break :blk self.allocator.dupe(u8, pty_instance.cwd.items) catch null;
+            break :blk @as(?[]u8, cwd_copy);
         };
         if (cwd_update) |cwd_copy| {
             defer self.allocator.free(cwd_copy);
