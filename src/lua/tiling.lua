@@ -271,6 +271,7 @@ local POWERLINE_SYMBOLS = {
 ---@field macos_option_as_alt? "false"|"left"|"right"|"true" macOS Option key behavior (default: "false")
 ---@field layouts? table<string, PriseLayout> Named layout definitions
 ---@field default_layout? string Layout to apply on startup (if no session exists)
+---@field screen_dump? boolean Write mmap screen dumps after each render (default: false)
 
 ---@class PriseConfig
 ---@field theme PriseTheme
@@ -282,6 +283,7 @@ local POWERLINE_SYMBOLS = {
 ---@field keybinds PriseKeybinds
 ---@field layouts table<string, PriseLayout>
 ---@field default_layout? string
+---@field screen_dump boolean
 
 -- Default configuration
 ---@type PriseConfig
@@ -367,6 +369,7 @@ local config = {
         ["<leader>o"] = "layout_picker",
     },
     macos_option_as_alt = "false",
+    screen_dump = false,
     layouts = {},
     default_layout = nil,
 }
@@ -490,6 +493,12 @@ end
 ---@return string
 function M.get_macos_option_as_alt()
     return config.macos_option_as_alt or "false"
+end
+
+---Get the screen_dump setting
+---@return boolean
+function M.get_screen_dump()
+    return config.screen_dump or false
 end
 
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
