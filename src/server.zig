@@ -2299,14 +2299,14 @@ const Server = struct {
         log.info("attach_pty called with params: {}", .{params});
         const parsed = parseAttachPtyParams(params) catch |err| {
             log.warn("attach_pty: invalid params: {}", .{err});
-            return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
+            return error.InvalidParams;
         };
 
         log.info("attach_pty: pty_id={} client_fd={} macos_option_as_alt={}", .{ parsed.pty_id, client.fd, parsed.macos_option_as_alt });
 
         const pty_instance = self.ptys.get(parsed.pty_id) orelse {
             log.warn("attach_pty: PTY {} not found", .{parsed.pty_id});
-            return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
+            return error.PtyNotFound;
         };
 
         client.macos_option_as_alt = parsed.macos_option_as_alt;

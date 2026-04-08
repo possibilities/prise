@@ -267,7 +267,10 @@ pub const ClientLogic = struct {
         if (request_info) |entry| {
             if (entry.value == .attach) {
                 const attach_info = entry.value.attach;
-                if (err_val == .string and std.mem.eql(u8, err_val.string, "PTY not found")) {
+                if (err_val == .string and
+                    (std.mem.eql(u8, err_val.string, "PtyNotFound") or
+                        std.mem.eql(u8, err_val.string, "PTY not found")))
+                {
                     log.info("PTY {} not found, spawning new PTY with cwd", .{attach_info.pty_id});
                     return .{ .spawn_pty_with_cwd = .{ .cwd = attach_info.cwd } };
                 }
@@ -283,6 +286,13 @@ pub const ClientLogic = struct {
             return switch (entry.value) {
                 .spawn => |spawn_info| handleSpawnResult(state, result, spawn_info.cwd, spawn_info.old_pty_id),
                 .attach => |attach_info| {
+                    // Successful attach returns a PTY ID (unsigned or non-negative integer).
+                    // Guard against string or other non-integer results that would indicate
+                    // a server-side error leaked as a result value.
+                    if (result != .unsigned and !(result == .integer and result.integer >= 0)) {
+                        log.warn("attach failed for PTY {}: unexpected result {}", .{ attach_info.pty_id, result });
+                        return .{ .spawn_pty_with_cwd = .{ .cwd = attach_info.cwd } };
+                    }
                     state.pty_id = attach_info.pty_id;
                     state.attached = true;
                     if (attach_info.cwd) |c| {
