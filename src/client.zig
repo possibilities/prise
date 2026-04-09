@@ -225,6 +225,7 @@ pub const ServerAction = union(enum) {
     detached,
     switch_detached,
     switch_detach_failed,
+    restore_attach_failed,
     color_query: ColorQueryTarget,
     server_info: struct { pty_validity: i64 },
     copy_to_clipboard: []const u8,
@@ -284,6 +285,10 @@ pub const ClientLogic = struct {
                         .old_pty_id = @intCast(attach_info.pty_id),
                     } };
                 }
+                // Non-PtyNotFound attach error — signal restore chain so
+                // remaining_attach_count doesn't get stuck.
+                log.info("Attach failed for PTY {}, signaling restore chain: {}", .{ attach_info.pty_id, err_val });
+                return .restore_attach_failed;
             } else if (entry.value == .switch_detach) {
                 log.err("Session switch detach failed: {}", .{err_val});
                 return .switch_detach_failed;
@@ -366,6 +371,12 @@ pub const ClientLogic = struct {
                 };
             }
             return .{ .attached = .{ .new_pty_id = id, .old_pty_id = old_pty_id } };
+        }
+        // Restore-related spawn failed — signal so remaining_attach_count
+        // doesn't get stuck. old_pty_id is set for restore spawns.
+        if (old_pty_id) |old_id| {
+            log.info("Restore spawn failed for old PTY {}, signaling restore chain", .{old_id});
+            return .restore_attach_failed;
         }
         return .none;
     }
@@ -1786,6 +1797,21 @@ pub const App = struct {
         self.finishSessionSwitch();
     }
 
+    /// Decrement remaining_attach_count when a restore spawn/attach fails.
+    /// When all requests have completed (success or failure), finish the
+    /// restore so session_switch_in_progress doesn't stay true forever.
+    fn handleRestoreAttachFailure(self: *App) void {
+        const plan = if (self.prepared_restore_plan) |*value| value else return;
+        if (plan.remaining_attach_count == 0) return;
+        plan.remaining_attach_count -= 1;
+        if (plan.remaining_attach_count == 0) {
+            self.completePreparedSessionRestore() catch |err| {
+                log.err("Failed to complete session restore after failures: {}", .{err});
+                self.cancelSessionSwitch("restore completion failed after attach failures");
+            };
+        }
+    }
+
     fn completeSessionSwitch(self: *App, source_session: ?[]const u8, target_session: []const u8) void {
         _ = source_session;
         _ = target_session;
@@ -2086,6 +2112,10 @@ pub const App = struct {
     fn completePreparedSessionRestore(self: *App) !void {
         const target_session = self.preparedRestoreSessionName() orelse return error.NoPreparedRestorePlan;
 
+        // If any step below fails, cancel the session switch so the client
+        // doesn't stay permanently frozen with input blocked.
+        errdefer self.cancelSessionSwitch("restore completion failed");
+
         log.info("All PTYs attached, restoring session state", .{});
         if (self.prepared_restore_plan) |plan| {
             try self.ui.setStateFromJson(plan.session_json, ptyLookup, self);
@@ -2162,7 +2192,6 @@ pub const App = struct {
         try self.appendSessionEnvNamed(env_array, string_allocator, session_name);
     }
 
-
     fn onSendComplete(_: *io.Loop, completion: io.Completion) anyerror!void {
         const app = completion.userdataCast(@This());
 
@@ -2236,6 +2265,10 @@ pub const App = struct {
                                 };
                             },
                             .attached => |info| {
+                                // If surface creation or resize fails below, still
+                                // decrement the restore counter so the switch doesn't hang.
+                                errdefer app.handleRestoreAttachFailure();
+
                                 log.info("Attached to session, checking for resize", .{});
                                 const pty_id = @as(u32, @intCast(info.new_pty_id));
 
@@ -2564,6 +2597,9 @@ pub const App = struct {
                             .switch_detach_failed => {
                                 app.cancelSessionSwitch("detach rejected");
                             },
+                            .restore_attach_failed => {
+                                app.handleRestoreAttachFailure();
+                            },
                             .color_query => |query| {
                                 try app.handleColorQuery(query);
                             },
@@ -2861,8 +2897,15 @@ pub const App = struct {
         errdefer if (!plan_stored) plan.deinit(self.allocator);
 
         if (self.current_session_name) |name| {
-            log.info("Saving current session '{s}' before switch", .{name});
-            try self.saveSession(name);
+            if (self.surfaces.count() > 0) {
+                log.info("Saving current session '{s}' before switch", .{name});
+                try self.saveSession(name);
+            } else {
+                // Session is empty (e.g. last pane just closed) — don't
+                // write a 0-PTY file that would fail future restores.
+                log.info("Skipping save for empty session '{s}'", .{name});
+                self.deleteCurrentSession();
+            }
         }
 
         self.clearPreparedRestorePlan();
@@ -3734,6 +3777,65 @@ test "switchToSession leaves state untouched when preflight fails" {
     try std.testing.expectEqualStrings("source", app.current_session_name.?);
     try std.testing.expect(!app.session_switch_in_progress);
     try std.testing.expect(app.prepared_restore_plan == null);
+}
+
+test "restore spawn failure returns restore_attach_failed when old_pty_id set" {
+    const testing = std.testing;
+    var state = ClientState.init(testing.allocator);
+    defer state.deinit();
+
+    // Spawn request with old_pty_id (restore-related)
+    try state.pending_requests.put(1, .{ .spawn = .{ .cwd = null, .old_pty_id = 42 } });
+
+    const msg = rpc.Message{
+        .response = .{
+            .msgid = 1,
+            .err = null,
+            .result = .{ .integer = -1 }, // spawn failed
+        },
+    };
+
+    const action = try ClientLogic.processServerMessage(&state, msg);
+    try testing.expectEqual(std.meta.Tag(ServerAction).restore_attach_failed, std.meta.activeTag(action));
+}
+
+test "spawn failure returns none when no old_pty_id" {
+    const testing = std.testing;
+    var state = ClientState.init(testing.allocator);
+    defer state.deinit();
+
+    // Spawn request without old_pty_id (not restore-related)
+    try state.pending_requests.put(1, .{ .spawn = .{} });
+
+    const msg = rpc.Message{
+        .response = .{
+            .msgid = 1,
+            .err = null,
+            .result = .{ .integer = -1 }, // spawn failed
+        },
+    };
+
+    const action = try ClientLogic.processServerMessage(&state, msg);
+    try testing.expectEqual(std.meta.Tag(ServerAction).none, std.meta.activeTag(action));
+}
+
+test "attach error returns restore_attach_failed for non-PtyNotFound" {
+    const testing = std.testing;
+    var state = ClientState.init(testing.allocator);
+    defer state.deinit();
+
+    try state.pending_requests.put(1, .{ .attach = .{ .pty_id = 99, .cwd = null } });
+
+    const msg = rpc.Message{
+        .response = .{
+            .msgid = 1,
+            .err = .{ .string = "InternalError" },
+            .result = .nil,
+        },
+    };
+
+    const action = try ClientLogic.processServerMessage(&state, msg);
+    try testing.expectEqual(std.meta.Tag(ServerAction).restore_attach_failed, std.meta.activeTag(action));
 }
 
 test "UnixSocketClient - successful connection" {
