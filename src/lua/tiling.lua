@@ -458,6 +458,69 @@ local state = {
     pending_layout = nil,
 }
 
+local function reset_session_state()
+    if state.timer then
+        state.timer:cancel()
+        state.timer = nil
+    end
+
+    state.tabs = {}
+    state.active_tab = 1
+    state.next_tab_id = 1
+    state.focused_id = nil
+    state.zoomed_pane_id = nil
+    state.pending_command = false
+    state.pending_split = nil
+    state.pending_new_tab = false
+    state.next_split_id = 1
+
+    state.palette.visible = false
+    state.palette.selected = 1
+    state.palette.scroll_offset = 0
+    state.palette.regions = {}
+    if state.palette.input then
+        state.palette.input:clear()
+    end
+
+    state.rename.visible = false
+    if state.rename.input then
+        state.rename.input:clear()
+    end
+
+    state.rename_tab.visible = false
+    if state.rename_tab.input then
+        state.rename_tab.input:clear()
+    end
+
+    state.swap_with_index = nil
+
+    state.session_picker.visible = false
+    state.session_picker.selected = 1
+    state.session_picker.scroll_offset = 0
+    state.session_picker.sessions = {}
+    state.session_picker.regions = {}
+    state.session_picker.renaming = false
+    state.session_picker.rename_target = nil
+    if state.session_picker.input then
+        state.session_picker.input:clear()
+    end
+
+    state.layout_picker.visible = false
+    state.layout_picker.selected = 1
+    state.layout_picker.scroll_offset = 0
+    state.layout_picker.regions = {}
+
+    state.tab_regions = {}
+    state.tab_close_regions = {}
+    state.hovered_tab = nil
+    state.hovered_close_tab = nil
+    state.cached_git_branch = nil
+    state.detaching = false
+    state.floating.visible = false
+    state.floating.pending = false
+    state.floating.resize_mode = false
+end
+
 local M = {}
 
 ---Forward declaration for action_handlers (defined after helper functions)
@@ -495,6 +558,13 @@ end
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
 local PALETTE_WIDTH = 60 -- Total width of command palette
 local PALETTE_INNER_WIDTH = 56 -- Inner width (PALETTE_WIDTH - 4 for padding)
+
+---@return integer start_x
+---@return integer end_x
+local function modal_x_bounds()
+    local start_x = math.floor((state.screen_cols - PALETTE_WIDTH) / 2)
+    return start_x, start_x + PALETTE_WIDTH
+end
 
 -- Floating pane size bounds
 local FLOATING_MIN_WIDTH = 40
@@ -1498,8 +1568,11 @@ end
 local function build_tabs_from_layout(layout, pty_queue)
     local new_tabs = {}
     local queue_idx = 1
+    ---@type number
     local new_floating_width = state.floating.width
+    ---@type number
     local new_floating_height = state.floating.height
+    ---@type boolean
     local new_floating_visible = state.floating.visible
 
     for tab_index, tab_def in ipairs(layout.tabs) do
@@ -1559,6 +1632,12 @@ local function finalize_layout(pending)
         state.pending_layout = nil
         return
     end
+    local floating_width = new_floating_width or state.floating.width
+    local floating_height = new_floating_height or state.floating.height
+    local floating_visible = new_floating_visible
+    if floating_visible == nil then
+        floating_visible = state.floating.visible
+    end
 
     -- Verify we used all PTYs
     if queue_idx ~= #pty_queue + 1 then
@@ -1574,9 +1653,9 @@ local function finalize_layout(pending)
     -- Swap in new state
     state.tabs = new_tabs
     state.next_tab_id = #new_tabs + 1
-    state.floating.width = new_floating_width
-    state.floating.height = new_floating_height
-    state.floating.visible = new_floating_visible
+    state.floating.width = floating_width
+    state.floating.height = floating_height
+    state.floating.visible = floating_visible
     state.zoomed_pane_id = nil
 
     -- Set active tab
@@ -1630,7 +1709,7 @@ local function expand_path(path)
         return expanded
     end
 
-    -- Check if it's a directory without using shell (avoids command injection)
+    -- Probe "path/." so we can recognize directories without shelling out.
     local dir_probe = io.open(expanded .. "/.", "r")
     if dir_probe then
         dir_probe:close()
@@ -3224,14 +3303,59 @@ function M.update(event)
         end
 
         if d.action == "press" and d.button == "left" then
+            -- Check if click is on session picker item
+            if
+                state.session_picker.visible
+                and not state.session_picker.renaming
+                and #state.session_picker.regions > 0
+            then
+                local click_x = math.floor(d.x)
+                local click_y = math.floor(d.y)
+                local modal_start_x, modal_end_x = modal_x_bounds()
+
+                if click_x >= modal_start_x and click_x < modal_end_x then
+                    for _, region in ipairs(state.session_picker.regions) do
+                        if click_y >= region.start_y and click_y < region.end_y then
+                            if state.session_picker.selected == region.index then
+                                execute_session_switch()
+                            else
+                                state.session_picker.selected = region.index
+                                prise.request_frame()
+                            end
+                            return
+                        end
+                    end
+                end
+            end
+
+            -- Check if click is on layout picker item
+            if state.layout_picker.visible and #state.layout_picker.regions > 0 then
+                local click_x = math.floor(d.x)
+                local click_y = math.floor(d.y)
+                local modal_start_x, modal_end_x = modal_x_bounds()
+
+                if click_x >= modal_start_x and click_x < modal_end_x then
+                    for _, region in ipairs(state.layout_picker.regions) do
+                        if click_y >= region.start_y and click_y < region.end_y then
+                            if state.layout_picker.selected == region.index then
+                                execute_selected_layout()
+                            else
+                                state.layout_picker.selected = region.index
+                                prise.request_frame()
+                            end
+                            return
+                        end
+                    end
+                end
+            end
+
             -- Check if click is on command palette item
             if state.palette.visible and #state.palette.regions > 0 then
                 -- Convert float coords to integer cell positions
                 local click_x = math.floor(d.x)
                 local click_y = math.floor(d.y)
 
-                local palette_start_x = math.floor((state.screen_cols - PALETTE_WIDTH) / 2)
-                local palette_end_x = palette_start_x + PALETTE_WIDTH
+                local palette_start_x, palette_end_x = modal_x_bounds()
 
                 if click_x >= palette_start_x and click_x < palette_end_x then
                     for _, region in ipairs(state.palette.regions) do
@@ -4289,9 +4413,6 @@ function M.view()
     local layout_picker = build_layout_picker()
     local floating = build_floating()
     local tab_bar = build_tab_bar()
-    prise.log.debug("view: palette.visible=" .. tostring(state.palette.visible))
-
-    -- When zoomed, render only the zoomed pane
     local tab = get_active_tab()
     local floating_visible = tab and tab.floating and tab.floating.visible
     local overlay_visible = state.palette.visible
@@ -4301,8 +4422,15 @@ function M.view()
         or state.session_picker.visible
         or state.layout_picker.visible
         or floating_visible
+    prise.log.debug("view: palette.visible=" .. tostring(state.palette.visible))
+
     local content
-    if state.zoomed_pane_id then
+    if not root then
+        content = prise.Column({
+            cross_axis_align = "stretch",
+            children = {},
+        })
+    elseif state.zoomed_pane_id then
         local path = find_node_path(root, state.zoomed_pane_id)
         if path then
             local pane = path[#path]
@@ -4311,12 +4439,10 @@ function M.view()
                 focus = not overlay_visible,
             })
 
-            -- Apply borders to zoomed pane if enabled and show_single_pane is true
-            -- (zoomed pane is a temporary single-pane view)
             if config.borders.enabled and config.borders.show_single_pane then
                 content = prise.Box({
                     border = config.borders.style,
-                    style = { fg = config.borders.focused_color }, -- Zoomed pane is always focused
+                    style = { fg = config.borders.focused_color },
                     child = terminal,
                 })
             else
@@ -4351,7 +4477,6 @@ function M.view()
     if floating then
         table.insert(overlay_children, floating)
     end
-
     local modal = palette or rename or rename_tab or swap_with_index or session_picker or layout_picker
     if modal then
         table.insert(overlay_children, modal)
@@ -4360,7 +4485,6 @@ function M.view()
         })
     end
 
-    -- If we only have floating pane (no modal), use Stack if floating exists
     if floating then
         return prise.Stack({
             children = overlay_children,
@@ -4401,6 +4525,8 @@ end
 ---@param saved? table
 ---@param pty_lookup fun(id: number): Pty?
 function M.set_state(saved, pty_lookup)
+    reset_session_state()
+
     if not saved then
         return
     end
@@ -4469,6 +4595,7 @@ function M.set_state(saved, pty_lookup)
         end
     end
 
+    update_cached_git_branch()
     prise.request_frame()
 end
 
