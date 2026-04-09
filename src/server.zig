@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const crash_context = @import("crash_context.zig");
 
 const ghostty_vt = @import("ghostty-vt");
 
@@ -24,6 +25,12 @@ const csig = @cImport({
 const posix = std.posix;
 
 const log = std.log.scoped(.server);
+
+fn logPtyWriteError(err: anyerror) void {
+    if (err != error.WouldBlock) {
+        logPtyWriteError(err);
+    }
+}
 
 /// Resource limits to prevent unbounded growth in the long-running daemon.
 pub const LIMITS = struct {
@@ -1455,7 +1462,7 @@ const Client = struct {
             self.promoteSizeOwner(pty_instance);
 
             _ = posix.write(pty_instance.process.master, input_data) catch |err| {
-                log.err("Write to PTY failed: {}", .{err});
+                logPtyWriteError(err);
             };
         } else {
             log.warn("write_pty notification: PTY {} not found", .{pty_id});
@@ -1500,13 +1507,13 @@ const Client = struct {
 
             if (bracketed) {
                 writeAllFd(pty_instance.process.master, "\x1b[200~") catch |err| {
-                    log.err("Write to PTY failed: {}", .{err});
+                    logPtyWriteError(err);
                 };
                 writeAllFd(pty_instance.process.master, paste_data) catch |err| {
-                    log.err("Write to PTY failed: {}", .{err});
+                    logPtyWriteError(err);
                 };
                 writeAllFd(pty_instance.process.master, "\x1b[201~") catch |err| {
-                    log.err("Write to PTY failed: {}", .{err});
+                    logPtyWriteError(err);
                 };
             } else {
                 const mutable_data = self.server.allocator.dupe(u8, paste_data) catch |err| {
@@ -1516,7 +1523,7 @@ const Client = struct {
                 defer self.server.allocator.free(mutable_data);
                 std.mem.replaceScalar(u8, mutable_data, '\n', '\r');
                 writeAllFd(pty_instance.process.master, mutable_data) catch |err| {
-                    log.err("Write to PTY failed: {}", .{err});
+                    logPtyWriteError(err);
                 };
             }
         } else {
@@ -1570,7 +1577,7 @@ const Client = struct {
 
             if (encoded.len > 0) {
                 _ = posix.write(pty_instance.process.master, encoded) catch |err| {
-                    log.err("Write to PTY failed: {}", .{err});
+                    logPtyWriteError(err);
                 };
             }
         } else {
@@ -1642,7 +1649,7 @@ const Client = struct {
             else
                 (if (mouse.button == .wheel_up) "\x1b[A" else "\x1b[B");
             _ = posix.write(pty_instance.process.master, seq) catch |err| {
-                log.err("Write to PTY failed: {}", .{err});
+                logPtyWriteError(err);
             };
         } else {
             const delta: isize = switch (mouse.button) {
@@ -1802,7 +1809,7 @@ const Client = struct {
         const encoded = writer.buffered();
         if (encoded.len > 0) {
             _ = posix.write(pty_instance.process.master, encoded) catch |err| {
-                log.err("Write to PTY failed: {}", .{err});
+                logPtyWriteError(err);
             };
         }
     }
@@ -2664,6 +2671,7 @@ const Server = struct {
         }
 
         log.info("Created PTY {} with PID {}", .{ pty_id, process.pid });
+        crash_context.record("spawn pty_id={d}", .{pty_id});
 
         // Send pty_spawned notification to all clients
         try self.sendPtySpawned(pty_id, cwd orelse "", parsed.session, parsed.tab, parsed.title);
@@ -2895,6 +2903,7 @@ const Server = struct {
         if (newly_attached) {
             try client.attached_ptys.append(self.allocator, parsed.pty_id);
             log.info("Client {} attached to PTY {}", .{ client.fd, parsed.pty_id });
+            crash_context.record("attach pty_id={d} client_fd={d}", .{ parsed.pty_id, client.fd });
         } else {
             log.info("Client {} attach_pty for PTY {} was no-op (already attached)", .{ client.fd, parsed.pty_id });
         }
@@ -2941,7 +2950,7 @@ const Server = struct {
         };
 
         _ = posix.write(pty_instance.process.master, args.data) catch |err| {
-            log.err("Write to PTY failed: {}", .{err});
+            logPtyWriteError(err);
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "write failed") };
         };
 
@@ -3304,6 +3313,7 @@ const Server = struct {
                 try self.clients.append(self.allocator, client);
                 std.debug.assert(self.clients.items.len <= LIMITS.CLIENTS_MAX);
                 std.log.debug("Total clients: {} (assigned id={})", .{ self.clients.items.len, client.id });
+                crash_context.record("client accepted fd={d}", .{client_fd});
 
                 // Start recv to detect disconnect
                 _ = try loop.recv(client_fd, &client.recv_buffer, .{
@@ -3729,6 +3739,7 @@ const Server = struct {
         defer self.allocator.free(msg_bytes);
 
         std.log.info("Sending pty_exited for session {} status {}", .{ pty_id, exit_status });
+        crash_context.record("pty exited pty_id={d} status={d}", .{ pty_id, exit_status });
 
         // Send to all clients
         for (self.clients.items) |client| {
@@ -4644,8 +4655,14 @@ fn buildPtyEntry(allocator: std.mem.Allocator, pty_instance: *const Pty) ![]msgp
 pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     std.log.info("Starting server on {s}", .{socket_path});
 
+    crash_context.init(.server, main.version);
+    defer crash_context.deinit();
+    crash_context.setSocketPath(socket_path);
+    crash_context.record("server start", .{});
+
     var loop = try io.Loop.init(allocator);
     defer loop.deinit();
+    errdefer crash_context.writeBundle("server startup failed", null, null);
 
     // Check if socket exists and if a server is already running
     if (std.fs.accessAbsolute(socket_path, .{})) {
@@ -4672,11 +4689,15 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
                 posix.unlink(socket_path) catch {};
             } else {
                 std.log.err("Failed to test socket: {}", .{err});
+                crash_context.record("socket probe failed: {s}", .{@errorName(err)});
                 return err;
             }
         }
     } else |err| {
-        if (err != error.FileNotFound) return err;
+        if (err != error.FileNotFound) {
+            crash_context.record("socket access error: {s}", .{@errorName(err)});
+            return err;
+        }
         // Socket doesn't exist, continue
     }
 
@@ -4718,6 +4739,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .signal_pipe_fds = signal_pipe_fds,
         .start_time_ms = std.time.milliTimestamp(),
     };
+    crash_context.setPtyValidity(server.start_time_ms);
     defer {
         posix.close(signal_pipe_fds[0]);
         posix.close(signal_pipe_fds[1]);
@@ -4733,6 +4755,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     }
 
     // Start accepting connections
+    crash_context.record("server accepting connections", .{});
     server.accept_task = try loop.accept(listen_fd, .{
         .ptr = &server,
         .cb = Server.onAccept,

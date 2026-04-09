@@ -671,8 +671,10 @@ local missing_ret = tiling.update({
 })
 assert(type(missing_ret) == "table", "return-missing: returns a table")
 assert(missing_ret.ok == false, "return-missing: ok=false when pane absent")
-assert(missing_ret.reason == "absent_from_viewer",
-    "return-missing: reason=absent_from_viewer, got " .. tostring(missing_ret.reason))
+assert(
+    missing_ret.reason == "absent_from_viewer",
+    "return-missing: reason=absent_from_viewer, got " .. tostring(missing_ret.reason)
+)
 assert(#place_calls == 0, "return-missing: place_pty_in_session NOT called")
 assert(save_calls == 0, "return-missing: prise.save NOT called")
 
@@ -775,13 +777,17 @@ local solo_unreachable_ret = tiling.update({
     },
 })
 assert(type(solo_unreachable_ret) == "table", "solo-unreachable: returns a table")
-assert(solo_unreachable_ret.ok == false,
-    "solo-unreachable: ok=false when destination place fails on a drained source")
-assert(solo_unreachable_ret.reason == "source_solo_destination_unreachable",
-    "solo-unreachable: reason=source_solo_destination_unreachable, got " .. tostring(solo_unreachable_ret.reason))
+assert(solo_unreachable_ret.ok == false, "solo-unreachable: ok=false when destination place fails on a drained source")
+assert(
+    solo_unreachable_ret.reason == "source_solo_destination_unreachable",
+    "solo-unreachable: reason=source_solo_destination_unreachable, got " .. tostring(solo_unreachable_ret.reason)
+)
 assert(#delete_calls == 1, "solo-unreachable: source session still closed (post-move cleanup fired)")
 -- place_pty_in_session still invoked + warned once; close_session did not warn
-assert(#warn_calls == 1, "solo-unreachable: exactly one warning logged (the place failure), got " .. tostring(#warn_calls))
+assert(
+    #warn_calls == 1,
+    "solo-unreachable: exactly one warning logged (the place failure), got " .. tostring(#warn_calls)
+)
 
 -- === prise.close_session: refuse non-empty current session ===
 -- The primitive must not drain an active session — the caller is
