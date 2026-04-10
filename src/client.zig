@@ -9,6 +9,7 @@ const msgpack = @import("msgpack.zig");
 const redraw = @import("redraw.zig");
 const rpc = @import("rpc.zig");
 const Surface = @import("Surface.zig");
+const ziglua = @import("zlua");
 const ui_mod = @import("ui.zig");
 const UI = ui_mod.UI;
 const vaxis_helper = @import("vaxis_helper.zig");
@@ -239,6 +240,10 @@ pub const ClientState = struct {
         switch_detach,
         get_server_info,
         copy_selection,
+        spawn_plug: struct { callback_ref: ?i32 = null },
+        call_plug: struct { callback_ref: i32 },
+        notify_plug,
+        list_plugs: struct { callback_ref: i32 },
     };
 
     pub fn init(allocator: std.mem.Allocator) ClientState {
@@ -266,7 +271,7 @@ pub const ServerAction = union(enum) {
     redraw: msgpack.Value,
     attached: struct { new_pty_id: i64, old_pty_id: ?u32 = null, cwd: ?[]const u8 = null },
     pty_exited: struct { pty_id: u32, status: u32 },
-    pty_spawned: struct { pty_id: u32, cwd: []const u8, session: ?[]const u8 = null, tab: ?[]const u8 = null, title: ?[]const u8 = null },
+    pty_spawned: struct { pty_id: u32, cwd: []const u8, session: ?[]const u8 = null, tab: ?[]const u8 = null, title: ?[]const u8 = null, focus: ?bool = null },
     cwd_changed: struct { pty_id: u32, cwd: []const u8 },
     rename_tab: struct { pty_id: u32, title: []const u8 },
     detached,
@@ -286,6 +291,18 @@ pub const ServerAction = union(enum) {
     // `.planctl/specs/fn-388-break-pane-rpc-broker-pattern.{1,2}.md`.
     break_pane_request: struct { pty_id: u32, focus: bool, request_id: usize },
     break_pane_applied: struct { pty_id: u32, focus: bool },
+    plug_notification: PlugNotification,
+    plug_connected: []const u8,
+    plug_disconnected: []const u8,
+    spawn_plug_response: struct { callback_ref: ?i32, err: ?msgpack.Value, result: msgpack.Value },
+    call_plug_response: struct { callback_ref: i32, err: ?msgpack.Value, result: msgpack.Value },
+    list_plugs_response: struct { callback_ref: i32, result: msgpack.Value },
+
+    pub const PlugNotification = struct {
+        plug: []const u8,
+        method: []const u8,
+        params: msgpack.Value,
+    };
 
     pub const ColorQueryTarget = struct {
         pty_id: u32,
@@ -353,6 +370,26 @@ pub const ClientLogic = struct {
             } else if (entry.value == .switch_detach) {
                 log.err("Session switch detach failed: {}", .{err_val});
                 return .switch_detach_failed;
+            } else if (entry.value == .call_plug) {
+                const info = entry.value.call_plug;
+                return .{ .call_plug_response = .{
+                    .callback_ref = info.callback_ref,
+                    .err = err_val,
+                    .result = .nil,
+                } };
+            } else if (entry.value == .list_plugs) {
+                const info = entry.value.list_plugs;
+                return .{ .list_plugs_response = .{
+                    .callback_ref = info.callback_ref,
+                    .result = .nil,
+                } };
+            } else if (entry.value == .spawn_plug) {
+                const info = entry.value.spawn_plug;
+                return .{ .spawn_plug_response = .{
+                    .callback_ref = info.callback_ref,
+                    .err = err_val,
+                    .result = .nil,
+                } };
             }
         }
         log.err("Error in response: {}", .{err_val});
@@ -402,6 +439,21 @@ pub const ClientLogic = struct {
                 .switch_detach => .switch_detached,
                 .get_server_info => handleServerInfoResult(state, result),
                 .copy_selection => handleCopySelectionResult(result),
+                .spawn_plug => |info| .{ .spawn_plug_response = .{
+                    .callback_ref = info.callback_ref,
+                    .err = null,
+                    .result = result,
+                } },
+                .call_plug => |info| .{ .call_plug_response = .{
+                    .callback_ref = info.callback_ref,
+                    .err = null,
+                    .result = result,
+                } },
+                .notify_plug => .none,
+                .list_plugs => |info| .{ .list_plugs_response = .{
+                    .callback_ref = info.callback_ref,
+                    .result = result,
+                } },
             };
         }
         return handleUnsolicitedResult(state, result);
@@ -529,6 +581,12 @@ pub const ClientLogic = struct {
             return parseBreakPaneApplied(notif.params);
         } else if (std.mem.eql(u8, notif.method, "session_switch")) {
             return parseSessionSwitch(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "plug_notification")) {
+            return parsePlugNotification(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "plug_connected")) {
+            return parsePlugConnected(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "plug_disconnected")) {
+            return parsePlugDisconnected(notif.params);
         }
         return .none;
     }
@@ -610,6 +668,51 @@ pub const ClientLogic = struct {
         return .{ .break_pane_applied = .{ .pty_id = pid, .focus = f } };
     }
 
+    fn parsePlugNotification(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+        var plug: ?[]const u8 = null;
+        var method: ?[]const u8 = null;
+        var notif_params: msgpack.Value = .nil;
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            const k = kv.key.string;
+            if (std.mem.eql(u8, k, "plug")) {
+                if (kv.value == .string) plug = kv.value.string;
+            } else if (std.mem.eql(u8, k, "method")) {
+                if (kv.value == .string) method = kv.value.string;
+            } else if (std.mem.eql(u8, k, "params")) {
+                notif_params = kv.value;
+            }
+        }
+        const plug_name = plug orelse return .none;
+        const method_name = method orelse return .none;
+        return .{ .plug_notification = .{
+            .plug = plug_name,
+            .method = method_name,
+            .params = notif_params,
+        } };
+    }
+
+    fn parsePlugConnected(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+        for (params.map) |kv| {
+            if (kv.key == .string and std.mem.eql(u8, kv.key.string, "plug")) {
+                if (kv.value == .string) return .{ .plug_connected = kv.value.string };
+            }
+        }
+        return .none;
+    }
+
+    fn parsePlugDisconnected(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+        for (params.map) |kv| {
+            if (kv.key == .string and std.mem.eql(u8, kv.key.string, "plug")) {
+                if (kv.value == .string) return .{ .plug_disconnected = kv.value.string };
+            }
+        }
+        return .none;
+    }
+
     fn parseColorQuery(params: msgpack.Value) ServerAction {
         if (params != .map) return .none;
 
@@ -683,10 +786,11 @@ pub const ClientLogic = struct {
         if (params != .map) return .none;
 
         var pty_id: ?u32 = null;
-        var cwd: []const u8 = "";
+        var cwd: ?[]const u8 = null;
         var session: ?[]const u8 = null;
         var tab: ?[]const u8 = null;
         var title: ?[]const u8 = null;
+        var focus: ?bool = null;
 
         for (params.map) |kv| {
             if (kv.key != .string) continue;
@@ -704,11 +808,14 @@ pub const ClientLogic = struct {
                 tab = kv.value.string;
             } else if (std.mem.eql(u8, kv.key.string, "title") and kv.value == .string) {
                 title = kv.value.string;
+            } else if (std.mem.eql(u8, kv.key.string, "focus") and kv.value == .boolean) {
+                focus = kv.value.boolean;
             }
         }
 
         const id = pty_id orelse return .none;
-        return .{ .pty_spawned = .{ .pty_id = id, .cwd = cwd, .session = session, .tab = tab, .title = title } };
+        const cwd_val = cwd orelse return .none;
+        return .{ .pty_spawned = .{ .pty_id = id, .cwd = cwd_val, .session = session, .tab = tab, .title = title, .focus = focus } };
     }
 
     fn handleCwdChanged(state: *ClientState, params: msgpack.Value) !ServerAction {
@@ -1098,6 +1205,20 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         log.info("deinit: starting", .{});
+
+        // Drain Lua callback refs from pending requests before destroying the Lua VM
+        {
+            var req_it = self.state.pending_requests.valueIterator();
+            while (req_it.next()) |info| {
+                switch (info.*) {
+                    .spawn_plug => |sp| if (sp.callback_ref) |ref| self.ui.lua.unref(ziglua.registry_index, ref),
+                    .call_plug => |cp| self.ui.lua.unref(ziglua.registry_index, cp.callback_ref),
+                    .list_plugs => |lp| self.ui.lua.unref(ziglua.registry_index, lp.callback_ref),
+                    else => {},
+                }
+            }
+        }
+
         self.ui.deinit();
         self.state.should_quit = true;
 
@@ -1454,6 +1575,43 @@ pub const App = struct {
             }
         }.attachCb;
         self.ui.queue_attach_pty_ctx = @ptrCast(self);
+
+        // Register place_pty_in_session callback
+        self.ui.setPlacePtyInSessionCallback(self, struct {
+            fn placeCb(ctx: *anyopaque, session_name: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.placePtyInSession(session_name, pty_id, cwd, tab_title);
+            }
+        }.placeCb);
+
+        // Register plug system callbacks
+        self.ui.setPlugSpawnCallback(self, struct {
+            fn cb(ctx: *anyopaque, opts: UI.PlugSpawnOptions) anyerror!void {
+                const app: *App = @ptrCast(@alignCast(ctx));
+                try app.sendSpawnPlug(opts);
+            }
+        }.cb);
+
+        self.ui.setPlugCallCallback(self, struct {
+            fn cb(ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value, callback_ref: i32) anyerror!void {
+                const app: *App = @ptrCast(@alignCast(ctx));
+                try app.sendCallPlug(name, method, params, callback_ref);
+            }
+        }.cb);
+
+        self.ui.setPlugNotifyCallback(self, struct {
+            fn cb(ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value) anyerror!void {
+                const app: *App = @ptrCast(@alignCast(ctx));
+                try app.sendNotifyPlug(name, method, params);
+            }
+        }.cb);
+
+        self.ui.setPlugListCallback(self, struct {
+            fn cb(ctx: *anyopaque, callback_ref: i32) anyerror!void {
+                const app: *App = @ptrCast(@alignCast(ctx));
+                try app.sendListPlugs(callback_ref);
+            }
+        }.cb);
 
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
@@ -1840,10 +1998,6 @@ pub const App = struct {
                 try self.vx.setMouseMode(self.tty.writer(), true);
                 // Enable bracketed paste mode
                 try self.vx.setBracketedPaste(self.tty.writer(), true);
-                // Send init event
-                self.ui.update(.init) catch |err| {
-                    log.err("Failed to update UI with init: {}", .{err});
-                };
 
                 if (!self.connected) {
                     if (self.io_loop) |loop| {
@@ -2593,6 +2747,16 @@ pub const App = struct {
                         .ptr = app,
                         .cb = onRecv,
                     });
+
+                    // Dispatch the Lua `init` event now that the socket is
+                    // live. init.lua code that calls RPC helpers like
+                    // spawn_plug relies on sendDirect having a real fd — if
+                    // this fires before the socket is open, sendDirect writes
+                    // the encoded msgpack straight onto the controlling TTY
+                    // (App.fd is `undefined` until onConnected sets it).
+                    app.ui.update(.init) catch |err| {
+                        log.err("Failed to update UI with init: {}", .{err});
+                    };
 
                     // First, get server info to obtain pty_validity
                     // After receiving server_info, onServerInfo will continue with spawn/attach
@@ -3465,7 +3629,7 @@ pub const App = struct {
                             },
                             .pty_spawned => |info| {
                                 log.info("PTY {} spawned with cwd {s}", .{ info.pty_id, info.cwd });
-                                app.ui.update(.{ .pty_spawned = .{ .id = info.pty_id, .cwd = info.cwd, .session = info.session, .tab = info.tab, .title = info.title } }) catch |err| {
+                                app.ui.update(.{ .pty_spawned = .{ .id = info.pty_id, .cwd = info.cwd, .session = info.session, .tab = info.tab, .title = info.title, .focus = info.focus } }) catch |err| {
                                     log.err("Failed to update UI with pty_spawned: {}", .{err});
                                 };
                             },
@@ -3556,6 +3720,43 @@ pub const App = struct {
                             },
                             .copy_to_clipboard => |text| {
                                 app.copyToClipboard(text);
+                            },
+                            .plug_notification => |notif| {
+                                app.ui.update(.{ .plug_notification = .{
+                                    .plug = notif.plug,
+                                    .method = notif.method,
+                                    .params = notif.params,
+                                } }) catch |err| {
+                                    log.err("Failed to update UI with plug_notification: {}", .{err});
+                                };
+                            },
+                            .plug_connected => |plug_name| {
+                                app.ui.update(.{ .plug_connected = .{
+                                    .plug = plug_name,
+                                } }) catch |err| {
+                                    log.err("Failed to update UI with plug_connected: {}", .{err});
+                                };
+                            },
+                            .plug_disconnected => |plug_name| {
+                                app.ui.update(.{ .plug_disconnected = .{
+                                    .plug = plug_name,
+                                } }) catch |err| {
+                                    log.err("Failed to update UI with plug_disconnected: {}", .{err});
+                                };
+                            },
+                            .call_plug_response => |resp| {
+                                app.ui.handlePlugCallResponse(resp.callback_ref, resp.err, resp.result);
+                                try app.scheduleRender();
+                            },
+                            .list_plugs_response => |resp| {
+                                app.ui.handlePlugListResponse(resp.callback_ref, resp.result);
+                                try app.scheduleRender();
+                            },
+                            .spawn_plug_response => |resp| {
+                                if (resp.callback_ref) |ref| {
+                                    app.ui.handlePlugSpawnResponse(ref, resp.err, resp.result);
+                                    try app.scheduleRender();
+                                }
                             },
                             .none => {},
                         }
@@ -3709,6 +3910,101 @@ pub const App = struct {
         const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params });
         defer self.allocator.free(msg);
 
+        try self.sendDirect(msg);
+    }
+
+    fn sendSpawnPlug(self: *App, opts: UI.PlugSpawnOptions) !void {
+        // We own opts.name and opts.cmd — free after encoding
+        defer {
+            self.allocator.free(opts.name);
+            for (opts.cmd) |arg| self.allocator.free(arg);
+            self.allocator.free(opts.cmd);
+        }
+
+        var field_count: usize = 2; // name + cmd always
+        if (opts.restart) field_count += 1;
+        if (opts.restart_delay_ms != 1000) field_count += 1;
+
+        const params = try self.allocator.alloc(msgpack.Value.KeyValue, field_count);
+        defer self.allocator.free(params);
+        var idx: usize = 0;
+
+        params[idx] = .{ .key = .{ .string = "name" }, .value = .{ .string = opts.name } };
+        idx += 1;
+
+        const cmd_arr = try self.allocator.alloc(msgpack.Value, opts.cmd.len);
+        defer self.allocator.free(cmd_arr);
+        for (opts.cmd, 0..) |arg, i| {
+            cmd_arr[i] = .{ .string = arg };
+        }
+        params[idx] = .{ .key = .{ .string = "cmd" }, .value = .{ .array = cmd_arr } };
+        idx += 1;
+
+        if (opts.restart) {
+            params[idx] = .{ .key = .{ .string = "restart" }, .value = .{ .boolean = true } };
+            idx += 1;
+        }
+        if (opts.restart_delay_ms != 1000) {
+            params[idx] = .{ .key = .{ .string = "restart_delay_ms" }, .value = .{ .unsigned = opts.restart_delay_ms } };
+            idx += 1;
+        }
+
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+        try self.state.pending_requests.put(msgid, .{ .spawn_plug = .{ .callback_ref = opts.callback_ref } });
+
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_plug", msgpack.Value{ .map = params } });
+        defer self.allocator.free(msg);
+        try self.sendDirect(msg);
+    }
+
+    fn sendCallPlug(self: *App, name: []const u8, method: []const u8, params: msgpack.Value, callback_ref: i32) !void {
+        // We own params — deinit after encoding to wire bytes
+        defer params.deinit(self.allocator);
+
+        const map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "plug" }, .value = .{ .string = name } };
+        map_items[1] = .{ .key = .{ .string = "method" }, .value = .{ .string = method } };
+        map_items[2] = .{ .key = .{ .string = "params" }, .value = params };
+
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+        try self.state.pending_requests.put(msgid, .{ .call_plug = .{ .callback_ref = callback_ref } });
+        errdefer _ = self.state.pending_requests.remove(msgid);
+
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "call_plug", msgpack.Value{ .map = map_items } });
+        defer self.allocator.free(msg);
+        try self.sendDirect(msg);
+    }
+
+    fn sendNotifyPlug(self: *App, name: []const u8, method: []const u8, params: msgpack.Value) !void {
+        // We own params — deinit after encoding
+        defer params.deinit(self.allocator);
+
+        const map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "plug" }, .value = .{ .string = name } };
+        map_items[1] = .{ .key = .{ .string = "method" }, .value = .{ .string = method } };
+        map_items[2] = .{ .key = .{ .string = "params" }, .value = params };
+
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+        try self.state.pending_requests.put(msgid, .notify_plug);
+
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "notify_plug", msgpack.Value{ .map = map_items } });
+        defer self.allocator.free(msg);
+        try self.sendDirect(msg);
+    }
+
+    fn sendListPlugs(self: *App, callback_ref: i32) !void {
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+        try self.state.pending_requests.put(msgid, .{ .list_plugs = .{ .callback_ref = callback_ref } });
+        errdefer _ = self.state.pending_requests.remove(msgid);
+
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "list_plugs", .{} });
+        defer self.allocator.free(msg);
         try self.sendDirect(msg);
     }
 
@@ -3963,24 +4259,13 @@ pub const App = struct {
     /// Create a new empty session and switch to it.
     /// Writes a minimal session file, then exec's into the new session.
     pub fn createSession(self: *App, name: []const u8) !void {
-        std.debug.assert(name.len > 0);
+        try validateSessionName(name);
 
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
         const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
         defer self.allocator.free(state_dir);
 
-        // Ensure directory exists
-        std.fs.makeDirAbsolute(state_dir) catch |e| {
-            if (e != error.PathAlreadyExists) {
-                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
-                std.fs.makeDirAbsolute(parent) catch |e2| {
-                    if (e2 != error.PathAlreadyExists) return e2;
-                };
-                std.fs.makeDirAbsolute(state_dir) catch |e2| {
-                    if (e2 != error.PathAlreadyExists) return e2;
-                };
-            }
-        };
+        try ensureSessionDir(state_dir);
 
         var dir = try std.fs.openDirAbsolute(state_dir, .{});
         defer dir.close();
@@ -3991,10 +4276,18 @@ pub const App = struct {
         // Write minimal session JSON with pty_validity=0 to force fresh PTY spawning
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.posix.getcwd(&cwd_buf) catch "/tmp";
-        var json_buf: [1024]u8 = undefined;
-        const json = std.fmt.bufPrint(&json_buf,
-            \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":"{s}"}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
-        , .{cwd}) catch return error.NameTooLong;
+
+        const Pane = struct { type: []const u8, id: u32, pty_id: u32, cwd: []const u8 };
+        const Tab = struct { id: u32, root: Pane };
+        const Session = struct { pty_validity: i64, tabs: []const Tab, active_tab: u32, next_split_id: u32, next_tab_id: u32 };
+
+        const pane: Pane = .{ .type = "pane", .id = 1, .pty_id = 0, .cwd = cwd };
+        const tab: Tab = .{ .id = 1, .root = pane };
+        const tabs = [_]Tab{tab};
+        const session: Session = .{ .pty_validity = 0, .tabs = &tabs, .active_tab = 1, .next_split_id = 2, .next_tab_id = 2 };
+
+        const json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(session, .{})});
+        defer self.allocator.free(json);
 
         const file = try dir.createFile(filename, .{});
         defer file.close();
@@ -4004,6 +4297,134 @@ pub const App = struct {
 
         // Switch to the new session (saves current + exec's into new)
         try self.switchToSession(name);
+    }
+
+    /// Validate that a session name is safe for use as a filename.
+    fn validateSessionName(name: []const u8) !void {
+        if (name.len == 0) return error.InvalidSessionName;
+        if (std.mem.indexOfAny(u8, name, "/\\") != null) return error.InvalidSessionName;
+        if (std.mem.indexOf(u8, name, "..") != null) return error.InvalidSessionName;
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSessionName;
+    }
+
+    /// Place a PTY into a target session's saved state file without switching.
+    /// If the session file doesn't exist, creates one. If it exists, appends a tab.
+    pub fn placePtyInSession(self: *App, session_name: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8) !void {
+        try validateSessionName(session_name);
+
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        // Ensure directory exists
+        ensureSessionDir(state_dir) catch |err| {
+            log.err("placePtyInSession: failed to create session dir: {}", .{err});
+            return err;
+        };
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
+        defer self.allocator.free(filename);
+
+        const path = try std.fs.path.join(self.allocator, &.{ state_dir, filename });
+        defer self.allocator.free(path);
+
+        const validity = self.state.pty_validity orelse 0;
+
+        // Try to read existing file
+        if (std.fs.openFileAbsolute(path, .{})) |file| {
+            defer file.close();
+            const existing = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+            defer self.allocator.free(existing);
+            try self.appendTabToSessionFile(path, existing, pty_id, cwd, tab_title, validity);
+        } else |_| {
+            // File doesn't exist — create new session
+            try self.writeNewSessionFile(path, pty_id, cwd, tab_title, validity);
+        }
+
+        log.info("Placed PTY {d} in session '{s}'", .{ pty_id, session_name });
+    }
+
+    /// Create a new session file with a single tab containing the given PTY.
+    fn writeNewSessionFile(self: *App, path: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
+        const Pane = struct { type: []const u8, id: u32, pty_id: u32, cwd: []const u8 };
+        const Tab = struct { id: u32, title: ?[]const u8, root: Pane, last_focused_id: u32 };
+        const Session = struct { pty_validity: i64, tabs: []const Tab, active_tab: u32, next_split_id: u32, next_tab_id: u32 };
+
+        const pane: Pane = .{ .type = "pane", .id = 1, .pty_id = pty_id, .cwd = cwd };
+        const tab: Tab = .{ .id = 1, .title = tab_title, .root = pane, .last_focused_id = 1 };
+        const tabs = [_]Tab{tab};
+        const session: Session = .{ .pty_validity = validity, .tabs = &tabs, .active_tab = 1, .next_split_id = 2, .next_tab_id = 2 };
+
+        const json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(session, .{})});
+        defer self.allocator.free(json);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(json);
+    }
+
+    /// Append a new tab to an existing session JSON file.
+    fn appendTabToSessionFile(self: *App, path: []const u8, existing_json: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, existing_json, .{});
+        defer parsed.deinit();
+
+        var root = &parsed.value.object;
+        const arena = parsed.arena.allocator();
+
+        // Extract and bump counters — return error if session file is missing fields
+        const next_tab_val = root.get("next_tab_id") orelse return error.InvalidSessionFile;
+        const next_split_val = root.get("next_split_id") orelse return error.InvalidSessionFile;
+        const new_tab_id = if (next_tab_val == .integer) next_tab_val.integer else return error.InvalidSessionFile;
+        const new_split_id = if (next_split_val == .integer) next_split_val.integer else return error.InvalidSessionFile;
+
+        // Build the new tab as a Value tree (use parser arena so parsed.deinit() frees everything)
+        var pane_obj = std.json.ObjectMap.init(arena);
+        try pane_obj.put("type", .{ .string = "pane" });
+        try pane_obj.put("id", .{ .integer = new_split_id });
+        try pane_obj.put("pty_id", .{ .integer = @intCast(pty_id) });
+        try pane_obj.put("cwd", .{ .string = cwd });
+
+        var tab_obj = std.json.ObjectMap.init(arena);
+        try tab_obj.put("id", .{ .integer = new_tab_id });
+        if (tab_title) |t| {
+            try tab_obj.put("title", .{ .string = t });
+        } else {
+            try tab_obj.put("title", .null);
+        }
+        try tab_obj.put("root", .{ .object = pane_obj });
+        try tab_obj.put("last_focused_id", .{ .integer = new_split_id });
+
+        // Append to tabs array
+        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+        try tabs_val.array.append(.{ .object = tab_obj });
+
+        // Update counters and validity
+        try root.put("next_tab_id", .{ .integer = new_tab_id + 1 });
+        try root.put("next_split_id", .{ .integer = new_split_id + 1 });
+        try root.put("pty_validity", .{ .integer = validity });
+
+        // Serialize back
+        const output = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+        defer self.allocator.free(output);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(output);
+    }
+
+    fn ensureSessionDir(state_dir: []const u8) !void {
+        std.fs.makeDirAbsolute(state_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
+                std.fs.makeDirAbsolute(parent) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+                std.fs.makeDirAbsolute(state_dir) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+            }
+        };
     }
 
     pub fn deleteCurrentSession(self: *App) void {
@@ -5207,6 +5628,54 @@ test "extractPtyIdsFromJson dedupes repeated pane pty_ids" {
     try testing.expectEqual(@as(usize, 2), ids.len);
     try testing.expectEqual(@as(u32, 3), ids[0]);
     try testing.expectEqual(@as(u32, 5), ids[1]);
+}
+
+test "createSession JSON escapes special characters in cwd" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Same struct types used by createSession
+    const Pane = struct { type: []const u8, id: u32, pty_id: u32, cwd: []const u8 };
+    const Tab = struct { id: u32, root: Pane };
+    const Session = struct { pty_validity: i64, tabs: []const Tab, active_tab: u32, next_split_id: u32, next_tab_id: u32 };
+
+    // cwd with quotes and backslashes — would produce invalid JSON via bufPrint
+    const evil_cwd = "/tmp/dir\"with\\special";
+    const pane: Pane = .{ .type = "pane", .id = 1, .pty_id = 0, .cwd = evil_cwd };
+    const tab: Tab = .{ .id = 1, .root = pane };
+    const tabs = [_]Tab{tab};
+    const session: Session = .{ .pty_validity = 0, .tabs = &tabs, .active_tab = 1, .next_split_id = 2, .next_tab_id = 2 };
+
+    const json = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(session, .{})});
+    defer allocator.free(json);
+
+    // Must round-trip through the JSON parser without error
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    // Verify the cwd survived the round-trip
+    const root = parsed.value.object.get("tabs").?.array.items[0].object.get("root").?;
+    const parsed_cwd = root.object.get("cwd").?.string;
+    try testing.expectEqualStrings(evil_cwd, parsed_cwd);
+}
+
+test "validateSessionName rejects path traversal" {
+    const valid = App.validateSessionName("my-session");
+    try std.testing.expectEqual({}, valid);
+
+    // Slashes allow directory escape
+    try std.testing.expectError(error.InvalidSessionName, App.validateSessionName("../etc/passwd"));
+    try std.testing.expectError(error.InvalidSessionName, App.validateSessionName("foo/bar"));
+    try std.testing.expectError(error.InvalidSessionName, App.validateSessionName("foo\\bar"));
+
+    // Double-dot without slashes is still suspicious
+    try std.testing.expectError(error.InvalidSessionName, App.validateSessionName(".."));
+
+    // Empty name
+    try std.testing.expectError(error.InvalidSessionName, App.validateSessionName(""));
+
+    // NUL byte
+    try std.testing.expectError(error.InvalidSessionName, App.validateSessionName("foo\x00bar"));
 }
 
 test "DumpHeader has correct size and field offsets" {

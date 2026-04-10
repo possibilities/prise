@@ -5,6 +5,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const ziglua = @import("zlua");
 
+const lua_msgpack = @import("lua_msgpack.zig");
 const msgpack = @import("msgpack.zig");
 const Surface = @import("Surface.zig");
 const TextInput = @import("TextInput.zig");
@@ -43,6 +44,7 @@ pub const PtySpawnedInfo = struct {
     session: ?[]const u8 = null,
     tab: ?[]const u8 = null,
     title: ?[]const u8 = null,
+    focus: ?bool = null,
 };
 
 pub const CwdChangedInfo = struct {
@@ -66,6 +68,20 @@ pub const BreakPaneAppliedInfo = struct {
     focus: bool,
 };
 
+pub const PlugNotificationInfo = struct {
+    plug: []const u8,
+    method: []const u8,
+    params: msgpack.Value,
+};
+
+pub const PlugConnectedInfo = struct {
+    plug: []const u8,
+};
+
+pub const PlugDisconnectedInfo = struct {
+    plug: []const u8,
+};
+
 pub const Event = union(enum) {
     vaxis: vaxis.Event,
     mouse: MouseEvent,
@@ -76,6 +92,9 @@ pub const Event = union(enum) {
     pty_spawned: PtySpawnedInfo,
     cwd_changed: CwdChangedInfo,
     rename_tab: RenameTabInfo,
+    plug_notification: PlugNotificationInfo,
+    plug_connected: PlugConnectedInfo,
+    plug_disconnected: PlugDisconnectedInfo,
     init: void,
     /// Broker-side entry point: server asks the chosen broker client
     /// to classify + apply a break_pane and reply via prise.notify
@@ -143,6 +162,9 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
         .pty_spawned => |info| pushPtySpawnedEvent(lua, info),
         .cwd_changed => |info| pushCwdChangedEvent(lua, info),
         .rename_tab => |info| pushRenameTabEvent(lua, info),
+        .plug_notification => |info| pushPlugNotificationEvent(lua, info),
+        .plug_connected => |info| pushPlugConnectedEvent(lua, info),
+        .plug_disconnected => |info| pushPlugDisconnectedEvent(lua, info),
         .paste => |data| pushPasteEvent(lua, data),
         .split_resize => |sr| pushSplitResizeEvent(lua, sr),
         .mouse => |m| pushMouseEvent(lua, m),
@@ -250,6 +272,10 @@ fn pushPtySpawnedEvent(lua: *ziglua.Lua, info: PtySpawnedInfo) void {
         _ = lua.pushString(t);
         lua.setField(-2, "title");
     }
+    if (info.focus) |f| {
+        lua.pushBoolean(f);
+        lua.setField(-2, "focus");
+    }
     lua.setField(-2, "data");
 }
 
@@ -274,6 +300,40 @@ fn pushRenameTabEvent(lua: *ziglua.Lua, info: RenameTabInfo) void {
     lua.setField(-2, "pty_id");
     _ = lua.pushString(info.title);
     lua.setField(-2, "title");
+    lua.setField(-2, "data");
+}
+
+fn pushPlugNotificationEvent(lua: *ziglua.Lua, info: PlugNotificationInfo) void {
+    _ = lua.pushString("plug_notification");
+    lua.setField(-2, "type");
+
+    lua.createTable(0, 3);
+    _ = lua.pushString(info.plug);
+    lua.setField(-2, "plug");
+    _ = lua.pushString(info.method);
+    lua.setField(-2, "method");
+    lua_msgpack.pushMsgpackValue(lua, info.params);
+    lua.setField(-2, "params");
+    lua.setField(-2, "data");
+}
+
+fn pushPlugConnectedEvent(lua: *ziglua.Lua, info: PlugConnectedInfo) void {
+    _ = lua.pushString("plug_connected");
+    lua.setField(-2, "type");
+
+    lua.createTable(0, 1);
+    _ = lua.pushString(info.plug);
+    lua.setField(-2, "plug");
+    lua.setField(-2, "data");
+}
+
+fn pushPlugDisconnectedEvent(lua: *ziglua.Lua, info: PlugDisconnectedInfo) void {
+    _ = lua.pushString("plug_disconnected");
+    lua.setField(-2, "type");
+
+    lua.createTable(0, 1);
+    _ = lua.pushString(info.plug);
+    lua.setField(-2, "plug");
     lua.setField(-2, "data");
 }
 

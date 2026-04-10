@@ -61,6 +61,12 @@ from within an existing pane.
 :   Server instance identifier used to reject stale tab-rename requests after a
     server restart.
 
+**PRISE_PLUG_TOKEN**
+:   Ephemeral authentication token for plug processes. Set automatically by the
+    server when spawning a plug via `spawn_plug`. The plug must include this
+    token in its `register_plug` RPC call. A new token is generated for each
+    spawn and restart.
+
 **PRISE_SOCKET**
 :   Override path for the prise server socket.
 

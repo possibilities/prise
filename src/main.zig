@@ -284,6 +284,9 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?ParseResul
         } else if (std.mem.eql(u8, arg, "tab")) {
             _ = try handleTabCommand(allocator, &args, socket_path);
             return null;
+        } else if (std.mem.eql(u8, arg, "plug")) {
+            _ = try handlePlugCommand(allocator, &args, socket_path);
+            return null;
         } else {
             log.err("Unknown command: {s}", .{arg});
             try printHelp();
@@ -360,6 +363,7 @@ fn printHelp() !void {
         \\  session    Manage sessions (attach, list, rename, delete)
         \\  pty        Manage PTYs (list, kill)
         \\  tab        Manage tabs (rename)
+        \\  plug       Manage plugs (list)
         \\
         \\Options:
         \\  -s, --session <name>  Create a new session with the specified name
@@ -561,6 +565,139 @@ fn printTabHelpTo(file: std.fs.File) !void {
         \\  -h, --help               Show this help message
         \\
     , .{});
+}
+
+fn handlePlugCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator, socket_path: []const u8) !?ParseResult {
+    const subcmd = args.next() orelse {
+        try printPlugHelp();
+        return error.MissingCommand;
+    };
+
+    if (std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "-h")) {
+        try printPlugHelp();
+        return null;
+    } else if (std.mem.eql(u8, subcmd, "list")) {
+        initLogFile("client.log");
+        try listPlugs(allocator, resolvePriseSocketPath(socket_path));
+        return null;
+    } else {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Unknown plug command: {s}\n\n", .{subcmd}) catch return error.UnknownCommand;
+        std.fs.File.stderr().writeAll(msg) catch {};
+        try printPlugHelpTo(std.fs.File.stderr());
+        return error.UnknownCommand;
+    }
+}
+
+fn printPlugHelp() !void {
+    try printPlugHelpTo(std.fs.File.stdout());
+}
+
+fn printPlugHelpTo(file: std.fs.File) !void {
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(&buf);
+    defer writer.interface.flush() catch {};
+    try writer.interface.print(
+        \\prise plug - Manage plugs
+        \\
+        \\Usage: prise plug <command>
+        \\
+        \\Commands:
+        \\  list                     List connected plugs
+        \\
+        \\Options:
+        \\  -h, --help               Show this help message
+        \\
+    , .{});
+}
+
+fn listPlugs(allocator: std.mem.Allocator, socket_path: []const u8) !void {
+    const sock = try connectToServer(socket_path);
+    defer posix.close(sock);
+
+    const request = try msgpack.encode(allocator, .{ 0, 1, "list_plugs", .{} });
+    defer allocator.free(request);
+
+    const msg = try sendRpcRequest(allocator, sock, request);
+    defer msg.deinit(allocator);
+
+    if (msg != .response) return error.InvalidResponse;
+    if (msg.response.err != null) return error.ServerError;
+    if (msg.response.result != .map) return error.InvalidResponse;
+
+    var plugs: ?[]const msgpack.Value = null;
+    for (msg.response.result.map) |kv| {
+        if (kv.key == .string and std.mem.eql(u8, kv.key.string, "plugs")) {
+            if (kv.value == .array) plugs = kv.value.array;
+        }
+    }
+
+    const plug_list = plugs orelse return error.InvalidResponse;
+
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    if (plug_list.len == 0) {
+        try stdout.interface.print("No plugs configured\n", .{});
+        return;
+    }
+
+    try stdout.interface.print("{s:<20} {s:<12} {s:<10} {s:<10} {s}\n", .{
+        "NAME", "STATUS", "PID", "RESTARTS", "AUTO-RESTART",
+    });
+    try stdout.interface.print("{s:<20} {s:<12} {s:<10} {s:<10} {s}\n", .{
+        "----", "------", "---", "--------", "------------",
+    });
+
+    for (plug_list) |plug_val| {
+        if (plug_val != .map) continue;
+        try printPlugRow(&stdout, plug_val.map);
+    }
+}
+
+fn printPlugRow(stdout: anytype, entries: []const msgpack.Value.KeyValue) !void {
+    var name: []const u8 = "?";
+    var registered: bool = false;
+    var pid: ?i64 = null;
+    var restart_count: u64 = 0;
+    var restart: bool = false;
+
+    for (entries) |kv| {
+        if (kv.key != .string) continue;
+        if (std.mem.eql(u8, kv.key.string, "name") and kv.value == .string) {
+            name = kv.value.string;
+        } else if (std.mem.eql(u8, kv.key.string, "registered") and kv.value == .boolean) {
+            registered = kv.value.boolean;
+        } else if (std.mem.eql(u8, kv.key.string, "pid")) {
+            pid = switch (kv.value) {
+                .integer => |i| i,
+                .unsigned => |u| @intCast(u),
+                else => null,
+            };
+        } else if (std.mem.eql(u8, kv.key.string, "restart_count")) {
+            restart_count = switch (kv.value) {
+                .unsigned => |u| u,
+                .integer => |i| @intCast(i),
+                else => 0,
+            };
+        } else if (std.mem.eql(u8, kv.key.string, "restart") and kv.value == .boolean) {
+            restart = kv.value.boolean;
+        }
+    }
+
+    const status = if (registered) "connected" else if (pid != null) "starting" else "stopped";
+    const restart_str = if (restart) "yes" else "no";
+
+    if (pid) |p| {
+        try stdout.interface.print("{s:<20} {s:<12} {d:<10} {d:<10} {s}\n", .{
+            name, status, p, restart_count, restart_str,
+        });
+    } else {
+        try stdout.interface.print("{s:<20} {s:<12} {s:<10} {d:<10} {s}\n", .{
+            name, status, "-", restart_count, restart_str,
+        });
+    }
 }
 
 fn resolvePriseSocketPath(default_socket_path: []const u8) []const u8 {
@@ -1703,6 +1840,7 @@ test {
     _ = @import("keybind.zig");
     _ = @import("keybind_compiler.zig");
     _ = @import("keybind_matcher.zig");
+    _ = @import("lua_msgpack.zig");
     _ = @import("crash_context.zig");
 
     if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {

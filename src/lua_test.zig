@@ -98,6 +98,12 @@ test "lua tiling tab bar clean swap" {
     try runLuaTest(lua, "src/lua/tiling_test_tab_bar_clean_swap.lua");
 }
 
+test "lua tiling tab bar state" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_tab_bar_state.lua");
+}
+
 test "lua tiling deserialize" {
     var lua = try setupLua(std.testing.allocator);
     defer lua.deinit();
@@ -108,4 +114,38 @@ test "lua tiling swap tab wrap" {
     var lua = try setupLua(std.testing.allocator);
     defer lua.deinit();
     try runLuaTest(lua, "src/lua/tiling_test_swap_tab_wrap.lua");
+test "lua tiling click regions" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_click_regions.lua");
+}
+
+test "lua tiling input" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_input.lua");
+}
+
+test "lua tiling spawn" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_spawn.lua");
+}
+
+test "lua tiling theme" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_theme.lua");
+}
+
+test "lua tiling keep attached" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_keep_attached.lua");
+}
+
+test "lua tiling tab info" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_tab_info.lua");
 }

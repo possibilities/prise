@@ -138,6 +138,9 @@ function M.setup_prise_mock()
         end,
         rename_session = function() end,
         create_session = function() end,
+        place_pty_in_session = function()
+            return true
+        end,
         -- Text input (feat/tab-name-from-cwd, feat/rename-tab)
         create_text_input = function()
             return {

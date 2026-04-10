@@ -121,6 +121,16 @@ pub const UI = struct {
     create_session_ctx: *anyopaque = undefined,
     queue_attach_pty_callback: ?*const fn (ctx: *anyopaque, pty_id: u32) void = null,
     queue_attach_pty_ctx: *anyopaque = undefined,
+    place_pty_in_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8) anyerror!void = null,
+    place_pty_in_session_ctx: *anyopaque = undefined,
+    plug_spawn_callback: ?*const fn (ctx: *anyopaque, opts: PlugSpawnOptions) anyerror!void = null,
+    plug_spawn_ctx: *anyopaque = undefined,
+    plug_call_callback: ?*const fn (ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value, callback_ref: i32) anyerror!void = null,
+    plug_call_ctx: *anyopaque = undefined,
+    plug_notify_callback: ?*const fn (ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value) anyerror!void = null,
+    plug_notify_ctx: *anyopaque = undefined,
+    plug_list_callback: ?*const fn (ctx: *anyopaque, callback_ref: i32) anyerror!void = null,
+    plug_list_ctx: *anyopaque = undefined,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -133,6 +143,14 @@ pub const UI = struct {
         // argv bypasses the login shell entirely; the server execs these
         // directly in the PTY child. Mutually exclusive with cmd.
         argv: ?[]const []const u8 = null,
+    };
+
+    pub const PlugSpawnOptions = struct {
+        name: []const u8,
+        cmd: []const []const u8,
+        restart: bool = false,
+        restart_delay_ms: u32 = 1000,
+        callback_ref: ?i32 = null,
     };
 
     pub const InitError = struct {
@@ -318,6 +336,31 @@ pub const UI = struct {
         self.create_session_callback = cb;
     }
 
+    pub fn setPlacePtyInSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, session_name: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8) anyerror!void) void {
+        self.place_pty_in_session_ctx = ctx;
+        self.place_pty_in_session_callback = cb;
+    }
+
+    pub fn setPlugSpawnCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, opts: PlugSpawnOptions) anyerror!void) void {
+        self.plug_spawn_ctx = ctx;
+        self.plug_spawn_callback = cb;
+    }
+
+    pub fn setPlugCallCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value, callback_ref: i32) anyerror!void) void {
+        self.plug_call_ctx = ctx;
+        self.plug_call_callback = cb;
+    }
+
+    pub fn setPlugNotifyCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value) anyerror!void) void {
+        self.plug_notify_ctx = ctx;
+        self.plug_notify_callback = cb;
+    }
+
+    pub fn setPlugListCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, callback_ref: i32) anyerror!void) void {
+        self.plug_list_ctx = ctx;
+        self.plug_list_callback = cb;
+    }
+
     pub fn getNextSessionName(self: *UI) ![]const u8 {
         const home = std.posix.getenv("HOME") orelse return self.allocator.dupe(u8, AMORY_NAMES[0]);
 
@@ -463,6 +506,23 @@ pub const UI = struct {
         // Register create_session
         lua.pushFunction(ziglua.wrap(createSession));
         lua.setField(-2, "create_session");
+
+        // Register place_pty_in_session
+        lua.pushFunction(ziglua.wrap(placePtyInSession));
+        lua.setField(-2, "place_pty_in_session");
+
+        // Register plug system functions
+        lua.pushFunction(ziglua.wrap(spawnPlug));
+        lua.setField(-2, "spawn_plug");
+
+        lua.pushFunction(ziglua.wrap(callPlug));
+        lua.setField(-2, "call_plug");
+
+        lua.pushFunction(ziglua.wrap(notifyPlug));
+        lua.setField(-2, "notify_plug");
+
+        lua.pushFunction(ziglua.wrap(listPlugs));
+        lua.setField(-2, "list_plugs");
 
         // Register log
         lua.createTable(0, 4);
@@ -632,6 +692,310 @@ pub const UI = struct {
             lua.raiseErrorStr("prise.notify: send failed: %s", .{@errorName(err).ptr});
         };
         return 0;
+    }
+
+    /// Lua: prise.spawn_plug({name="echo", cmd={"python3", "echo.py"}, restart=true, restart_delay_ms=2000}, callback?)
+    fn spawnPlug(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.raiseErrorStr("UI not available", .{});
+        };
+        lua.pop(1);
+
+        const cb = ui.plug_spawn_callback orelse {
+            lua.raiseErrorStr("spawn_plug callback not configured", .{});
+        };
+
+        lua.checkType(1, .table);
+
+        // Validate optional callback early, before allocations
+        if (lua.getTop() >= 2 and lua.typeOf(2) != .nil) {
+            lua.checkType(2, .function);
+        }
+
+        const name = spawnPlugExtractName(lua, ui);
+        const cmd_result = spawnPlugExtractCmd(lua, ui, name);
+
+        // Extract optional fields
+        _ = lua.getField(1, "restart");
+        const restart = if (lua.isBoolean(-1)) lua.toBoolean(-1) else false;
+        lua.pop(1);
+
+        _ = lua.getField(1, "restart_delay_ms");
+        const restart_delay_ms: u32 = if (lua.isInteger(-1)) blk: {
+            const raw = lua.toInteger(-1) catch 1000;
+            break :blk std.math.cast(u32, raw) orelse 1000;
+        } else 1000;
+        lua.pop(1);
+
+        // Optional callback (arg 2)
+        const callback_ref: ?i32 = if (lua.getTop() >= 2 and lua.typeOf(2) == .function) blk: {
+            lua.pushValue(2);
+            break :blk lua.ref(ziglua.registry_index) catch {
+                ui.allocator.free(name);
+                for (cmd_result.cmd[0..cmd_result.count]) |arg| ui.allocator.free(arg);
+                ui.allocator.free(cmd_result.cmd);
+                lua.raiseErrorStr("spawn_plug: failed to store callback reference", .{});
+            };
+        } else null;
+
+        cb(ui.plug_spawn_ctx, .{
+            .name = name,
+            .cmd = cmd_result.cmd,
+            .restart = restart,
+            .restart_delay_ms = restart_delay_ms,
+            .callback_ref = callback_ref,
+        }) catch |err| {
+            if (callback_ref) |ref| lua.unref(ziglua.registry_index, ref);
+            // Free allocator-owned name and cmd on failure
+            ui.allocator.free(name);
+            for (cmd_result.cmd[0..cmd_result.count]) |arg| ui.allocator.free(arg);
+            ui.allocator.free(cmd_result.cmd);
+            lua.raiseErrorStr("spawn_plug failed: %s", .{@errorName(err).ptr});
+        };
+
+        return 0;
+    }
+
+    const SpawnPlugCmdResult = struct {
+        cmd: []const []const u8,
+        count: usize,
+    };
+
+    /// Extract and dupe the name string from a spawn_plug table arg.
+    fn spawnPlugExtractName(lua: *ziglua.Lua, ui: *UI) []const u8 {
+        _ = lua.getField(1, "name");
+        const raw_name = if (lua.isString(-1)) lua.toString(-1) catch null else null;
+        lua.pop(1);
+
+        if (raw_name == null) {
+            lua.raiseErrorStr("spawn_plug: name is required", .{});
+        }
+        // Dupe with allocator — Lua string dangles if callback enqueues async work
+        return ui.allocator.dupe(u8, raw_name.?) catch {
+            lua.raiseErrorStr("spawn_plug: allocation failed", .{});
+        };
+    }
+
+    /// Extract and dupe the cmd array from a spawn_plug table arg.
+    fn spawnPlugExtractCmd(lua: *ziglua.Lua, ui: *UI, name: []const u8) SpawnPlugCmdResult {
+        _ = lua.getField(1, "cmd");
+        if (lua.typeOf(-1) != .table) {
+            ui.allocator.free(name);
+            lua.raiseErrorStr("spawn_plug: cmd must be a table of strings", .{});
+        }
+        const cmd_len = lua.rawLen(-1);
+        if (cmd_len == 0) {
+            ui.allocator.free(name);
+            lua.raiseErrorStr("spawn_plug: cmd must not be empty", .{});
+        }
+        if (cmd_len > 64) {
+            ui.allocator.free(name);
+            lua.raiseErrorStr("spawn_plug: cmd too many arguments", .{});
+        }
+
+        const cmd_alloc = ui.allocator.alloc([]const u8, cmd_len) catch {
+            ui.allocator.free(name);
+            lua.raiseErrorStr("spawn_plug: allocation failed", .{});
+        };
+        var cmd_i: usize = 0;
+        for (0..cmd_len) |i| {
+            _ = lua.rawGetIndex(-1, @intCast(i + 1));
+            const s = lua.toString(-1) catch {
+                // Free already-duped cmd strings on failure
+                for (cmd_alloc[0..cmd_i]) |arg| ui.allocator.free(arg);
+                ui.allocator.free(cmd_alloc);
+                ui.allocator.free(name);
+                lua.raiseErrorStr("spawn_plug: cmd elements must be strings", .{});
+            };
+            cmd_alloc[i] = ui.allocator.dupe(u8, s) catch {
+                for (cmd_alloc[0..cmd_i]) |arg| ui.allocator.free(arg);
+                ui.allocator.free(cmd_alloc);
+                ui.allocator.free(name);
+                lua.raiseErrorStr("spawn_plug: allocation failed", .{});
+            };
+            cmd_i = i + 1;
+            lua.pop(1);
+        }
+        lua.pop(1); // pop cmd table
+
+        return .{ .cmd = cmd_alloc, .count = cmd_i };
+    }
+
+    /// Lua: prise.call_plug("echo", "ping", {key="val"}, function(err, result) ... end)
+    fn callPlug(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.raiseErrorStr("UI not available", .{});
+        };
+        lua.pop(1);
+
+        const cb = ui.plug_call_callback orelse {
+            lua.raiseErrorStr("call_plug callback not configured", .{});
+        };
+
+        const name = lua.checkString(1);
+        const method = lua.checkString(2);
+
+        const lua_msgpack = @import("lua_msgpack.zig");
+        const params = lua_msgpack.luaToMsgpackValue(lua, ui.allocator, 3) catch |err| {
+            lua.raiseErrorStr("call_plug: failed to convert params: %s", .{@errorName(err).ptr});
+        };
+
+        // Store callback function as registry reference
+        lua.checkType(4, .function);
+        lua.pushValue(4);
+        const callback_ref = lua.ref(ziglua.registry_index) catch {
+            params.deinit(ui.allocator);
+            lua.raiseErrorStr("call_plug: failed to store callback reference", .{});
+        };
+
+        // Callback takes ownership of params; deinit here only on failure
+        cb(ui.plug_call_ctx, name, method, params, callback_ref) catch |err| {
+            lua.unref(ziglua.registry_index, callback_ref);
+            params.deinit(ui.allocator);
+            lua.raiseErrorStr("call_plug failed: %s", .{@errorName(err).ptr});
+        };
+
+        return 0;
+    }
+
+    /// Lua: prise.notify_plug("echo", "update", {data="hello"})
+    fn notifyPlug(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.raiseErrorStr("UI not available", .{});
+        };
+        lua.pop(1);
+
+        const cb = ui.plug_notify_callback orelse {
+            lua.raiseErrorStr("notify_plug callback not configured", .{});
+        };
+
+        const name = lua.checkString(1);
+        const method = lua.checkString(2);
+
+        // Params is optional; default to nil
+        const lua_msgpack = @import("lua_msgpack.zig");
+        const params = if (lua.getTop() >= 3)
+            lua_msgpack.luaToMsgpackValue(lua, ui.allocator, 3) catch |err| {
+                lua.raiseErrorStr("notify_plug: failed to convert params: %s", .{@errorName(err).ptr});
+            }
+        else
+            msgpack.Value.nil;
+
+        cb(ui.plug_notify_ctx, name, method, params) catch |err| {
+            params.deinit(ui.allocator);
+            lua.raiseErrorStr("notify_plug failed: %s", .{@errorName(err).ptr});
+        };
+
+        return 0;
+    }
+
+    /// Lua: prise.list_plugs(function(result) ... end)
+    fn listPlugs(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.raiseErrorStr("UI not available", .{});
+        };
+        lua.pop(1);
+
+        const cb = ui.plug_list_callback orelse {
+            lua.raiseErrorStr("list_plugs callback not configured", .{});
+        };
+
+        lua.checkType(1, .function);
+        lua.pushValue(1);
+        const callback_ref = lua.ref(ziglua.registry_index) catch {
+            lua.raiseErrorStr("list_plugs: failed to store callback reference", .{});
+        };
+
+        cb(ui.plug_list_ctx, callback_ref) catch |err| {
+            lua.unref(ziglua.registry_index, callback_ref);
+            lua.raiseErrorStr("list_plugs failed: %s", .{@errorName(err).ptr});
+        };
+
+        return 0;
+    }
+
+    /// Invoke the stored Lua callback for a call_plug response.
+    pub fn handlePlugCallResponse(self: *UI, callback_ref: i32, err_val: ?msgpack.Value, result: msgpack.Value) void {
+        const lua = self.lua;
+        const lua_msgpack = @import("lua_msgpack.zig");
+
+        // Values are owned by app.msg_arena — do NOT deinit here.
+        // The arena resets in onRecv after all messages are processed.
+
+        _ = lua.rawGetIndex(ziglua.registry_index, callback_ref);
+        defer lua.unref(ziglua.registry_index, callback_ref);
+
+        if (lua.typeOf(-1) != .function) {
+            lua.pop(1);
+            log.err("call_plug callback ref {} is not a function", .{callback_ref});
+            return;
+        }
+
+        if (err_val) |e| {
+            lua_msgpack.pushMsgpackValue(lua, e);
+        } else {
+            lua.pushNil();
+        }
+        lua_msgpack.pushMsgpackValue(lua, result);
+
+        lua.protectedCall(.{ .args = 2, .results = 0 }) catch |e| {
+            log.err("call_plug callback error: {}", .{e});
+        };
+    }
+
+    /// Invoke the stored Lua callback for a list_plugs response.
+    pub fn handlePlugListResponse(self: *UI, callback_ref: i32, result: msgpack.Value) void {
+        const lua = self.lua;
+        const lua_msgpack = @import("lua_msgpack.zig");
+
+        // Values are owned by app.msg_arena — do NOT deinit here.
+
+        _ = lua.rawGetIndex(ziglua.registry_index, callback_ref);
+        defer lua.unref(ziglua.registry_index, callback_ref);
+
+        if (lua.typeOf(-1) != .function) {
+            lua.pop(1);
+            log.err("list_plugs callback ref {} is not a function", .{callback_ref});
+            return;
+        }
+
+        lua_msgpack.pushMsgpackValue(lua, result);
+
+        lua.protectedCall(.{ .args = 1, .results = 0 }) catch |e| {
+            log.err("list_plugs callback error: {}", .{e});
+        };
+    }
+
+    /// Invoke the stored Lua callback for a spawn_plug response.
+    pub fn handlePlugSpawnResponse(self: *UI, callback_ref: i32, err_val: ?msgpack.Value, result: msgpack.Value) void {
+        const lua = self.lua;
+        const lua_msgpack = @import("lua_msgpack.zig");
+
+        // Values are owned by app.msg_arena — do NOT deinit here.
+
+        _ = lua.rawGetIndex(ziglua.registry_index, callback_ref);
+        defer lua.unref(ziglua.registry_index, callback_ref);
+
+        if (lua.typeOf(-1) != .function) {
+            lua.pop(1);
+            log.err("spawn_plug callback ref {} is not a function", .{callback_ref});
+            return;
+        }
+
+        if (err_val) |e| {
+            lua_msgpack.pushMsgpackValue(lua, e);
+        } else {
+            lua.pushNil();
+        }
+        lua_msgpack.pushMsgpackValue(lua, result);
+
+        lua.protectedCall(.{ .args = 2, .results = 0 }) catch |e| {
+            log.err("spawn_plug callback error: {}", .{e});
+        };
     }
 
     fn requestFrame(lua: *ziglua.Lua) i32 {
@@ -912,6 +1276,73 @@ pub const UI = struct {
             lua.pushBoolean(true);
         } else {
             log.warn("createSession: no callback registered", .{});
+            lua.pushBoolean(false);
+        }
+        return 1;
+    }
+
+    fn placePtyInSession(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        lua.pop(1);
+
+        const session_name_lua = lua.toString(1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        const pty_id_lua = lua.toInteger(2) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        const cwd_lua = lua.toString(3) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        // Arg 4 is optional tab_title (string or nil)
+        const tab_title_lua: ?[:0]const u8 = lua.toString(4) catch null;
+
+        // Dupe strings — Lua GC owns the originals
+        const session_name = ui.allocator.dupe(u8, session_name_lua) catch {
+            log.warn("placePtyInSession: failed to allocate session name", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        defer ui.allocator.free(session_name);
+
+        const cwd = ui.allocator.dupe(u8, cwd_lua) catch {
+            log.warn("placePtyInSession: failed to allocate cwd", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        defer ui.allocator.free(cwd);
+
+        const tab_title: ?[]const u8 = if (tab_title_lua) |t| ui.allocator.dupe(u8, t) catch {
+            log.warn("placePtyInSession: failed to allocate tab title", .{});
+            lua.pushBoolean(false);
+            return 1;
+        } else null;
+        defer if (tab_title) |t| ui.allocator.free(t);
+
+        if (pty_id_lua < 0 or pty_id_lua > std.math.maxInt(u32)) {
+            log.warn("placePtyInSession: pty_id out of u32 range: {d}", .{pty_id_lua});
+            lua.pushBoolean(false);
+            return 1;
+        }
+        const pty_id: u32 = @intCast(pty_id_lua);
+
+        log.info("placePtyInSession: session='{s}' pty={d} cwd='{s}'", .{ session_name, pty_id, cwd });
+
+        if (ui.place_pty_in_session_callback) |cb| {
+            cb(ui.place_pty_in_session_ctx, session_name, pty_id, cwd, tab_title) catch {
+                lua.pushBoolean(false);
+                return 1;
+            };
+            lua.pushBoolean(true);
+        } else {
+            log.warn("placePtyInSession: no callback registered", .{});
             lua.pushBoolean(false);
         }
         return 1;

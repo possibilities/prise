@@ -59,6 +59,63 @@ pub const LIMITS = struct {
     // Plenty of room for realistic program invocations without unbounded
     // stack buffers.
     pub const SPAWN_ARGV_MAX: usize = 64;
+    pub const PLUGS_MAX: usize = 16;
+    pub const PLUG_NAME_MAX: usize = 64;
+    pub const CALL_FORWARD_TIMEOUT_MS: i64 = 30_000;
+    pub const PENDING_FORWARDS_MAX: usize = 256;
+    pub const PLUG_TOKEN_BYTES: usize = 16;
+    pub const PLUG_TOKEN_HEX_LEN: usize = PLUG_TOKEN_BYTES * 2;
+};
+
+/// A plug process spawned and managed by the server.
+const ManagedPlug = struct {
+    name: []const u8,
+    cmd: []const []const u8,
+    restart: bool,
+    restart_delay_ms: u32,
+    token: [LIMITS.PLUG_TOKEN_HEX_LEN]u8 = undefined,
+    pid: ?posix.pid_t = null,
+    registered: bool = false,
+    restart_count: u32 = 0,
+    /// Set when the process has been killed by the server (shutdown or replacement).
+    killed_by_server: bool = false,
+    /// Tracks the pending waitpid task so it can be cancelled on shutdown.
+    waitpid_task: ?io.Task = null,
+    /// Pending restart timer — stored so shutdown can cancel it.
+    restart_timer_task: ?io.Task = null,
+    /// Heap-allocated restart context — freed on cancel or when timer fires.
+    restart_ctx: ?*RestartContext = null,
+
+    fn deinit(self: *ManagedPlug, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        for (self.cmd) |arg| allocator.free(arg);
+        allocator.free(self.cmd);
+    }
+};
+
+/// Heap context for a pending restart timer. Owns a duped plug name
+/// so the callback is safe even if the ManagedPlug is freed first.
+const RestartContext = struct {
+    server: *Server,
+    plug_name: []const u8,
+};
+
+/// A call_plug request in flight, waiting for the plug's response.
+const PendingForward = struct {
+    /// The TUI client that initiated the call.
+    originator: *Client,
+    /// The original msgid from the TUI client's request.
+    orig_msgid: u32,
+    /// Timestamp when this forward was created, for timeout detection.
+    created_ms: i64,
+    /// Name of the target plug (for error messages on timeout).
+    /// OWNED — must be freed on removal from pending_forwards.
+    plug_name: []const u8,
+};
+
+/// Heap context for the forward-timeout sweep timer.
+const SweepTimerContext = struct {
+    server: *Server,
 };
 
 /// In-flight client-broker RPC request awaiting a reply notification
@@ -300,6 +357,7 @@ const Pty = struct {
         self.clients.deinit(allocator);
         self.title.deinit(allocator);
         self.cwd.deinit(allocator);
+        if (self.cmd) |c| allocator.free(c);
         allocator.destroy(self);
     }
 
@@ -1180,6 +1238,24 @@ const Client = struct {
     attached_ptys: std.ArrayList(usize),
     closing: bool = false,
     macos_option_as_alt: key_encode.OptionAsAlt = .false,
+    /// Non-null when this client is a registered plug process.
+    plug_name: ?[]const u8 = null,
+    /// Event subscriptions for this plug (e.g., "pty_exited", "cwd_changed", or "*").
+    plug_subscriptions: ?[]const []const u8 = null,
+    /// Whether this client has been sent existing plug notifications.
+    notified_plugs: bool = false,
+
+    /// Check if this plug client is subscribed to the given event name.
+    fn isSubscribedPlug(self: *const Client, event_name: []const u8) bool {
+        const subs = self.plug_subscriptions orelse return false;
+        for (subs) |s| {
+            if (std.mem.eql(u8, s, "*") or std.mem.eql(u8, s, event_name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Map style ID to its last known definition hash/attributes to detect changes
     // We store the Attributes struct directly.
     // style_cache: std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes),
@@ -1288,6 +1364,51 @@ const Client = struct {
         self.msg_buffer.deinit(allocator);
         self.attached_ptys.deinit(allocator);
 
+        // Clean up plug registration and pending call forwards
+        if (self.plug_name) |name| {
+            // Error out in-flight calls to this plug
+            server.cleanupPlugForwards(self);
+
+            // Mark the managed plug as unregistered and check for deferred restart
+            var deferred_restart_mp: ?*ManagedPlug = null;
+            for (server.managed_plugs.items) |*mp| {
+                if (std.mem.eql(u8, mp.name, name)) {
+                    mp.registered = false;
+                    // Process already exited — onPlugExit deferred restart
+                    if (mp.pid == null and mp.restart and !mp.killed_by_server and !server.shutting_down) {
+                        mp.restart_count += 1;
+                        deferred_restart_mp = mp;
+                    }
+                    break;
+                }
+            }
+
+            _ = server.plugs.remove(name);
+
+            // Notify TUI clients that this plug disconnected
+            server.broadcastPlugDisconnected(loop, name) catch |err| {
+                log.err("Failed to broadcast plug_disconnected: {}", .{err});
+            };
+
+            allocator.free(name);
+            self.plug_name = null;
+
+            // Restart after cleanup to avoid DuplicatePlugName race
+            if (deferred_restart_mp) |mp| {
+                server.schedulePlugRestart(loop, mp) catch |err| {
+                    log.err("Failed to schedule restart for '{s}': {}", .{ mp.name, err });
+                };
+            }
+        }
+
+        // Remove pending forwards originated by this client
+        server.cleanupOriginatorForwards(self);
+        if (self.plug_subscriptions) |subs| {
+            for (subs) |s| allocator.free(s);
+            allocator.free(subs);
+            self.plug_subscriptions = null;
+        }
+
         // Remove from server's client list
         for (server.clients.items, 0..) |c, i| {
             if (c == self) {
@@ -1319,8 +1440,11 @@ const Client = struct {
             .notification => |notif| {
                 try self.handleNotification(notif);
             },
-            .response => {
-                // std.log.warn("Client sent response, ignoring", .{});
+            .response => |resp| {
+                // Plug clients send responses to forwarded calls
+                if (self.plug_name != null) {
+                    self.server.handlePlugResponse(resp);
+                }
             },
         }
     }
@@ -1336,6 +1460,14 @@ const Client = struct {
         // synchronous-response wrapper below from sending an extra Response.
         if (std.mem.eql(u8, req.method, "break_pane")) {
             return self.server.handleBreakPane(self, req.msgid, req.params);
+        }
+
+        // call_plug is special: response is deferred until the plug replies
+        if (std.mem.eql(u8, req.method, "call_plug")) {
+            self.server.handleCallPlugDeferred(self, req.msgid, req.params) catch |err| {
+                return self.sendErrorResponse(loop, req.msgid, err);
+            };
+            return; // response will be sent later by handlePlugResponse
         }
 
         const result = self.server.handleRequest(self, req.method, req.params) catch |err| {
@@ -1438,6 +1570,10 @@ const Client = struct {
             try self.handleColorResponse(notif);
         } else if (std.mem.eql(u8, notif.method, "break_pane_reply")) {
             try self.server.handleBreakPaneReply(notif);
+        } else if (std.mem.startsWith(u8, notif.method, "plug.")) {
+            if (self.plug_name) |name| {
+                try self.server.forwardPlugNotification(self.server.loop, notif, name);
+            }
         }
     }
 
@@ -2226,6 +2362,21 @@ const Server = struct {
     signal_buf: [1]u8 = undefined,
     /// Timestamp (ms since epoch) when server started - used to detect server restarts
     start_time_ms: i64 = 0,
+    /// Registered plug processes, keyed by plug name.
+    /// Default uses undefined allocator — startServer sets it properly.
+    plugs: std.StringHashMap(*Client) = std.StringHashMap(*Client).init(undefined),
+    /// Plug processes spawned by the server via spawn_plug.
+    managed_plugs: std.ArrayList(ManagedPlug) = std.ArrayList(ManagedPlug).empty,
+    /// In-flight call_plug requests, keyed by the forward msgid sent to the plug.
+    pending_forwards: std.AutoHashMap(u32, PendingForward),
+    /// Next msgid to use when forwarding requests to plugs.
+    next_forward_msgid: u32 = 1,
+    /// Heap context for the sweep timer — freed on shutdown.
+    sweep_timer_ctx: ?*SweepTimerContext = null,
+    /// Active sweep timer task — cancelled on shutdown to prevent use-after-free.
+    sweep_timer_task: ?io.Task = null,
+    /// Set true during shutdown to gate restart timer callbacks.
+    shutting_down: bool = false,
 
     const ParsedSpawnPty = struct {
         size: pty.Winsize,
@@ -2252,6 +2403,7 @@ const Server = struct {
         /// Initial ratio of the new split node. Honored by the layout
         /// renderer (`tiling.lua:render_node`); 0.5 is an even split.
         split_ratio: f64,
+        focus: ?bool = null,
     };
 
     const SplitDirection = enum {
@@ -2281,6 +2433,7 @@ const Server = struct {
         var split_target_pty_id: ?usize = null;
         var split_direction: SplitDirection = .col;
         var split_ratio: f64 = 0.5;
+        var focus: ?bool = null;
 
         if (params == .map) {
             for (params.map) |kv| {
@@ -2338,6 +2491,8 @@ const Server = struct {
                     } else if (kv.value == .integer) {
                         split_ratio = @floatFromInt(kv.value.integer);
                     }
+                } else if (std.mem.eql(u8, kv.key.string, "focus") and kv.value == .boolean) {
+                    focus = kv.value.boolean;
                 }
             }
         }
@@ -2361,6 +2516,7 @@ const Server = struct {
             .split_target_pty_id = split_target_pty_id,
             .split_direction = split_direction,
             .split_ratio = split_ratio,
+            .focus = focus,
         };
     }
 
@@ -2674,7 +2830,7 @@ const Server = struct {
         crash_context.record("spawn pty_id={d}", .{pty_id});
 
         // Send pty_spawned notification to all clients
-        try self.sendPtySpawned(pty_id, cwd orelse "", parsed.session, parsed.tab, parsed.title);
+        try self.sendPtySpawned(pty_id, cwd orelse "", parsed.session, parsed.tab, parsed.title, parsed.focus);
 
         // Always persist to the session file when a target session is specified.
         // If a TUI client handles pty_spawned via Lua, it overwrites the file
@@ -3226,13 +3382,59 @@ const Server = struct {
         return .{ .map = result_entries };
     }
 
+    /// Return information about all managed plugs.
+    fn handleListPlugs(self: *Server) !msgpack.Value {
+        const plug_count = self.managed_plugs.items.len;
+        const plugs_array = try self.allocator.alloc(msgpack.Value, plug_count);
+
+        var i: usize = 0;
+        var plugs_owned = true;
+        errdefer {
+            if (plugs_owned) {
+                for (plugs_array[0..i]) |entry| entry.deinit(self.allocator);
+                self.allocator.free(plugs_array);
+            }
+        }
+
+        for (self.managed_plugs.items) |mp| {
+            plugs_array[i] = .{ .map = try buildPlugEntry(self.allocator, &mp) };
+            i += 1;
+        }
+
+        const result_entries = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+        @memset(result_entries, .{ .key = .nil, .value = .nil });
+        errdefer {
+            for (result_entries) |kv| {
+                kv.key.deinit(self.allocator);
+                kv.value.deinit(self.allocator);
+            }
+            self.allocator.free(result_entries);
+        }
+
+        result_entries[0].key = .{ .string = try self.allocator.dupe(u8, "plugs") };
+        result_entries[0].value = .{ .array = plugs_array };
+        plugs_owned = false;
+
+        return .{ .map = result_entries };
+    }
+
     fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
+        // On the first non-register_plug RPC, send existing plug notifications.
+        // This is deferred from onAccept so plug clients don't receive
+        // unsolicited messages before their register_plug response.
+        if (!client.notified_plugs and !std.mem.eql(u8, method, "register_plug")) {
+            client.notified_plugs = true;
+            self.notifyExistingPlugs(self.loop, client);
+        }
+
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
         } else if (std.mem.eql(u8, method, "get_server_info")) {
             return self.handleGetServerInfo();
         } else if (std.mem.eql(u8, method, "list_ptys")) {
             return self.handleListPtys();
+        } else if (std.mem.eql(u8, method, "list_plugs")) {
+            return self.handleListPlugs();
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
             return self.handleSpawnPty(client, params);
         } else if (std.mem.eql(u8, method, "close_pty")) {
@@ -3255,9 +3457,660 @@ const Server = struct {
             return self.handleRenameTab(client, params);
         } else if (std.mem.eql(u8, method, "session_switch")) {
             return try self.handleSessionSwitch(params);
+        } else if (std.mem.eql(u8, method, "notify_plug")) {
+            return self.handleNotifyPlug(params);
+        } else if (std.mem.eql(u8, method, "spawn_plug")) {
+            return self.handleSpawnPlug(params);
+        } else if (std.mem.eql(u8, method, "register_plug")) {
+            return self.handleRegisterPlug(client, params);
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "unknown method") };
         }
+    }
+
+    /// Handle register_plug RPC from a spawned plug process.
+    /// Params: {name: string, token: string, subscribe: [string...] (optional)}
+    fn handleRegisterPlug(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
+        if (params != .map) return error.InvalidParams;
+
+        // Already registered
+        if (client.plug_name != null) return error.AlreadyRegistered;
+
+        var name: ?[]const u8 = null;
+        var token_str: ?[]const u8 = null;
+        var subscribe: ?[]const msgpack.Value = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "name")) {
+                name = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "token")) {
+                token_str = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "subscribe")) {
+                subscribe = if (kv.value == .array) kv.value.array else null;
+            }
+        }
+
+        const plug_name = name orelse return error.MissingPlugName;
+
+        // Validate token against the managed plug's stored token
+        const plug_token = token_str orelse return error.MissingPlugToken;
+        const mp = self.findManagedPlug(plug_name) orelse return error.PermissionDenied;
+        if (plug_token.len != LIMITS.PLUG_TOKEN_HEX_LEN or
+            !std.crypto.timing_safe.eql([LIMITS.PLUG_TOKEN_HEX_LEN]u8, plug_token[0..LIMITS.PLUG_TOKEN_HEX_LEN].*, mp.token))
+        {
+            return error.PermissionDenied;
+        }
+
+        if (plug_name.len == 0 or plug_name.len > LIMITS.PLUG_NAME_MAX) {
+            return error.InvalidPlugName;
+        }
+
+        if (self.plugs.count() >= LIMITS.PLUGS_MAX) {
+            return error.PlugLimitReached;
+        }
+
+        if (self.plugs.contains(plug_name)) {
+            return error.DuplicatePlugName;
+        }
+
+        const owned_name = try self.allocator.dupe(u8, plug_name);
+        errdefer self.allocator.free(owned_name);
+
+        // Parse and dupe subscriptions
+        var owned_subs: ?[]const []const u8 = null;
+        if (subscribe) |sub_arr| {
+            var subs = try self.allocator.alloc([]const u8, sub_arr.len);
+            var i: usize = 0;
+            errdefer {
+                for (subs[0..i]) |s| self.allocator.free(s);
+                self.allocator.free(subs);
+            }
+            for (sub_arr) |item| {
+                if (item != .string) continue;
+                subs[i] = try self.allocator.dupe(u8, item.string);
+                i += 1;
+            }
+            // Shrink to actual count (some non-string items may have been skipped)
+            if (i < subs.len) {
+                subs = try self.allocator.realloc(subs, i);
+            }
+            owned_subs = subs;
+        }
+        errdefer if (owned_subs) |subs| {
+            for (subs) |s| self.allocator.free(s);
+            self.allocator.free(subs);
+        };
+
+        // Complete all fallible work before publishing to client fields,
+        // otherwise finishClose would double-free on error.
+        try self.plugs.put(owned_name, client);
+        errdefer _ = self.plugs.remove(owned_name);
+
+        const response = try self.allocator.dupe(u8, "ok");
+
+        // All fallible work succeeded — publish to client (infallible)
+        client.plug_name = owned_name;
+        client.plug_subscriptions = owned_subs;
+
+        // Mark the managed plug as registered (mp from findManagedPlug above)
+        mp.registered = true;
+
+        // Cancel any pending restart timer — the child registered before it fired.
+        // Without this, a late-registering child (wrapper exits before child connects)
+        // would race with the restart timer spawning a second process.
+        if (mp.restart_timer_task) |*task| {
+            task.cancel(self.loop) catch {};
+            mp.restart_timer_task = null;
+        }
+        if (mp.restart_ctx) |ctx| {
+            self.allocator.free(ctx.plug_name);
+            self.allocator.destroy(ctx);
+            mp.restart_ctx = null;
+        }
+
+        log.info("Plug '{s}' registered with {} subscriptions", .{
+            owned_name,
+            if (owned_subs) |s| s.len else 0,
+        });
+
+        self.broadcastPlugConnected(self.loop, owned_name);
+
+        return msgpack.Value{ .string = response };
+    }
+
+    /// Send a plug_connected notification to a single client.
+    fn sendPlugConnectedTo(self: *Server, loop: *io.Loop, client: *Client, plug_name: []const u8) void {
+        var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
+            log.err("Failed to alloc plug_connected for fd={}: {}", .{ client.fd, err });
+            return;
+        };
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "plug" }, .value = .{ .string = plug_name } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = msgpack.encode(self.allocator, .{ 2, "plug_connected", params }) catch |err| {
+            log.err("Failed to encode plug_connected for fd={}: {}", .{ client.fd, err });
+            return;
+        };
+        defer self.allocator.free(msg_bytes);
+
+        client.sendData(loop, msg_bytes) catch |err| {
+            log.err("Failed to send plug_connected to client fd={}: {}", .{ client.fd, err });
+        };
+    }
+
+    /// Notify all non-plug TUI clients that a plug has connected.
+    fn broadcastPlugConnected(self: *Server, loop: *io.Loop, plug_name: []const u8) void {
+        for (self.clients.items) |c| {
+            if (c.plug_name != null) continue;
+            if (c.closing) continue;
+            self.sendPlugConnectedTo(loop, c, plug_name);
+        }
+    }
+
+    /// Notify a single client about all already-registered plugs.
+    fn notifyExistingPlugs(self: *Server, loop: *io.Loop, client: *Client) void {
+        for (self.managed_plugs.items) |mp| {
+            if (!mp.registered) continue;
+            self.sendPlugConnectedTo(loop, client, mp.name);
+        }
+    }
+
+    /// Notify all non-plug TUI clients that a plug has disconnected.
+    fn broadcastPlugDisconnected(self: *Server, loop: *io.Loop, plug_name: []const u8) !void {
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "plug" }, .value = .{ .string = plug_name } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "plug_disconnected", params });
+        defer self.allocator.free(msg_bytes);
+
+        for (self.clients.items) |c| {
+            if (c.plug_name != null) continue;
+            if (c.closing) continue;
+            c.sendData(loop, msg_bytes) catch |err| {
+                log.err("Failed to send plug_disconnected to client fd={}: {}", .{ c.fd, err });
+            };
+        }
+    }
+
+    /// Look up a managed plug by name. Returns null if not found.
+    fn findManagedPlug(self: *Server, name: []const u8) ?*ManagedPlug {
+        for (self.managed_plugs.items) |*mp| {
+            if (std.mem.eql(u8, mp.name, name)) return mp;
+        }
+        return null;
+    }
+
+    /// Remove a managed plug by name, freeing its owned resources.
+    fn removeManagedPlug(self: *Server, name: []const u8) void {
+        for (self.managed_plugs.items, 0..) |*mp, i| {
+            if (std.mem.eql(u8, mp.name, name)) {
+                mp.deinit(self.allocator);
+                _ = self.managed_plugs.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Forward a plug-originated notification to all non-plug TUI clients.
+    fn forwardPlugNotification(self: *Server, loop: *io.Loop, notif: rpc.Notification, plug_name: []const u8) !void {
+        const method_suffix = notif.method["plug.".len..];
+
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "plug" }, .value = .{ .string = plug_name } };
+        map_items[1] = .{ .key = .{ .string = "method" }, .value = .{ .string = method_suffix } };
+        map_items[2] = .{ .key = .{ .string = "params" }, .value = notif.params };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "plug_notification", params });
+        defer self.allocator.free(msg_bytes);
+
+        for (self.clients.items) |c| {
+            if (c.plug_name != null) continue;
+            if (c.closing) continue;
+            c.sendData(loop, msg_bytes) catch |err| {
+                log.err("Failed to send plug_notification to client fd={}: {}", .{ c.fd, err });
+            };
+        }
+    }
+
+    // -- call forwarding handlers --
+
+    /// Handle call_plug by forwarding the request to the target plug.
+    /// Response will arrive asynchronously via handlePlugResponse.
+    fn handleCallPlugDeferred(
+        self: *Server,
+        originator: *Client,
+        orig_msgid: u32,
+        params: msgpack.Value,
+    ) !void {
+        if (params != .map) return error.InvalidParams;
+
+        var plug_name: ?[]const u8 = null;
+        var method: ?[]const u8 = null;
+        var call_params: msgpack.Value = .nil;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "plug")) {
+                plug_name = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "method")) {
+                method = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "params")) {
+                call_params = kv.value;
+            }
+        }
+
+        const name = plug_name orelse return error.MissingPlugName;
+        const meth = method orelse return error.MissingMethod;
+        const plug_client = self.plugs.get(name) orelse return error.PlugNotFound;
+
+        if (self.pending_forwards.count() >= LIMITS.PENDING_FORWARDS_MAX) {
+            return error.TooManyPendingCalls;
+        }
+
+        // Skip forward_msgids that collide with in-flight entries
+        var forward_msgid = self.next_forward_msgid;
+        while (self.pending_forwards.contains(forward_msgid)) {
+            forward_msgid +%= 1;
+        }
+        self.next_forward_msgid = forward_msgid +% 1;
+
+        // Dupe plug_name — params are freed after we return
+        const owned_plug_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_plug_name);
+
+        try self.pending_forwards.put(forward_msgid, .{
+            .originator = originator,
+            .orig_msgid = orig_msgid,
+            .created_ms = std.time.milliTimestamp(),
+            .plug_name = owned_plug_name,
+        });
+        // If sending to plug fails, remove the stale pending entry
+        errdefer {
+            _ = self.pending_forwards.remove(forward_msgid);
+        }
+
+        // Send request to plug: [0, forward_msgid, method, params]
+        const request_arr = try self.allocator.alloc(msgpack.Value, 4);
+        defer self.allocator.free(request_arr);
+        request_arr[0] = .{ .unsigned = 0 };
+        request_arr[1] = .{ .unsigned = forward_msgid };
+        request_arr[2] = .{ .string = meth };
+        request_arr[3] = call_params;
+
+        const request_value = msgpack.Value{ .array = request_arr };
+        const request_bytes = try msgpack.encodeFromValue(self.allocator, request_value);
+        defer self.allocator.free(request_bytes);
+
+        try plug_client.sendData(self.loop, request_bytes);
+
+        log.info("Forwarded call to plug '{s}' method '{s}' forward_msgid={}", .{
+            name, meth, forward_msgid,
+        });
+    }
+
+    /// Route a plug's response back to the originating TUI client.
+    fn handlePlugResponse(self: *Server, resp: rpc.Response) void {
+        const pending = self.pending_forwards.fetchRemove(resp.msgid) orelse {
+            log.warn("Response from plug with unknown forward_msgid={}", .{resp.msgid});
+            return;
+        };
+        defer self.allocator.free(pending.value.plug_name);
+
+        const originator = pending.value.originator;
+
+        // Check if originator is still connected
+        var found = false;
+        for (self.clients.items) |c| {
+            if (c == originator and !c.closing) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            log.info("Originator disconnected, dropping response for msgid={}", .{
+                pending.value.orig_msgid,
+            });
+            return;
+        }
+
+        // Build response: [1, orig_msgid, error, result]
+        const response_arr = self.allocator.alloc(msgpack.Value, 4) catch {
+            log.err("OOM building forwarded response", .{});
+            return;
+        };
+        defer self.allocator.free(response_arr);
+        response_arr[0] = .{ .unsigned = 1 };
+        response_arr[1] = .{ .unsigned = pending.value.orig_msgid };
+        response_arr[2] = resp.err orelse .nil;
+        response_arr[3] = resp.result;
+
+        const response_value = msgpack.Value{ .array = response_arr };
+        const response_bytes = msgpack.encodeFromValue(self.allocator, response_value) catch {
+            log.err("Failed to encode forwarded response", .{});
+            return;
+        };
+        defer self.allocator.free(response_bytes);
+
+        originator.sendData(self.loop, response_bytes) catch |err| {
+            log.err("Failed to send forwarded response: {}", .{err});
+        };
+    }
+
+    /// Send a notification to a plug (fire and forget, no response).
+    fn handleNotifyPlug(self: *Server, params: msgpack.Value) !msgpack.Value {
+        if (params != .map) return error.InvalidParams;
+
+        var plug_name: ?[]const u8 = null;
+        var method: ?[]const u8 = null;
+        var notif_params: msgpack.Value = .nil;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "plug")) {
+                plug_name = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "method")) {
+                method = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "params")) {
+                notif_params = kv.value;
+            }
+        }
+
+        const name = plug_name orelse return error.MissingPlugName;
+        const meth = method orelse return error.MissingMethod;
+        const plug_client = self.plugs.get(name) orelse return error.PlugNotFound;
+
+        // Send notification: [2, method, params]
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, meth, notif_params });
+        defer self.allocator.free(msg_bytes);
+
+        try plug_client.sendData(self.loop, msg_bytes);
+
+        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+    }
+
+    // -- spawn_plug types and handlers --
+
+    const SpawnPlugParams = struct {
+        name: []const u8,
+        cmd: []const msgpack.Value,
+        restart: bool,
+        restart_delay_ms: u32,
+    };
+
+    fn parseSpawnPlugParams(params: msgpack.Value) ?SpawnPlugParams {
+        if (params != .map) return null;
+
+        var name: ?[]const u8 = null;
+        var cmd: ?[]const msgpack.Value = null;
+        var restart: bool = false;
+        var restart_delay_ms: u32 = 1000;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            const k = kv.key.string;
+            if (std.mem.eql(u8, k, "name")) {
+                name = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, k, "cmd")) {
+                cmd = if (kv.value == .array) kv.value.array else null;
+            } else if (std.mem.eql(u8, k, "restart")) {
+                restart = if (kv.value == .boolean) kv.value.boolean else false;
+            } else if (std.mem.eql(u8, k, "restart_delay_ms")) {
+                restart_delay_ms = switch (kv.value) {
+                    .unsigned => |u| std.math.cast(u32, u) orelse 1000,
+                    .integer => |i| if (i > 0) std.math.cast(u32, i) orelse 1000 else 1000,
+                    else => 1000,
+                };
+            }
+        }
+
+        const plug_name = name orelse return null;
+        const cmd_arr = cmd orelse return null;
+        if (cmd_arr.len == 0 or cmd_arr.len > 64) return null;
+
+        // Validate all cmd elements are strings
+        for (cmd_arr) |item| {
+            if (item != .string) return null;
+        }
+
+        return .{
+            .name = plug_name,
+            .cmd = cmd_arr,
+            .restart = restart,
+            .restart_delay_ms = restart_delay_ms,
+        };
+    }
+
+    /// Handle spawn_plug RPC. Spawns a child process with PRISE_SOCKET set.
+    fn handleSpawnPlug(self: *Server, params: msgpack.Value) !msgpack.Value {
+        const parsed = parseSpawnPlugParams(params) orelse {
+            return error.InvalidParams;
+        };
+
+        if (parsed.name.len == 0 or parsed.name.len > LIMITS.PLUG_NAME_MAX) {
+            return error.InvalidPlugName;
+        }
+
+        // Idempotent: if a managed plug with this name exists, check state and config
+        if (self.findManagedPlug(parsed.name)) |mp| {
+            const active = mp.pid != null or mp.restart_timer_task != null or mp.registered;
+            if (active) {
+                if (plugCmdMatchesParsed(mp.cmd, parsed.cmd) and
+                    mp.restart == parsed.restart and
+                    mp.restart_delay_ms == parsed.restart_delay_ms)
+                {
+                    return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+                }
+                return error.PlugConfigConflict;
+            }
+            // Stopped plug — remove stale entry so we can re-spawn below
+            self.removeManagedPlug(parsed.name);
+        }
+        if (self.plugs.contains(parsed.name)) {
+            // Externally connected plug — cannot verify command
+            return error.PlugConfigConflict;
+        }
+
+        if (self.managed_plugs.items.len >= LIMITS.PLUGS_MAX) {
+            return error.PlugLimitReached;
+        }
+
+        // Dupe name (params are transient)
+        const owned_name = try self.allocator.dupe(u8, parsed.name);
+        errdefer self.allocator.free(owned_name);
+
+        // Dupe cmd args
+        const owned_cmd = try self.dupePlugCmd(parsed.cmd);
+        errdefer self.freePlugCmd(owned_cmd);
+
+        const token = generatePlugToken();
+        const pid = try self.spawnPlugProcess(owned_cmd, &token);
+        const task = try self.loop.waitpid(pid, .{
+            .ptr = self,
+            .cb = onPlugExit,
+        });
+
+        try self.managed_plugs.append(self.allocator, .{
+            .name = owned_name,
+            .cmd = owned_cmd,
+            .restart = parsed.restart,
+            .restart_delay_ms = parsed.restart_delay_ms,
+            .token = token,
+            .pid = pid,
+            .waitpid_task = task,
+        });
+
+        log.info("Spawned plug '{s}' pid={}", .{ owned_name, pid });
+        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+    }
+
+    /// Dupe an array of msgpack string values into owned slices.
+    fn dupePlugCmd(self: *Server, cmd_values: []const msgpack.Value) ![]const []const u8 {
+        const owned = try self.allocator.alloc([]const u8, cmd_values.len);
+        var i: usize = 0;
+        errdefer {
+            for (owned[0..i]) |arg| self.allocator.free(arg);
+            self.allocator.free(owned);
+        }
+        for (cmd_values) |item| {
+            owned[i] = try self.allocator.dupe(u8, item.string);
+            i += 1;
+        }
+        return owned;
+    }
+
+    fn freePlugCmd(self: *Server, cmd: []const []const u8) void {
+        for (cmd) |arg| self.allocator.free(arg);
+        self.allocator.free(cmd);
+    }
+
+    fn generatePlugToken() [LIMITS.PLUG_TOKEN_HEX_LEN]u8 {
+        var raw: [LIMITS.PLUG_TOKEN_BYTES]u8 = undefined;
+        std.crypto.random.bytes(&raw);
+        return std.fmt.bytesToHex(raw, .lower);
+    }
+
+    /// Spawn a child process with PRISE_SOCKET and PRISE_PLUG_TOKEN in the environment.
+    fn spawnPlugProcess(self: *Server, cmd: []const []const u8, token: *const [LIMITS.PLUG_TOKEN_HEX_LEN]u8) !posix.pid_t {
+        var env_map = std.process.getEnvMap(self.allocator) catch
+            return error.SpawnFailed;
+        defer env_map.deinit();
+        env_map.put("PRISE_SOCKET", self.socket_path) catch
+            return error.SpawnFailed;
+        env_map.put("PRISE_PLUG_TOKEN", token) catch
+            return error.SpawnFailed;
+
+        var child = std.process.Child.init(cmd, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.env_map = &env_map;
+
+        child.spawn() catch return error.SpawnFailed;
+        // Close the internal err_pipe and detect exec failures synchronously.
+        // Without this, every spawn leaks an FD in the parent.
+        child.waitForSpawn() catch return error.SpawnFailed;
+        return child.id;
+    }
+
+    /// Callback when a managed plug process exits (via loop.waitpid).
+    fn onPlugExit(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        const self = completion.userdataCast(Server);
+
+        const exit_pid = switch (completion.result) {
+            .waitpid => |r| r.pid,
+            .err => |err| {
+                log.err("waitpid error for plug: {}", .{err});
+                return;
+            },
+            else => return,
+        };
+
+        for (self.managed_plugs.items) |*mp| {
+            if (mp.pid != exit_pid) continue;
+
+            log.info("Plug '{s}' (pid={}) exited", .{ mp.name, exit_pid });
+            mp.pid = null;
+            mp.waitpid_task = null;
+
+            if (mp.registered) {
+                // Wrapper exited but child still owns the socket.
+                // Defer cleanup and restart to finishClose.
+                log.info("Plug '{s}' process exited but still registered, deferring cleanup", .{mp.name});
+                return;
+            }
+
+            // Plug never registered — proceed with teardown
+            mp.registered = false;
+
+            // Proactively remove old registration from plugs map so restart
+            // doesn't race with finishClose. Without this, a fast-restarting
+            // plug hits DuplicatePlugName because the old client hasn't closed yet.
+            // finishClose checks plug_name against the map and skips if absent.
+            _ = self.plugs.remove(mp.name);
+
+            if (mp.restart and !mp.killed_by_server and !self.shutting_down) {
+                mp.restart_count += 1;
+                self.schedulePlugRestart(loop, mp) catch |err| {
+                    log.err("Failed to schedule restart for '{s}': {}", .{ mp.name, err });
+                };
+            }
+            return;
+        }
+    }
+
+    /// Schedule a plug process restart after the configured delay.
+    fn schedulePlugRestart(self: *Server, loop: *io.Loop, mp: *ManagedPlug) !void {
+        if (mp.restart_delay_ms == 0) {
+            self.restartPlug(loop, mp) catch |err| {
+                log.err("Failed to restart plug '{s}': {}", .{ mp.name, err });
+            };
+            return;
+        }
+
+        // Dupe plug name — ManagedPlug may be freed before timer fires
+        const owned_name = try self.allocator.dupe(u8, mp.name);
+        errdefer self.allocator.free(owned_name);
+
+        const ctx = try self.allocator.create(RestartContext);
+        ctx.* = .{ .server = self, .plug_name = owned_name };
+
+        const delay_ns: u64 = @as(u64, mp.restart_delay_ms) * std.time.ns_per_ms;
+        const task = try loop.timeout(delay_ns, .{
+            .ptr = ctx,
+            .cb = onRestartTimer,
+        });
+
+        // Store so shutdown can cancel the timer and free context
+        mp.restart_timer_task = task;
+        mp.restart_ctx = ctx;
+    }
+
+    fn onRestartTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        const ctx = completion.userdataCast(RestartContext);
+        const server = ctx.server;
+        defer {
+            server.allocator.free(ctx.plug_name);
+            server.allocator.destroy(ctx);
+        }
+
+        // Clear references on the managed plug now that the timer fired
+        for (server.managed_plugs.items) |*mp| {
+            if (mp.restart_ctx == ctx) {
+                mp.restart_timer_task = null;
+                mp.restart_ctx = null;
+                break;
+            }
+        }
+
+        if (server.shutting_down) return;
+
+        for (server.managed_plugs.items) |*mp| {
+            if (!std.mem.eql(u8, mp.name, ctx.plug_name)) continue;
+            if (mp.pid != null or mp.registered) return; // already restarted or late-registered
+            server.restartPlug(loop, mp) catch |err| {
+                log.err("Failed to restart plug '{s}': {}", .{ mp.name, err });
+            };
+            return;
+        }
+    }
+
+    fn restartPlug(self: *Server, loop: *io.Loop, mp: *ManagedPlug) !void {
+        log.info("Restarting plug '{s}' (attempt {})", .{ mp.name, mp.restart_count });
+        const token = generatePlugToken();
+        mp.token = token;
+        const pid = try self.spawnPlugProcess(mp.cmd, &token);
+        mp.pid = pid;
+        mp.killed_by_server = false;
+        mp.waitpid_task = try loop.waitpid(pid, .{
+            .ptr = self,
+            .cb = onPlugExit,
+        });
     }
 
     fn shouldExit(self: *Server) bool {
@@ -3320,6 +4173,10 @@ const Server = struct {
                     .ptr = client,
                     .cb = Client.onRecv,
                 });
+
+                // Existing plug notifications are deferred to the first RPC
+                // (in handleRequest) so plug clients don't receive unsolicited
+                // messages before the register_plug response.
 
                 // Queue next accept if still accepting
                 if (self.accepting) {
@@ -3732,6 +4589,26 @@ const Server = struct {
         return msgpack.Value{ .boolean = true };
     }
 
+    /// Forward a pre-encoded notification to all plugs subscribed to the given event.
+    fn forwardToSubscribedPlugs(self: *Server, event_name: []const u8, msg_bytes: []const u8, exclude_client: ?*Client) void {
+        var iter = self.plugs.valueIterator();
+        while (iter.next()) |client_ptr| {
+            const client = client_ptr.*;
+            if (client.closing) continue;
+            if (exclude_client) |excluded| {
+                if (client == excluded) continue;
+            }
+            if (!client.isSubscribedPlug(event_name)) continue;
+            client.sendData(self.loop, msg_bytes) catch |err| {
+                log.err("Failed to forward {s} to plug '{s}': {}", .{
+                    event_name,
+                    client.plug_name orelse "unknown",
+                    err,
+                });
+            };
+        }
+    }
+
     /// Build and send pty_exited notification to all clients
     fn sendPtyExited(self: *Server, pty_id: usize, exit_status: u32) !void {
         const params = .{ pty_id, exit_status };
@@ -3741,10 +4618,299 @@ const Server = struct {
         std.log.info("Sending pty_exited for session {} status {}", .{ pty_id, exit_status });
         crash_context.record("pty exited pty_id={d} status={d}", .{ pty_id, exit_status });
 
-        // Send to all clients
+        // Send only to non-plug TUI clients. Plugs receive events via
+        // forwardToSubscribedPlugs which filters by subscription. Also skip
+        // managed plug sockets that haven't registered yet.
         for (self.clients.items) |client| {
+            if (client.plug_name != null) continue;
             try client.sendData(self.loop, msg_bytes);
         }
+
+        // Forward to subscribed plugs
+        self.forwardToSubscribedPlugs("pty_exited", msg_bytes, null);
+    }
+
+    /// Build and send pty_spawned notification to all clients
+    fn sendPtySpawned(self: *Server, pty_id: usize, cwd: []const u8, session: ?[]const u8, tab: ?[]const u8, title: ?[]const u8, focus: ?bool) !void {
+        var field_count: usize = 2; // id + cwd always present
+        if (session != null) field_count += 1;
+        if (tab != null) field_count += 1;
+        if (title != null) field_count += 1;
+        if (focus != null) field_count += 1;
+
+        const params = try self.allocator.alloc(msgpack.Value.KeyValue, field_count);
+        defer self.allocator.free(params);
+
+        var idx: usize = 0;
+        params[idx] = .{ .key = .{ .string = "id" }, .value = .{ .unsigned = pty_id } };
+        idx += 1;
+        params[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+        idx += 1;
+        if (session) |s| {
+            params[idx] = .{ .key = .{ .string = "session" }, .value = .{ .string = s } };
+            idx += 1;
+        }
+        if (tab) |t| {
+            params[idx] = .{ .key = .{ .string = "tab" }, .value = .{ .string = t } };
+            idx += 1;
+        }
+        if (title) |t| {
+            params[idx] = .{ .key = .{ .string = "title" }, .value = .{ .string = t } };
+            idx += 1;
+        }
+        if (focus) |f| {
+            params[idx] = .{ .key = .{ .string = "focus" }, .value = .{ .boolean = f } };
+            idx += 1;
+        }
+
+        const params_value = msgpack.Value{ .map = params };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "pty_spawned", params_value });
+        defer self.allocator.free(msg_bytes);
+
+        log.info("Sending pty_spawned for pty {}", .{pty_id});
+
+        // Send only to non-plug TUI clients. Plugs receive events via
+        // forwardToSubscribedPlugs which filters by subscription.
+        for (self.clients.items) |client| {
+            if (client.plug_name != null) continue;
+            try client.sendData(self.loop, msg_bytes);
+        }
+
+        // Forward to subscribed plugs
+        self.forwardToSubscribedPlugs("pty_spawned", msg_bytes, null);
+    }
+
+    /// Place a PTY into a session state file so it is discovered on next attach.
+    /// Used when no TUI client is connected to receive the pty_spawned event.
+    fn placePtyInSessionFile(self: *Server, session_name: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8) !void {
+        // Validate session name (no path traversal)
+        if (session_name.len == 0) return error.InvalidSessionName;
+        if (std.mem.indexOfAny(u8, session_name, "/\\") != null) return error.InvalidSessionName;
+        if (std.mem.indexOf(u8, session_name, "..") != null) return error.InvalidSessionName;
+        if (std.mem.indexOfScalar(u8, session_name, 0) != null) return error.InvalidSessionName;
+
+        const home = posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        // Ensure directory exists
+        std.fs.makeDirAbsolute(state_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
+                std.fs.makeDirAbsolute(parent) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+                std.fs.makeDirAbsolute(state_dir) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+            }
+        };
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
+        defer self.allocator.free(filename);
+
+        const path = try std.fs.path.join(self.allocator, &.{ state_dir, filename });
+        defer self.allocator.free(path);
+
+        const validity = self.start_time_ms;
+
+        // Try to read existing file
+        if (std.fs.openFileAbsolute(path, .{})) |file| {
+            defer file.close();
+            const existing = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+            defer self.allocator.free(existing);
+            try self.appendTabToSessionFile(path, existing, pty_id, cwd, tab_title, validity);
+        } else |_| {
+            try self.writeNewSessionFile(path, pty_id, cwd, tab_title, validity);
+        }
+
+        log.info("Placed PTY {d} in session file '{s}' (no TUI clients)", .{ pty_id, session_name });
+    }
+
+    /// Create a new session file with a single tab containing the given PTY.
+    fn writeNewSessionFile(self: *Server, path: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
+        const Pane = struct { type: []const u8, id: u32, pty_id: usize, cwd: []const u8 };
+        const Tab = struct { id: u32, title: ?[]const u8, root: Pane, last_focused_id: u32 };
+        const Session = struct { pty_validity: i64, tabs: []const Tab, active_tab: u32, next_split_id: u32, next_tab_id: u32 };
+
+        const pane: Pane = .{ .type = "pane", .id = 1, .pty_id = pty_id, .cwd = cwd };
+        const tab: Tab = .{ .id = 1, .title = tab_title, .root = pane, .last_focused_id = 1 };
+        const tabs = [_]Tab{tab};
+        const session: Session = .{ .pty_validity = validity, .tabs = &tabs, .active_tab = 1, .next_split_id = 2, .next_tab_id = 2 };
+
+        const json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(session, .{})});
+        defer self.allocator.free(json);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(json);
+    }
+
+    /// Append a new tab to an existing session JSON file.
+    fn appendTabToSessionFile(self: *Server, path: []const u8, existing_json: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, existing_json, .{});
+        defer parsed.deinit();
+
+        var root = &parsed.value.object;
+        const arena = parsed.arena.allocator();
+
+        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+
+        // No-op-on-duplicate (parity with the client-side appendTabToSessionFile
+        // in src/client.zig on feat/plug-system). If the exact pty_id is
+        // already present anywhere in the tab tree, this call is a redundant
+        // placement; skip the write. Sits alongside the remap-on-collision
+        // logic below, which handles the bounced-server scenario where a new
+        // PTY happens to reuse an old, dead PTY's id.
+        if (tabsContainPtyId(tabs_val.*, @intCast(pty_id))) |host_tab_id| {
+            log.warn(
+                "appendTabToSessionFile: pty_id={d} already in session file {s} at tab_id={d} — skipping write",
+                .{ pty_id, path, host_tab_id },
+            );
+            return;
+        }
+
+        // Extract and bump counters
+        const next_tab_val = root.get("next_tab_id") orelse return error.InvalidSessionFile;
+        const next_split_val = root.get("next_split_id") orelse return error.InvalidSessionFile;
+        const new_tab_id = if (next_tab_val == .integer) next_tab_val.integer else return error.InvalidSessionFile;
+        const new_split_id = if (next_split_val == .integer) next_split_val.integer else return error.InvalidSessionFile;
+
+        // Ensure unique pty_id within the file. When the server bounces,
+        // the new PTY can get the same ID as an old tab's PTY. The client's
+        // spawn-fallback remap keys by pty_id, so duplicates cause one
+        // mapping to clobber the other → two tabs share one PTY → crash.
+        var file_pty_id: i64 = @intCast(pty_id);
+        for (tabs_val.array.items) |tab_entry| {
+            if (tab_entry != .object) continue;
+            const root_pane = tab_entry.object.get("root") orelse continue;
+            if (root_pane != .object) continue;
+            const existing_id = root_pane.object.get("pty_id") orelse continue;
+            if (existing_id == .integer and existing_id.integer >= file_pty_id) {
+                file_pty_id = existing_id.integer + 1;
+            }
+        }
+
+        // Build the new tab as a Value tree
+        var pane_obj = std.json.ObjectMap.init(arena);
+        try pane_obj.put("type", .{ .string = "pane" });
+        try pane_obj.put("id", .{ .integer = new_split_id });
+        try pane_obj.put("pty_id", .{ .integer = file_pty_id });
+        try pane_obj.put("cwd", .{ .string = cwd });
+
+        var tab_obj = std.json.ObjectMap.init(arena);
+        try tab_obj.put("id", .{ .integer = new_tab_id });
+        if (tab_title) |t| {
+            try tab_obj.put("title", .{ .string = t });
+        } else {
+            try tab_obj.put("title", .null);
+        }
+        try tab_obj.put("root", .{ .object = pane_obj });
+        try tab_obj.put("last_focused_id", .{ .integer = new_split_id });
+
+        // Insert the new tab right of the focused tab, mirroring the Lua
+        // break_pane placement policy. The anchor is sourced from the JSON
+        // active_tab field (1-based). Missing key, explicit null, and
+        // wrong-type reads all normalize to 1 via the helper. Empty tabs
+        // array is handled explicitly (std.json.Array.insert at index > len
+        // panics, unlike Lua's forgiving table.insert). The target session's
+        // active_tab field is NOT modified here — it stays pointing at
+        // whatever tab the viewer had focused before the place fired; only
+        // the list shape changes.
+        const insert_idx = computeSessionFileInsertIndex(root.get("active_tab"), tabs_val.array.items.len);
+        try tabs_val.array.insert(insert_idx, .{ .object = tab_obj });
+
+        // Update counters and validity
+        try root.put("next_tab_id", .{ .integer = new_tab_id + 1 });
+        try root.put("next_split_id", .{ .integer = new_split_id + 1 });
+        try root.put("pty_validity", .{ .integer = validity });
+
+        // Serialize back
+        const output = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+        defer self.allocator.free(output);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(output);
+    }
+
+    /// Compute the 0-based insert index for a new tab in a session file's
+    /// `tabs` array, mirroring the Lua break_pane anchor + 1 rule:
+    ///   - empty tabs → index 0 (new tab becomes the only tab)
+    ///   - otherwise  → clamp(active_tab, 1..len) as the 1-based anchor,
+    ///                  converted to 0-based insert index (= clamped),
+    ///                  which puts the new tab right of the focused tab.
+    ///
+    /// active_tab_val is the result of `obj.get("active_tab")`: null when
+    /// missing, `.null` when explicitly JSON null, `.integer` when valid,
+    /// anything else is treated as an out-of-contract read. Missing / null
+    /// / wrong-type / zero / negative all normalize to 1.
+    fn computeSessionFileInsertIndex(active_tab_val: ?std.json.Value, tabs_len: usize) usize {
+        if (tabs_len == 0) return 0;
+
+        const active_tab: i64 = blk: {
+            if (active_tab_val) |v| {
+                if (v == .integer) break :blk v.integer;
+            }
+            // Missing key, explicit .null, or wrong-type → normalize to 1.
+            break :blk 1;
+        };
+
+        const len_i64: i64 = @intCast(tabs_len);
+        // max(1, min(len, active_tab or 1)) with explicit guard for
+        // zero/negative active_tab values (which route to 1).
+        const floored: i64 = if (active_tab < 1) 1 else active_tab;
+        const clamped: i64 = if (floored > len_i64) len_i64 else floored;
+        // Convert 1-based anchor to 0-based insert index; insertion at
+        // (anchor) in 0-based terms lands right of the 1-based anchor.
+        return @intCast(clamped);
+    }
+
+    /// Returns the tab id that already hosts pty_id (anywhere in its pane
+    /// tree), or null if no tab in `tabs_val` references pty_id. The tab id
+    /// is used purely for the diagnostic warn; if the matched tab is missing
+    /// an integer id field we return 0 rather than null so the caller can
+    /// still detect the duplicate.
+    fn tabsContainPtyId(tabs_val: std.json.Value, pty_id: i64) ?i64 {
+        if (tabs_val != .array) return null;
+        for (tabs_val.array.items) |tab_val| {
+            if (!paneSubtreeContainsPtyId(tab_val, pty_id)) continue;
+            if (tab_val == .object) {
+                if (tab_val.object.get("id")) |id_val| {
+                    if (id_val == .integer) return id_val.integer;
+                }
+            }
+            return 0;
+        }
+        return null;
+    }
+
+    fn paneSubtreeContainsPtyId(value: std.json.Value, pty_id: i64) bool {
+        switch (value) {
+            .object => |obj| {
+                if (obj.get("type")) |type_val| {
+                    if (type_val == .string and std.mem.eql(u8, type_val.string, "pane")) {
+                        if (obj.get("pty_id")) |pid_val| {
+                            if (pid_val == .integer and pid_val.integer == pty_id) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    if (paneSubtreeContainsPtyId(entry.value_ptr.*, pty_id)) return true;
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    if (paneSubtreeContainsPtyId(item, pty_id)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
     }
 
     /// Build and send pty_spawned notification to all clients
@@ -4309,6 +5475,61 @@ const Server = struct {
                 try client.sendData(self.loop, msg_bytes);
             }
         }
+
+        // Forward to subscribed plugs
+        self.forwardToSubscribedPlugs("cwd_changed", msg_bytes, null);
+    }
+
+    fn handleRenameTab(self: *Server, requesting_client: ?*Client, params: msgpack.Value) !msgpack.Value {
+        const parsed = parseRenameTabParams(params) catch |err| {
+            const message = switch (err) {
+                error.InvalidParams => "invalid params",
+                error.MissingPtyId => "missing pty_id",
+                error.MissingTitle => "missing title",
+                error.MissingPtyValidity => "missing pty_validity",
+            };
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, message) };
+        };
+
+        if (parsed.pty_validity != self.start_time_ms) {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "stale shell environment; open a new shell") };
+        }
+
+        const pty_instance = self.ptys.get(parsed.pty_id) orelse {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
+        };
+
+        pty_instance.terminal_mutex.lock();
+        defer pty_instance.terminal_mutex.unlock();
+        try pty_instance.setTitle(parsed.title);
+
+        try self.sendRenameTab(parsed.pty_id, parsed.title, requesting_client);
+
+        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+    }
+
+    /// Broadcast rename_tab notification to all clients
+    fn sendRenameTab(self: *Server, pty_id: usize, title: []const u8, exclude_client: ?*Client) !void {
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } };
+        map_items[1] = .{ .key = .{ .string = "title" }, .value = .{ .string = title } };
+
+        const map_params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "rename_tab", map_params });
+        defer self.allocator.free(msg_bytes);
+
+        // Skip plug clients — they receive via forwarding below
+        for (self.clients.items) |client| {
+            if (client.plug_name != null) continue;
+            if (exclude_client) |excluded| {
+                if (client == excluded) continue;
+            }
+            try client.sendData(self.loop, msg_bytes);
+        }
+
+        // Forward to subscribed plugs (exclude requester to avoid double delivery)
+        self.forwardToSubscribedPlugs("rename_tab", msg_bytes, exclude_client);
     }
 
     fn handleRenameTab(self: *Server, requesting_client: ?*Client, params: msgpack.Value) !msgpack.Value {
@@ -4445,8 +5666,148 @@ const Server = struct {
         _ = pty_instance.flushResponsesUnlocked();
     }
 
+    // -- call forward timeout and disconnect cleanup --
+
+    /// Sweep pending forwards for timeouts. Called on a periodic timer.
+    fn sweepForwardTimeouts(self: *Server) void {
+        const now = std.time.milliTimestamp();
+        var to_remove: std.ArrayList(u32) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var iter = self.pending_forwards.iterator();
+        while (iter.next()) |entry| {
+            if (now - entry.value_ptr.created_ms > LIMITS.CALL_FORWARD_TIMEOUT_MS) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |fwd_msgid| {
+            if (self.pending_forwards.fetchRemove(fwd_msgid)) |entry| {
+                const pending = entry.value;
+                log.warn("Call forward to plug '{s}' timed out (forward_msgid={})", .{
+                    pending.plug_name, fwd_msgid,
+                });
+                defer self.allocator.free(pending.plug_name);
+
+                // Send timeout error to originator if still connected
+                for (self.clients.items) |c| {
+                    if (c == pending.originator and !c.closing) {
+                        c.sendErrorResponse(self.loop, pending.orig_msgid, error.CallForwardTimeout) catch {};
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn onSweepTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        _ = loop;
+        const ctx = completion.userdataCast(SweepTimerContext);
+        const server = ctx.server;
+
+        if (server.shutting_down) return;
+
+        server.sweepForwardTimeouts();
+
+        // Re-arm the one-shot timer and track it for shutdown cancellation
+        server.sweep_timer_task = try server.loop.timeout(5 * std.time.ns_per_s, .{
+            .ptr = ctx,
+            .cb = onSweepTimer,
+        });
+    }
+
+    /// Error out all pending forwards targeting a disconnected plug.
+    fn cleanupPlugForwards(self: *Server, plug_client: *Client) void {
+        var to_remove: std.ArrayList(u32) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var iter = self.pending_forwards.iterator();
+        while (iter.next()) |entry| {
+            if (plug_client.plug_name) |name| {
+                if (std.mem.eql(u8, entry.value_ptr.plug_name, name)) {
+                    to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+                }
+            }
+        }
+
+        for (to_remove.items) |fwd_msgid| {
+            if (self.pending_forwards.fetchRemove(fwd_msgid)) |entry| {
+                const pending = entry.value;
+                defer self.allocator.free(pending.plug_name);
+                for (self.clients.items) |c| {
+                    if (c == pending.originator and !c.closing) {
+                        c.sendErrorResponse(self.loop, pending.orig_msgid, error.PlugDisconnected) catch {};
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Silently remove all pending forwards from a disconnecting TUI client.
+    fn cleanupOriginatorForwards(self: *Server, originator: *Client) void {
+        var to_remove: std.ArrayList(u32) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var iter = self.pending_forwards.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.originator == originator) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |fwd_msgid| {
+            if (self.pending_forwards.fetchRemove(fwd_msgid)) |entry| {
+                self.allocator.free(entry.value.plug_name);
+            }
+        }
+    }
+
     fn shutdown(self: *Server) void {
         std.log.info("Shutting down server...", .{});
+
+        // Gate restart timer callbacks before killing children
+        self.shutting_down = true;
+
+        // Kill managed plug processes — set flag BEFORE signal to prevent
+        // onPlugExit from scheduling a restart
+        for (self.managed_plugs.items) |*mp| {
+            if (mp.pid) |pid| {
+                mp.killed_by_server = true;
+                posix.kill(pid, posix.SIG.TERM) catch {};
+            }
+            if (mp.waitpid_task) |*task| {
+                task.cancel(self.loop) catch {};
+                mp.waitpid_task = null;
+            }
+            // Cancel pending restart timers and free their context
+            if (mp.restart_timer_task) |*task| {
+                task.cancel(self.loop) catch {};
+                mp.restart_timer_task = null;
+            }
+            if (mp.restart_ctx) |ctx| {
+                self.allocator.free(ctx.plug_name);
+                self.allocator.destroy(ctx);
+                mp.restart_ctx = null;
+            }
+        }
+
+        // Cancel sweep timer before freeing its context
+        if (self.sweep_timer_task) |*task| {
+            task.cancel(self.loop) catch {};
+            self.sweep_timer_task = null;
+        }
+        if (self.sweep_timer_ctx) |ctx| {
+            self.allocator.destroy(ctx);
+            self.sweep_timer_ctx = null;
+        }
+
+        // Error out remaining pending forwards
+        var fwd_iter = self.pending_forwards.iterator();
+        while (fwd_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.plug_name);
+        }
+        self.pending_forwards.clearRetainingCapacity();
 
         // Stop accepting
         self.accepting = false;
@@ -4652,6 +6013,39 @@ fn buildPtyEntry(allocator: std.mem.Allocator, pty_instance: *const Pty) ![]msgp
     return entries;
 }
 
+fn buildPlugEntry(allocator: std.mem.Allocator, mp: *const ManagedPlug) ![]msgpack.Value.KeyValue {
+    const field_count: usize = 5;
+    const entries = try allocator.alloc(msgpack.Value.KeyValue, field_count);
+    @memset(entries, .{ .key = .nil, .value = .nil });
+    errdefer {
+        for (entries) |kv| {
+            kv.key.deinit(allocator);
+            kv.value.deinit(allocator);
+        }
+        allocator.free(entries);
+    }
+
+    entries[0].key = .{ .string = try allocator.dupe(u8, "name") };
+    entries[0].value = .{ .string = try allocator.dupe(u8, mp.name) };
+
+    entries[1].key = .{ .string = try allocator.dupe(u8, "registered") };
+    entries[1].value = .{ .boolean = mp.registered };
+
+    entries[2].key = .{ .string = try allocator.dupe(u8, "pid") };
+    entries[2].value = if (mp.pid) |pid|
+        .{ .integer = @intCast(pid) }
+    else
+        .nil;
+
+    entries[3].key = .{ .string = try allocator.dupe(u8, "restart_count") };
+    entries[3].value = .{ .unsigned = mp.restart_count };
+
+    entries[4].key = .{ .string = try allocator.dupe(u8, "restart") };
+    entries[4].value = .{ .boolean = mp.restart };
+
+    return entries;
+}
+
 pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     std.log.info("Starting server on {s}", .{socket_path});
 
@@ -4738,6 +6132,8 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .signal_pipe_fds = signal_pipe_fds,
         .start_time_ms = std.time.milliTimestamp(),
+        .plugs = std.StringHashMap(*Client).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
     };
     crash_context.setPtyValidity(server.start_time_ms);
     defer {
@@ -4752,6 +6148,15 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         server.clients.deinit(allocator);
         server.ptys.deinit();
         server.pending.deinit();
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        if (server.sweep_timer_ctx) |ctx| {
+            allocator.destroy(ctx);
+        }
+        for (server.managed_plugs.items) |*mp| {
+            mp.deinit(allocator);
+        }
+        server.managed_plugs.deinit(allocator);
     }
 
     // Start accepting connections
@@ -4759,6 +6164,15 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     server.accept_task = try loop.accept(listen_fd, .{
         .ptr = &server,
         .cb = Server.onAccept,
+    });
+
+    // Start sweep timer for call forward timeouts
+    const sweep_ctx = try allocator.create(SweepTimerContext);
+    sweep_ctx.* = .{ .server = &server };
+    server.sweep_timer_ctx = sweep_ctx;
+    server.sweep_timer_task = try loop.timeout(5 * std.time.ns_per_s, .{
+        .ptr = sweep_ctx,
+        .cb = Server.onSweepTimer,
     });
 
     // Register signal watcher
@@ -4794,6 +6208,19 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     posix.unlink(socket_path) catch {};
 }
 
+/// Compare a ManagedPlug's owned cmd slices against parsed msgpack values.
+fn plugCmdMatchesParsed(cmd: []const []const u8, parsed_cmd: []const msgpack.Value) bool {
+    if (cmd.len != parsed_cmd.len) return false;
+    for (cmd, parsed_cmd) |owned, val| {
+        const parsed_str = switch (val) {
+            .string => |s| s,
+            else => return false,
+        };
+        if (!std.mem.eql(u8, owned, parsed_str)) return false;
+    }
+    return true;
+}
+
 test "server lifecycle - shutdown when no clients" {
     const testing = std.testing;
 
@@ -4810,6 +6237,8 @@ test "server lifecycle - shutdown when no clients" {
         .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer server.clients.deinit(testing.allocator);
     defer server.ptys.deinit();
@@ -4844,6 +6273,8 @@ test "server lifecycle - accept client connection" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
@@ -4882,6 +6313,8 @@ test "server lifecycle - client disconnect triggers shutdown" {
         .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
@@ -4926,6 +6359,8 @@ test "server lifecycle - multiple clients" {
         .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
@@ -4987,6 +6422,8 @@ test "server lifecycle - recv error triggers disconnect" {
         .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
@@ -5084,11 +6521,11 @@ test "parseSpawnPtyParams" {
         .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 120 } },
         .{ .key = .{ .string = "argv" }, .value = .{ .array = &argv_values } },
     };
-    const p6 = Server.parseSpawnPtyParams(.{ .map = &params_with_argv });
-    try testing.expect(p6.argv != null);
-    try testing.expectEqual(@as(usize, 2), p6.argv.?.len);
-    try testing.expectEqualStrings("prisectl-ui", p6.argv.?[0].string);
-    try testing.expectEqualStrings("plug-status", p6.argv.?[1].string);
+    const p_argv = Server.parseSpawnPtyParams(.{ .map = &params_with_argv });
+    try testing.expect(p_argv.argv != null);
+    try testing.expectEqual(@as(usize, 2), p_argv.argv.?.len);
+    try testing.expectEqualStrings("prisectl-ui", p_argv.argv.?[0].string);
+    try testing.expectEqualStrings("plug-status", p_argv.argv.?[1].string);
 
     // Without argv param - null
     try testing.expectEqual(@as(?[]const msgpack.Value, null), p1.argv);
@@ -5130,6 +6567,48 @@ test "parseSpawnPtyParams" {
     try testing.expectEqual(@as(?usize, null), p9.split_target_pty_id);
     try testing.expectEqual(Server.SplitDirection.col, p9.split_direction);
     try testing.expectEqual(@as(f64, 1.0), p9.split_ratio);
+
+    // Non-map params (nil) - all defaults
+    const p10 = Server.parseSpawnPtyParams(.nil);
+    try testing.expectEqual(@as(u16, 24), p10.size.ws_row);
+    try testing.expectEqual(@as(u16, 80), p10.size.ws_col);
+    try testing.expectEqual(false, p10.attach);
+    try testing.expectEqual(@as(?[]const u8, null), p10.cwd);
+
+    // Wrong value types silently ignored - fall back to defaults
+    var params_wrong_types = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .string = "hello" } },
+        .{ .key = .{ .string = "cols" }, .value = .{ .boolean = true } },
+        .{ .key = .{ .string = "attach" }, .value = .{ .unsigned = 1 } },
+        .{ .key = .{ .string = "cwd" }, .value = .{ .unsigned = 42 } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .boolean = false } },
+    };
+    const p11 = Server.parseSpawnPtyParams(.{ .map = &params_wrong_types });
+    try testing.expectEqual(@as(u16, 24), p11.size.ws_row);
+    try testing.expectEqual(@as(u16, 80), p11.size.ws_col);
+    try testing.expectEqual(false, p11.attach);
+    try testing.expectEqual(@as(?[]const u8, null), p11.cwd);
+    try testing.expectEqual(@as(?[]const u8, null), p11.cmd);
+
+    // Unknown keys ignored
+    var params_unknown = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 50 } },
+        .{ .key = .{ .string = "bogus" }, .value = .{ .string = "ignored" } },
+    };
+    const p12 = Server.parseSpawnPtyParams(.{ .map = &params_unknown });
+    try testing.expectEqual(@as(u16, 50), p12.size.ws_row);
+
+    // env param - array of strings
+    var env_vals = [_]msgpack.Value{
+        .{ .string = "PATH=/usr/bin" },
+        .{ .string = "HOME=/tmp" },
+    };
+    var params_with_env = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "env" }, .value = .{ .array = &env_vals } },
+    };
+    const p13 = Server.parseSpawnPtyParams(.{ .map = &params_with_env });
+    try testing.expect(p13.env != null);
+    try testing.expectEqual(@as(usize, 2), p13.env.?.len);
 }
 
 test "prepareSpawnEnv" {
@@ -5170,6 +6649,7 @@ fn initRenameTestServer(allocator: std.mem.Allocator, loop: *io.Loop, start_time
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .signal_pipe_fds = .{ -1, -1 },
         .start_time_ms = start_time_ms,
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
     };
 }
 
@@ -6489,6 +7969,8 @@ test "server - pty exit notification" {
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
     };
     defer {
         // cleanup
@@ -6987,4 +8469,1146 @@ test "Pty.addClient is idempotent on duplicate attach" {
     const second = try pty_inst.addClient(allocator, &client);
     try testing.expect(!second);
     try testing.expectEqual(@as(usize, 1), pty_inst.clients.items.len);
+}
+
+test "parseSpawnPlugParams - valid params" {
+    var kv_buf: [4]msgpack.Value.KeyValue = undefined;
+    var cmd_buf: [2]msgpack.Value = .{
+        .{ .string = "/usr/bin/echo" },
+        .{ .string = "hello" },
+    };
+    kv_buf[0] = .{ .key = .{ .string = "name" }, .value = .{ .string = "echo" } };
+    kv_buf[1] = .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_buf } };
+    kv_buf[2] = .{ .key = .{ .string = "restart" }, .value = .{ .boolean = true } };
+    kv_buf[3] = .{ .key = .{ .string = "restart_delay_ms" }, .value = .{ .unsigned = 2000 } };
+
+    const params: msgpack.Value = .{ .map = &kv_buf };
+    const parsed = Server.parseSpawnPlugParams(params).?;
+
+    try std.testing.expectEqualStrings("echo", parsed.name);
+    try std.testing.expectEqual(@as(usize, 2), parsed.cmd.len);
+    try std.testing.expect(parsed.restart);
+    try std.testing.expectEqual(@as(u32, 2000), parsed.restart_delay_ms);
+}
+
+test "parseSpawnPlugParams - missing name returns null" {
+    var cmd_buf: [1]msgpack.Value = .{.{ .string = "cmd" }};
+    var kv_buf: [1]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_buf } },
+    };
+
+    const params: msgpack.Value = .{ .map = &kv_buf };
+    try std.testing.expect(Server.parseSpawnPlugParams(params) == null);
+}
+
+test "parseSpawnPlugParams - missing cmd returns null" {
+    var kv_buf: [1]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "test" } },
+    };
+
+    const params: msgpack.Value = .{ .map = &kv_buf };
+    try std.testing.expect(Server.parseSpawnPlugParams(params) == null);
+}
+
+test "parseSpawnPlugParams - empty cmd returns null" {
+    var cmd_buf: [0]msgpack.Value = .{};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "test" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_buf } },
+    };
+
+    const params: msgpack.Value = .{ .map = &kv_buf };
+    try std.testing.expect(Server.parseSpawnPlugParams(params) == null);
+}
+
+test "parseSpawnPlugParams - defaults" {
+    var cmd_buf: [1]msgpack.Value = .{.{ .string = "run" }};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "plug" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_buf } },
+    };
+
+    const params: msgpack.Value = .{ .map = &kv_buf };
+    const parsed = Server.parseSpawnPlugParams(params).?;
+
+    try std.testing.expect(!parsed.restart);
+    try std.testing.expectEqual(@as(u32, 1000), parsed.restart_delay_ms);
+}
+
+test "handleSpawnPlug - idempotent with same managed cmd" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate a managed plug (restart_delay_ms=1000 matches parsed default)
+    const name = try testing.allocator.dupe(u8, "echo");
+    const cmd_arg = try testing.allocator.dupe(u8, "echo");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 1000,
+        .pid = 12345,
+    });
+
+    // Try to spawn with same name and cmd (restart defaults match)
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "echo" }};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "echo" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    const result = try server.handleSpawnPlug(params);
+    try testing.expectEqualStrings("ok", result.string);
+    testing.allocator.free(result.string);
+}
+
+test "handleSpawnPlug - config conflict for external plug" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate a registered plug
+    const plug_name = try testing.allocator.dupe(u8, "myplugin");
+    defer testing.allocator.free(plug_name);
+    try server.plugs.put(plug_name, undefined);
+
+    // Try to spawn with same name
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "run" }};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "myplugin" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.PlugConfigConflict, server.handleSpawnPlug(params));
+}
+
+test "handleSpawnPlug - config conflict with different managed cmd" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate a managed plug with cmd "echo"
+    const name = try testing.allocator.dupe(u8, "echo");
+    const cmd_arg = try testing.allocator.dupe(u8, "echo");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 1000,
+        .pid = 12345,
+    });
+
+    // Try to spawn with same name but different cmd
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "cat" }};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "echo" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.PlugConfigConflict, server.handleSpawnPlug(params));
+}
+
+test "handleSpawnPlug - config conflict with different restart policy" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate with restart=false
+    const name = try testing.allocator.dupe(u8, "echo");
+    const cmd_arg = try testing.allocator.dupe(u8, "echo");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 0,
+        .pid = 12345,
+    });
+
+    // Same name and cmd but restart=true (via restart key in params)
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "echo" }};
+    var kv_buf: [3]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "echo" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+        .{ .key = .{ .string = "restart" }, .value = .{ .boolean = true } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.PlugConfigConflict, server.handleSpawnPlug(params));
+}
+
+test "handleSpawnPlug - stopped plug is removed for re-spawn" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate a stopped plug (pid=null, no restart timer)
+    const name = try testing.allocator.dupe(u8, "stale");
+    const cmd_arg = try testing.allocator.dupe(u8, "/nonexistent/binary");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 0,
+        .pid = null,
+    });
+
+    try testing.expectEqual(@as(usize, 1), server.managed_plugs.items.len);
+
+    // spawn_plug with same name+cmd should remove the stale entry
+    // then try to spawn (which fails because the binary doesn't exist)
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "/nonexistent/binary" }};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "stale" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    // spawnPlugProcess fails because binary doesn't exist
+    const result = server.handleSpawnPlug(params);
+    try testing.expectError(error.SpawnFailed, result);
+
+    // The stale entry should have been removed before the spawn attempt
+    try testing.expectEqual(@as(usize, 0), server.managed_plugs.items.len);
+}
+
+test "plugCmdMatchesParsed - matching commands" {
+    const cmd: []const []const u8 = &.{ "echo", "hello" };
+    var parsed: [2]msgpack.Value = .{ .{ .string = "echo" }, .{ .string = "hello" } };
+    try std.testing.expect(plugCmdMatchesParsed(cmd, &parsed));
+}
+
+test "plugCmdMatchesParsed - different lengths" {
+    const cmd: []const []const u8 = &.{ "echo", "hello" };
+    var parsed: [1]msgpack.Value = .{.{ .string = "echo" }};
+    try std.testing.expect(!plugCmdMatchesParsed(cmd, &parsed));
+}
+
+test "plugCmdMatchesParsed - different values" {
+    const cmd: []const []const u8 = &.{"echo"};
+    var parsed: [1]msgpack.Value = .{.{ .string = "cat" }};
+    try std.testing.expect(!plugCmdMatchesParsed(cmd, &parsed));
+}
+
+test "onPlugExit - reaps exited process" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    const name = try testing.allocator.dupe(u8, "exiter");
+    const cmd_arg = try testing.allocator.dupe(u8, "true");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    const pid: posix.pid_t = 99999;
+
+    const waitpid_task = try loop.waitpid(pid, .{
+        .ptr = &server,
+        .cb = Server.onPlugExit,
+    });
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 0,
+        .pid = pid,
+        .waitpid_task = waitpid_task,
+    });
+
+    // Simulate process exit
+    try loop.completeWaitpid(pid, 0);
+    try loop.run(.once);
+
+    // After exit: pid cleared, no restart scheduled (restart=false)
+    const mp = &server.managed_plugs.items[0];
+    try testing.expect(mp.pid == null);
+    try testing.expect(mp.waitpid_task == null);
+    try testing.expectEqual(@as(u32, 0), mp.restart_count);
+}
+
+test "onPlugExit - no restart when killed_by_server" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    const name = try testing.allocator.dupe(u8, "killed");
+    const cmd_arg = try testing.allocator.dupe(u8, "true");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    const pid: posix.pid_t = 88888;
+
+    const waitpid_task = try loop.waitpid(pid, .{
+        .ptr = &server,
+        .cb = Server.onPlugExit,
+    });
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 0,
+        .pid = pid,
+        .killed_by_server = true,
+        .waitpid_task = waitpid_task,
+    });
+
+    try loop.completeWaitpid(pid, 0);
+    try loop.run(.once);
+
+    // Should NOT have restarted
+    const mp = &server.managed_plugs.items[0];
+    try testing.expect(mp.pid == null);
+    try testing.expectEqual(@as(u32, 0), mp.restart_count);
+}
+
+test "onPlugExit - no restart when shutting_down" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+        .shutting_down = true,
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    const name = try testing.allocator.dupe(u8, "shutdown");
+    const cmd_arg = try testing.allocator.dupe(u8, "true");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    const pid: posix.pid_t = 77777;
+
+    const waitpid_task = try loop.waitpid(pid, .{
+        .ptr = &server,
+        .cb = Server.onPlugExit,
+    });
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 0,
+        .pid = pid,
+        .waitpid_task = waitpid_task,
+    });
+
+    try loop.completeWaitpid(pid, 0);
+    try loop.run(.once);
+
+    const mp = &server.managed_plugs.items[0];
+    try testing.expect(mp.pid == null);
+    try testing.expectEqual(@as(u32, 0), mp.restart_count);
+}
+
+test "handleRegisterPlug - valid token succeeds" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp_item| mp_item.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate a managed plug with a known token
+    const token = Server.generatePlugToken();
+    const name = try testing.allocator.dupe(u8, "testplug");
+    const cmd_arg = try testing.allocator.dupe(u8, "echo");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 0,
+        .token = token,
+        .pid = 12345,
+    });
+
+    var client: Client = .{
+        .fd = 42,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        if (client.plug_name) |pn| testing.allocator.free(pn);
+        client.msg_buffer.deinit(testing.allocator);
+        client.send_queue.deinit(testing.allocator);
+        client.attached_ptys.deinit(testing.allocator);
+    }
+    try server.clients.append(testing.allocator, &client);
+
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "testplug" } },
+        .{ .key = .{ .string = "token" }, .value = .{ .string = &token } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    const result = try server.handleRegisterPlug(&client, params);
+    try testing.expectEqualStrings("ok", result.string);
+    testing.allocator.free(result.string);
+
+    try testing.expect(client.plug_name != null);
+    try testing.expectEqualStrings("testplug", client.plug_name.?);
+    try testing.expect(server.managed_plugs.items[0].registered);
+}
+
+test "handleRegisterPlug - missing token returns error" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    var client: Client = .{
+        .fd = 42,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        client.msg_buffer.deinit(testing.allocator);
+        client.send_queue.deinit(testing.allocator);
+        client.attached_ptys.deinit(testing.allocator);
+    }
+
+    // No token field in params
+    var kv_buf: [1]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "testplug" } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.MissingPlugToken, server.handleRegisterPlug(&client, params));
+}
+
+test "handleRegisterPlug - wrong token returns PermissionDenied" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp_item| mp_item.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    const token = Server.generatePlugToken();
+    const name = try testing.allocator.dupe(u8, "testplug");
+    const cmd_arg = try testing.allocator.dupe(u8, "echo");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 0,
+        .token = token,
+        .pid = 12345,
+    });
+
+    var client: Client = .{
+        .fd = 42,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        client.msg_buffer.deinit(testing.allocator);
+        client.send_queue.deinit(testing.allocator);
+        client.attached_ptys.deinit(testing.allocator);
+    }
+
+    // Use a different token
+    const bad_token = Server.generatePlugToken();
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "testplug" } },
+        .{ .key = .{ .string = "token" }, .value = .{ .string = &bad_token } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.PermissionDenied, server.handleRegisterPlug(&client, params));
+}
+
+test "handleRegisterPlug - unknown plug name returns PermissionDenied" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    var client: Client = .{
+        .fd = 42,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        client.msg_buffer.deinit(testing.allocator);
+        client.send_queue.deinit(testing.allocator);
+        client.attached_ptys.deinit(testing.allocator);
+    }
+
+    const token = Server.generatePlugToken();
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "nonexistent" } },
+        .{ .key = .{ .string = "token" }, .value = .{ .string = &token } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.PermissionDenied, server.handleRegisterPlug(&client, params));
+}
+
+test "handleRegisterPlug - already registered returns error" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    var client: Client = .{
+        .fd = 42,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+        .plug_name = "already",
+    };
+    defer {
+        client.msg_buffer.deinit(testing.allocator);
+        client.send_queue.deinit(testing.allocator);
+        client.attached_ptys.deinit(testing.allocator);
+    }
+
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "testplug" } },
+        .{ .key = .{ .string = "token" }, .value = .{ .string = "deadbeef" } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.AlreadyRegistered, server.handleRegisterPlug(&client, params));
+}
+
+test "onPlugExit - defers when registered" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    const name = try testing.allocator.dupe(u8, "wrapper");
+    const cmd_arg = try testing.allocator.dupe(u8, "npx");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    const pid: posix.pid_t = 55555;
+
+    const waitpid_task = try loop.waitpid(pid, .{
+        .ptr = &server,
+        .cb = Server.onPlugExit,
+    });
+
+    // Put plug name in plugs map to simulate a registered client
+    try server.plugs.put(name, undefined);
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 1000,
+        .pid = pid,
+        .registered = true,
+        .waitpid_task = waitpid_task,
+    });
+
+    // Wrapper process exits
+    try loop.completeWaitpid(pid, 0);
+    try loop.run(.once);
+
+    const mp = &server.managed_plugs.items[0];
+    // Deferred: registered stays true, plug stays in map, no restart yet
+    try testing.expect(mp.registered);
+    try testing.expect(mp.pid == null);
+    try testing.expect(server.plugs.contains(name));
+    try testing.expectEqual(@as(u32, 0), mp.restart_count);
+}
+
+test "onPlugExit - proceeds when not registered" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| {
+            if (mp.restart_ctx) |ctx| {
+                testing.allocator.free(ctx.plug_name);
+                testing.allocator.destroy(ctx);
+            }
+            mp.deinit(testing.allocator);
+        }
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    const name = try testing.allocator.dupe(u8, "unregistered");
+    const cmd_arg = try testing.allocator.dupe(u8, "true");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    const pid: posix.pid_t = 44444;
+
+    const waitpid_task = try loop.waitpid(pid, .{
+        .ptr = &server,
+        .cb = Server.onPlugExit,
+    });
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 1000,
+        .pid = pid,
+        .registered = false,
+        .waitpid_task = waitpid_task,
+    });
+
+    try loop.completeWaitpid(pid, 0);
+    try loop.run(.once);
+
+    const mp = &server.managed_plugs.items[0];
+    // Immediate teardown: not registered, removed from plugs, restart scheduled
+    try testing.expect(!mp.registered);
+    try testing.expect(mp.pid == null);
+    try testing.expect(!server.plugs.contains(name));
+    try testing.expectEqual(@as(u32, 1), mp.restart_count);
+    try testing.expect(mp.restart_timer_task != null);
+}
+
+test "finishClose - deferred restart when pid null" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| {
+            if (mp.restart_ctx) |ctx| {
+                testing.allocator.free(ctx.plug_name);
+                testing.allocator.destroy(ctx);
+            }
+            mp.deinit(testing.allocator);
+        }
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        // finishClose removes and destroys the client, so no manual cleanup
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Managed plug in deferred state: pid=null, registered=true
+    const mp_name = try testing.allocator.dupe(u8, "deferred");
+    const cmd_arg = try testing.allocator.dupe(u8, "npx");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = mp_name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 1000,
+        .pid = null,
+        .registered = true,
+    });
+
+    // Heap-allocate client like the real code does (finishClose calls destroy)
+    const client = try testing.allocator.create(Client);
+    const client_name = try testing.allocator.dupe(u8, "deferred");
+    client.* = .{
+        .fd = 42,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+        .plug_name = client_name,
+    };
+    try server.plugs.put(client_name, client);
+    try server.clients.append(testing.allocator, client);
+
+    // Simulate client disconnect via finishClose
+    client.finishClose(&loop);
+
+    const mp = &server.managed_plugs.items[0];
+    // After finishClose: registered cleared, plug removed from map, restart scheduled
+    try testing.expect(!mp.registered);
+    try testing.expect(!server.plugs.contains(mp_name));
+    try testing.expectEqual(@as(u32, 1), mp.restart_count);
+    try testing.expect(mp.restart_timer_task != null);
+}
+
+test "handleSpawnPlug - registered but pidless treated as active" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Plug in deferred state: pid=null, registered=true
+    const name = try testing.allocator.dupe(u8, "active-deferred");
+    const cmd_arg = try testing.allocator.dupe(u8, "npx");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 1000,
+        .pid = null,
+        .registered = true,
+    });
+
+    // Same config spawn should return "ok" (treated as active + matching)
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "npx" }};
+    var kv_buf: [4]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "active-deferred" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+        .{ .key = .{ .string = "restart" }, .value = .{ .boolean = true } },
+        .{ .key = .{ .string = "restart_delay_ms" }, .value = .{ .unsigned = 1000 } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    const result = server.handleSpawnPlug(params);
+    const val = try result;
+    defer testing.allocator.free(val.string);
+    try testing.expectEqualStrings("ok", val.string);
+
+    // Different config should return PlugConfigConflict
+    var cmd_vals2: [1]msgpack.Value = .{.{ .string = "different-binary" }};
+    var kv_buf2: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "active-deferred" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals2 } },
+    };
+    const params2: msgpack.Value = .{ .map = &kv_buf2 };
+
+    try testing.expectError(error.PlugConfigConflict, server.handleSpawnPlug(params2));
+}
+
+test "handleRegisterPlug - cancels pending restart timer on late registration" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| {
+            if (mp.restart_ctx) |ctx| {
+                testing.allocator.free(ctx.plug_name);
+                testing.allocator.destroy(ctx);
+            }
+            mp.deinit(testing.allocator);
+        }
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Managed plug with a known token, restart enabled, delay > 0
+    const token = Server.generatePlugToken();
+    const name = try testing.allocator.dupe(u8, "late-reg");
+    const cmd_arg = try testing.allocator.dupe(u8, "npx");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    const pid: posix.pid_t = 33333;
+
+    const waitpid_task = try loop.waitpid(pid, .{
+        .ptr = &server,
+        .cb = Server.onPlugExit,
+    });
+
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 5000,
+        .pid = pid,
+        .registered = false,
+        .token = token,
+        .waitpid_task = waitpid_task,
+    });
+
+    // Step 1: Wrapper exits before child registers.
+    // onPlugExit sees registered=false → schedules restart timer.
+    try loop.completeWaitpid(pid, 0);
+    try loop.run(.once);
+
+    const mp = &server.managed_plugs.items[0];
+    try testing.expect(mp.pid == null);
+    try testing.expectEqual(@as(u32, 1), mp.restart_count);
+    try testing.expect(mp.restart_timer_task != null);
+
+    // Step 2: Child connects late and registers with the original token.
+    var client: Client = .{
+        .fd = 50,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        if (client.plug_name) |pn| testing.allocator.free(pn);
+        client.msg_buffer.deinit(testing.allocator);
+        client.send_queue.deinit(testing.allocator);
+        client.attached_ptys.deinit(testing.allocator);
+    }
+    try server.clients.append(testing.allocator, &client);
+
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "late-reg" } },
+        .{ .key = .{ .string = "token" }, .value = .{ .string = &token } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    const result = try server.handleRegisterPlug(&client, params);
+    testing.allocator.free(result.string);
+
+    // After late registration: registered=true, restart timer cancelled
+    try testing.expect(mp.registered);
+    try testing.expect(mp.restart_timer_task == null);
+    try testing.expect(mp.restart_ctx == null);
 }

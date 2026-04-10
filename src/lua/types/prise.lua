@@ -135,6 +135,19 @@ function prise.list_sessions() end
 ---@param target_session string The session name to switch to
 function prise.switch_session(target_session) end
 
+---Place a PTY in a target session's saved state without switching
+---@param session_name string Target session name
+---@param pty_id integer PTY ID to place
+---@param cwd string Working directory for the PTY
+---@param tab_title? string Optional tab title
+---@return boolean success
+function prise.place_pty_in_session(session_name, pty_id, cwd, tab_title) end
+
+---Create a session
+---@param session_name string
+---@return boolean success
+function prise.create_session(session_name) end
+
 ---Create a new TextInput handle
 ---@return TextInput
 function prise.create_text_input() end
