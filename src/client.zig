@@ -1749,9 +1749,40 @@ pub const App = struct {
 
     // --- mmap screen dump implementation ---
 
+    /// Return the current process PID.
+    ///
+    /// `std.posix` has no cross-platform getpid, so we route through the
+    /// linux-specific syscall wrapper on Linux (prise does not link libc)
+    /// and through `std.c.getpid` on Darwin (libSystem is always linked).
+    fn currentPid() posix.pid_t {
+        return switch (@import("builtin").os.tag) {
+            .linux => @intCast(std.os.linux.getpid()),
+            else => std.c.getpid(),
+        };
+    }
+
+    /// Format the session-wide mmap dump path.
+    ///
+    /// The path MUST include the PID, not just the UID. Two clients on the
+    /// same user cannot share a path: `createDumpFile` opens with `O_TRUNC`,
+    /// so a second opener truncates the first client's file to zero bytes
+    /// while it is still mmap'd. The next render writes past the new EOF,
+    /// which Darwin delivers as SIGBUS. Including PID keeps each client's
+    /// file isolated.
+    fn formatSessionDumpPath(buf: []u8, uid: posix.uid_t, pid: posix.pid_t) ![]u8 {
+        return std.fmt.bufPrint(buf, "/tmp/prise-screen-{d}-{d}", .{ uid, pid });
+    }
+
+    /// Format a per-PTY mmap dump path. Same per-PID uniqueness rules as
+    /// `formatSessionDumpPath`.
+    fn formatPtyDumpPath(buf: []u8, uid: posix.uid_t, pid: posix.pid_t, pty_id: u32) ![]u8 {
+        return std.fmt.bufPrint(buf, "/tmp/prise-pty-{d}-{d}-{d}", .{ uid, pid, pty_id });
+    }
+
     fn initScreenDump(self: *App) !void {
         const uid = posix.getuid();
-        const path = std.fmt.bufPrint(&self.screen_dump_path_buf, "/tmp/prise-screen-{d}", .{uid}) catch return;
+        const pid = App.currentPid();
+        const path = App.formatSessionDumpPath(&self.screen_dump_path_buf, uid, pid) catch return;
         self.screen_dump_path_len = path.len;
 
         const initial_size = std.heap.page_size_min; // one page to start
@@ -1958,7 +1989,8 @@ pub const App = struct {
             // Create new mmap file for this PTY
             var path_buf: [64]u8 = undefined;
             const uid = posix.getuid();
-            const path = std.fmt.bufPrint(&path_buf, "/tmp/prise-pty-{d}-{d}", .{ uid, pty_id }) catch return;
+            const pid = App.currentPid();
+            const path = App.formatPtyDumpPath(&path_buf, uid, pid, pty_id) catch return;
 
             const fd = try self.createDumpFile(path);
             errdefer posix.close(fd);
@@ -3873,4 +3905,71 @@ test "packStyleAttrs encodes flags correctly" {
     multi.italic = true;
     multi.reverse = true;
     try testing.expectEqual(@as(u8, 0x01 | 0x04 | 0x08), App.packStyleAttrs(multi));
+}
+
+test "formatSessionDumpPath differs by pid" {
+    const testing = std.testing;
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+
+    const uid: posix.uid_t = 1000;
+    const path_a = try App.formatSessionDumpPath(&buf_a, uid, 111);
+    const path_b = try App.formatSessionDumpPath(&buf_b, uid, 222);
+
+    // Pins the per-PID uniqueness invariant. Two clients on the same user
+    // must not share a path — the underlying file is opened with O_TRUNC,
+    // and a shared path produces SIGBUS on the first client's next render
+    // when the second client attaches.
+    try testing.expect(!std.mem.eql(u8, path_a, path_b));
+    try testing.expectEqualStrings("/tmp/prise-screen-1000-111", path_a);
+    try testing.expectEqualStrings("/tmp/prise-screen-1000-222", path_b);
+}
+
+test "formatPtyDumpPath differs by pid and pty_id" {
+    const testing = std.testing;
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    var buf_c: [64]u8 = undefined;
+
+    const uid: posix.uid_t = 1000;
+    const path_a = try App.formatPtyDumpPath(&buf_a, uid, 111, 7);
+    const path_b = try App.formatPtyDumpPath(&buf_b, uid, 222, 7);
+    const path_c = try App.formatPtyDumpPath(&buf_c, uid, 111, 8);
+
+    try testing.expect(!std.mem.eql(u8, path_a, path_b));
+    try testing.expect(!std.mem.eql(u8, path_a, path_c));
+    try testing.expectEqualStrings("/tmp/prise-pty-1000-111-7", path_a);
+    try testing.expectEqualStrings("/tmp/prise-pty-1000-222-7", path_b);
+    try testing.expectEqualStrings("/tmp/prise-pty-1000-111-8", path_c);
+}
+
+test "dump path formatters fit in 64-byte buffer at max values" {
+    const testing = std.testing;
+
+    // Widest plausible values: u32-max uid, i32-max pid, u32-max pty_id.
+    // This pins the buffer-size assumption baked into App.screen_dump_path_buf
+    // and PtyDumpState.path_buf ([64]u8) so a future widening of uid/pid/pty_id
+    // can't silently overflow and be truncated into a colliding path.
+    var session_buf: [64]u8 = undefined;
+    const session_path = try App.formatSessionDumpPath(
+        &session_buf,
+        std.math.maxInt(u32),
+        std.math.maxInt(i32),
+    );
+    try testing.expectEqualStrings(
+        "/tmp/prise-screen-4294967295-2147483647",
+        session_path,
+    );
+
+    var pty_buf: [64]u8 = undefined;
+    const pty_path = try App.formatPtyDumpPath(
+        &pty_buf,
+        std.math.maxInt(u32),
+        std.math.maxInt(i32),
+        std.math.maxInt(u32),
+    );
+    try testing.expectEqualStrings(
+        "/tmp/prise-pty-4294967295-2147483647-4294967295",
+        pty_path,
+    );
 }
