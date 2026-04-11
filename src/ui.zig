@@ -850,10 +850,15 @@ pub const UI = struct {
             lua.raiseErrorStr("call_plug: failed to store callback reference", .{});
         };
 
-        // Callback takes ownership of params; deinit here only on failure
+        // Callback takes unconditional ownership of params: sendCallPlug's
+        // top-of-function `defer params.deinit(...)` runs on BOTH success
+        // and error exits, so we must NOT deinit here on failure — doing
+        // so is a double-free that crashes with `switch on corrupt value`
+        // the next time the tag bits get re-read. We still unref the Lua
+        // registry slot we reserved above (sendCallPlug's errdefer only
+        // clears pending_requests, it does not touch the Lua registry).
         cb(ui.plug_call_ctx, name, method, params, callback_ref) catch |err| {
             lua.unref(ziglua.registry_index, callback_ref);
-            params.deinit(ui.allocator);
             lua.raiseErrorStr("call_plug failed: %s", .{@errorName(err).ptr});
         };
 
@@ -884,8 +889,15 @@ pub const UI = struct {
         else
             msgpack.Value.nil;
 
+        // Callback takes unconditional ownership of params: sendNotifyPlug's
+        // top-of-function `defer params.deinit(...)` runs on BOTH success
+        // and error exits, so we must NOT deinit here on failure — doing
+        // so is a double-free that crashes with `switch on corrupt value`
+        // the next time the tag bits get re-read. Reproducer: send a plug
+        // notify after the server socket has died (e.g. from `prisectl
+        // start-arthack --kill-server`), which trips `sendDirect` and
+        // walks this error path.
         cb(ui.plug_notify_ctx, name, method, params) catch |err| {
-            params.deinit(ui.allocator);
             lua.raiseErrorStr("notify_plug failed: %s", .{@errorName(err).ptr});
         };
 
