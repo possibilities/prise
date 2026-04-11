@@ -82,8 +82,16 @@ pub const UI = struct {
     detach_ctx: *anyopaque = undefined,
     save_callback: ?*const fn (ctx: *anyopaque) void = null,
     save_ctx: *anyopaque = undefined,
-    switch_session_callback: ?*const fn (ctx: *anyopaque, target_session: []const u8) anyerror!void = null,
-    switch_session_ctx: *anyopaque = undefined,
+    /// Called by the switchSession Lua binding to queue a session switch.
+    /// The callback takes ownership of `owned_target` (an allocation in
+    /// ui.allocator) and must not synchronously re-enter Lua — the binding
+    /// is frequently invoked from inside an outer `ui.update` pcall (for
+    /// example, tiling.lua's `pty_exited` handler on the `keep_attached`
+    /// path), and re-entering Lua via `clearState` aborts the interpreter.
+    /// The app-side implementation just stashes the target on a flag that
+    /// is drained from `onPipeRead`, outside any pcall frame.
+    queue_switch_session_callback: ?*const fn (ctx: *anyopaque, owned_target: []const u8) void = null,
+    queue_switch_session_ctx: *anyopaque = undefined,
     get_session_name_callback: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     get_session_name_ctx: *anyopaque = undefined,
     rename_session_callback: ?*const fn (ctx: *anyopaque, old_name: []const u8, new_name: []const u8) anyerror!void = null,
@@ -246,9 +254,13 @@ pub const UI = struct {
         self.save_callback = cb;
     }
 
-    pub fn setSwitchSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, target_session: []const u8) anyerror!void) void {
-        self.switch_session_ctx = ctx;
-        self.switch_session_callback = cb;
+    pub fn setQueueSwitchSessionCallback(
+        self: *UI,
+        ctx: *anyopaque,
+        cb: *const fn (ctx: *anyopaque, owned_target: []const u8) void,
+    ) void {
+        self.queue_switch_session_ctx = ctx;
+        self.queue_switch_session_callback = cb;
     }
 
     pub fn setGetSessionNameCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) ?[]const u8) void {
@@ -687,22 +699,27 @@ pub const UI = struct {
             return 1;
         };
 
-        const target_session = ui.allocator.dupe(u8, target_session_lua) catch {
+        // Dup into ui.allocator — ownership transfers to the queue callback,
+        // which stashes the slice on App.pending_session_switch for later
+        // drain from onPipeRead. We deliberately do NOT synchronously
+        // invoke switchToSession here: this binding is called from inside
+        // the outer `ui.update` pcall in tiling.lua's pty_exited handler,
+        // and switchToSession can re-enter Lua via `clearState`, which
+        // aborts the interpreter in luaD_precall.
+        const owned_target = ui.allocator.dupe(u8, target_session_lua) catch {
             log.warn("switchSession: failed to allocate target session name", .{});
             lua.pushBoolean(false);
             return 1;
         };
-        defer ui.allocator.free(target_session);
 
-        log.info("switchSession: called with target_session='{s}'", .{target_session});
+        log.info("switchSession: queueing switch to '{s}'", .{owned_target});
 
-        if (ui.switch_session_callback) |cb| {
-            cb(ui.switch_session_ctx, target_session) catch |err| {
-                lua.raiseErrorStr("Failed to switch session: %s", .{@errorName(err).ptr});
-            };
+        if (ui.queue_switch_session_callback) |cb| {
+            cb(ui.queue_switch_session_ctx, owned_target);
             lua.pushBoolean(true);
         } else {
-            log.warn("switchSession: no callback registered", .{});
+            log.warn("switchSession: no queue callback registered", .{});
+            ui.allocator.free(owned_target);
             lua.pushBoolean(false);
         }
         return 1;

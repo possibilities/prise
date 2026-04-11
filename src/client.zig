@@ -671,6 +671,13 @@ pub const App = struct {
     /// whose completion we would otherwise be running in.
     pending_force_quit: bool = false,
 
+    /// Set by the switchSession Lua binding when a `prise.switch_session`
+    /// call arrives from inside a ui.update pcall. Drained from onPipeRead
+    /// via switchSessionIfPending — we cannot synchronously re-enter Lua
+    /// (via clearState) from a Zig function called by the outer pcall, or
+    /// Lua's interpreter aborts in luaD_precall. See `keep_attached` path.
+    pending_session_switch: ?[]const u8 = null,
+
     pub const PendingColorQuery = struct {
         pty_id: u32,
         target: ServerAction.ColorQueryTarget.Target,
@@ -808,6 +815,10 @@ pub const App = struct {
         if (self.current_session_name) |name| {
             self.allocator.free(name);
         }
+        if (self.pending_session_switch) |s| {
+            self.allocator.free(s);
+            self.pending_session_switch = null;
+        }
         if (self.hit_regions.len > 0) self.allocator.free(self.hit_regions);
         if (self.split_handles.len > 0) self.allocator.free(self.split_handles);
         self.vx.deinit(self.allocator, self.tty.writer());
@@ -850,6 +861,21 @@ pub const App = struct {
             self.connected = false;
         }
         self.vx.deviceStatusReport(self.tty.writer()) catch {};
+    }
+
+    /// Runs the deferred session switch outside any outer Lua update pcall.
+    /// Called from onPipeRead after the switchSession binding set
+    /// pending_session_switch — we are no longer on a Lua pcall frame, so
+    /// re-entering Lua via clearState is safe.
+    fn switchSessionIfPending(self: *App) void {
+        const target = self.pending_session_switch orelse return;
+        self.pending_session_switch = null;
+        defer self.allocator.free(target);
+        if (self.state.should_quit) return;
+
+        self.switchToSession(target) catch |err| {
+            log.err("switchSessionIfPending: switchToSession failed: {}", .{err});
+        };
     }
 
     pub fn setup(self: *App, loop: *io.Loop) !void {
@@ -1010,13 +1036,20 @@ pub const App = struct {
             }
         }.deleteCb);
 
-        // Register switch_session callback
-        self.ui.setSwitchSessionCallback(self, struct {
-            fn switchCb(ctx: *anyopaque, target_session: []const u8) anyerror!void {
+        // Register switch_session callback. The binding takes ownership of
+        // `owned_target` (allocated in ui.allocator, which is the App
+        // allocator) and stashes it on pending_session_switch. onPipeRead
+        // drains the flag via switchSessionIfPending once we are off the
+        // outer Lua pcall frame. See pending_session_switch comment.
+        self.ui.setQueueSwitchSessionCallback(self, struct {
+            fn queueCb(ctx: *anyopaque, owned_target: []const u8) void {
                 const app_ptr: *App = @ptrCast(@alignCast(ctx));
-                try app_ptr.switchToSession(target_session);
+                if (app_ptr.pending_session_switch) |old| {
+                    app_ptr.allocator.free(old);
+                }
+                app_ptr.pending_session_switch = owned_target;
             }
-        }.switchCb);
+        }.queueCb);
 
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
@@ -1060,8 +1093,11 @@ pub const App = struct {
     fn onPipeRead(l: *io.Loop, completion: io.Completion) anyerror!void {
         const app = completion.userdataCast(@This());
 
-        // Act on any deferred force-quit request from the pty_exited handler.
-        // Safe here because we're on onPipeRead's stack, not recv_task's.
+        // Drain any deferred work that was queued from inside a Lua pcall
+        // or recv_task's callback. Safe here because we're on onPipeRead's
+        // stack, not recv_task's. Ordering matters: a pending session
+        // switch must win over an incidental empty-state force-quit.
+        app.switchSessionIfPending();
         app.forceQuitIfPending();
         if (app.state.should_quit) return;
 
@@ -2323,7 +2359,16 @@ pub const App = struct {
                                 // running on recv_task's completion stack, and cancelling it
                                 // from here corrupts the io.Loop's task state. forceQuitIfPending
                                 // runs from onPipeRead instead, which is a different task.
-                                if (app.surfaces.count() == 0 and !app.state.should_quit) {
+                                //
+                                // Also skip the force-quit path when a session switch has
+                                // already been queued (keep_attached last-pane path): the
+                                // drain in onPipeRead will perform the switch, and queuing
+                                // a quit alongside it would race the client into exit()
+                                // instead of switching.
+                                const no_surfaces = app.surfaces.count() == 0;
+                                const not_quitting = !app.state.should_quit;
+                                const no_pending_switch = app.pending_session_switch == null;
+                                if (no_surfaces and not_quitting and no_pending_switch) {
                                     if (app.autosave_timer) |*task| {
                                         if (app.io_loop) |loop| task.cancel(loop) catch {};
                                         app.autosave_timer = null;
