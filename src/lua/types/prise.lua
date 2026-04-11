@@ -12,6 +12,7 @@
 ---@class SpawnOptions
 ---@field cwd? string Working directory for the new process
 ---@field cmd? string Command to run after shell is ready
+---@field argv? string[] Argv for direct exec, bypassing the login shell. Mutually exclusive with cmd.
 
 ---The prise module provides core functionality for the terminal multiplexer
 ---@class prise

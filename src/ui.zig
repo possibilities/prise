@@ -101,6 +101,9 @@ pub const UI = struct {
         attach: bool,
         cwd: ?[]const u8 = null,
         cmd: ?[]const u8 = null,
+        // argv bypasses the login shell entirely; the server execs these
+        // directly in the PTY child. Mutually exclusive with cmd.
+        argv: ?[]const []const u8 = null,
     };
 
     pub const InitError = struct {
@@ -496,6 +499,35 @@ pub const UI = struct {
 
             _ = lua.getField(1, "cmd");
             if (lua.isString(-1)) opts.cmd = lua.toString(-1) catch null;
+            lua.pop(1);
+
+            // argv is a Lua array of strings; collect into a temporary slice
+            // that lives for the duration of the spawn callback. The strings
+            // themselves remain valid because the source table is still on
+            // the Lua stack at index 1.
+            var argv_storage: ?[][]const u8 = null;
+            defer if (argv_storage) |buf| ui.allocator.free(buf);
+
+            _ = lua.getField(1, "argv");
+            if (lua.typeOf(-1) == .table) {
+                const len = lua.rawLen(-1);
+                if (len > 0) {
+                    const buf = ui.allocator.alloc([]const u8, len) catch {
+                        lua.raiseErrorStr("Failed to allocate argv", .{});
+                    };
+                    argv_storage = buf;
+                    for (0..len) |i| {
+                        _ = lua.getIndex(-1, @intCast(i + 1));
+                        if (lua.typeOf(-1) == .string) {
+                            buf[i] = lua.toString(-1) catch "";
+                        } else {
+                            buf[i] = "";
+                        }
+                        lua.pop(1);
+                    }
+                    opts.argv = buf;
+                }
+            }
             lua.pop(1);
 
             cb(ui.spawn_ctx, opts) catch |err| {

@@ -2472,9 +2472,24 @@ pub const App = struct {
 
         const has_cwd = opts.cwd != null;
         const has_cmd = opts.cmd != null;
-        const num_params: usize = 4 + @as(usize, @intFromBool(has_cwd)) + @as(usize, @intFromBool(has_cmd));
+        const has_argv = opts.argv != null;
+        const num_params: usize = 4 +
+            @as(usize, @intFromBool(has_cwd)) +
+            @as(usize, @intFromBool(has_cmd)) +
+            @as(usize, @intFromBool(has_argv));
         var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, num_params);
         defer self.allocator.free(map_items);
+
+        // Build a msgpack array from argv when present; freed after sending.
+        var argv_values: ?[]msgpack.Value = null;
+        defer if (argv_values) |v| self.allocator.free(v);
+        if (opts.argv) |argv| {
+            const values = try self.allocator.alloc(msgpack.Value, argv.len);
+            for (argv, 0..) |arg, i| {
+                values[i] = .{ .string = arg };
+            }
+            argv_values = values;
+        }
 
         map_items[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = opts.rows } };
         map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = opts.cols } };
@@ -2487,6 +2502,10 @@ pub const App = struct {
         }
         if (opts.cmd) |cmd| {
             map_items[idx] = .{ .key = .{ .string = "cmd" }, .value = .{ .string = cmd } };
+            idx += 1;
+        }
+        if (argv_values) |values| {
+            map_items[idx] = .{ .key = .{ .string = "argv" }, .value = .{ .array = values } };
         }
 
         const params = msgpack.Value{ .map = map_items };

@@ -36,6 +36,10 @@ pub const LIMITS = struct {
     pub const COLOR_QUERY_MAX: usize = 32;
     pub const RESPONSE_QUEUE_MAX: usize = 64;
     pub const COLOR_QUERY_TIMEOUT_MS: i64 = 5000;
+    // Upper bound on argv entries accepted by spawn_pty's direct-exec path.
+    // Plenty of room for realistic program invocations without unbounded
+    // stack buffers.
+    pub const SPAWN_ARGV_MAX: usize = 64;
 };
 
 var signal_write_fd: posix.fd_t = undefined;
@@ -2051,7 +2055,20 @@ const Server = struct {
     /// Timestamp (ms since epoch) when server started - used to detect server restarts
     start_time_ms: i64 = 0,
 
-    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value, macos_option_as_alt: key_encode.OptionAsAlt, cmd: ?[]const u8, session: ?[]const u8, tab: ?[]const u8, title: ?[]const u8 } {
+    const ParsedSpawnPty = struct {
+        size: pty.Winsize,
+        attach: bool,
+        cwd: ?[]const u8,
+        env: ?[]const msgpack.Value,
+        macos_option_as_alt: key_encode.OptionAsAlt,
+        cmd: ?[]const u8,
+        argv: ?[]const msgpack.Value,
+        session: ?[]const u8,
+        tab: ?[]const u8,
+        title: ?[]const u8,
+    };
+
+    fn parseSpawnPtyParams(params: msgpack.Value) ParsedSpawnPty {
         var rows: u16 = 24;
         var cols: u16 = 80;
         var attach: bool = false;
@@ -2059,6 +2076,7 @@ const Server = struct {
         var env: ?[]const msgpack.Value = null;
         var macos_option_as_alt: key_encode.OptionAsAlt = .false;
         var cmd: ?[]const u8 = null;
+        var argv: ?[]const msgpack.Value = null;
         var session: ?[]const u8 = null;
         var tab: ?[]const u8 = null;
         var title: ?[]const u8 = null;
@@ -2080,6 +2098,8 @@ const Server = struct {
                     macos_option_as_alt = parseMacosOptionAsAlt(kv.value);
                 } else if (std.mem.eql(u8, kv.key.string, "cmd") and kv.value == .string) {
                     cmd = kv.value.string;
+                } else if (std.mem.eql(u8, kv.key.string, "argv") and kv.value == .array) {
+                    argv = kv.value.array;
                 } else if (std.mem.eql(u8, kv.key.string, "session") and kv.value == .string) {
                     session = kv.value.string;
                 } else if (std.mem.eql(u8, kv.key.string, "tab") and kv.value == .string) {
@@ -2102,6 +2122,7 @@ const Server = struct {
             .env = env,
             .macos_option_as_alt = macos_option_as_alt,
             .cmd = cmd,
+            .argv = argv,
             .session = session,
             .tab = tab,
             .title = title,
@@ -2243,7 +2264,25 @@ const Server = struct {
             }
         }
 
-        const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items), cwd);
+        // argv, when present, bypasses the login shell entirely and execs
+        // directly in the PTY child. This eliminates the visible shell-prompt
+        // flash that occurs with the cmd-on-first-output path, which must
+        // first spawn the shell, source rc files, and paint a prompt before
+        // the cmd bytes can be written. cmd and argv are mutually exclusive
+        // from the caller's perspective; argv takes precedence here.
+        var argv_buf: [LIMITS.SPAWN_ARGV_MAX][]const u8 = undefined;
+        var argv_slice: []const []const u8 = &.{shell};
+        if (parsed.argv) |raw_argv| {
+            if (raw_argv.len == 0) return error.InvalidParams;
+            if (raw_argv.len > LIMITS.SPAWN_ARGV_MAX) return error.InvalidParams;
+            for (raw_argv, 0..) |v, i| {
+                if (v != .string) return error.InvalidParams;
+                argv_buf[i] = v.string;
+            }
+            argv_slice = argv_buf[0..raw_argv.len];
+        }
+
+        const process = try pty.Process.spawn(self.allocator, parsed.size, argv_slice, @ptrCast(env_list.items), cwd);
 
         const pty_id = self.next_pty_id;
         self.next_pty_id += 1;
@@ -2251,8 +2290,12 @@ const Server = struct {
         const pty_instance = try Pty.init(self.allocator, pty_id, process, parsed.size);
         pty_instance.server_ptr = self;
 
-        if (parsed.cmd) |cmd| {
-            pty_instance.cmd = try self.allocator.dupe(u8, cmd);
+        // argv-mode spawns never use the type-on-first-output cmd mechanism
+        // since the target program is already running as the PTY child.
+        if (parsed.argv == null) {
+            if (parsed.cmd) |cmd| {
+                pty_instance.cmd = try self.allocator.dupe(u8, cmd);
+            }
         }
 
         try self.ptys.put(pty_id, pty_instance);
@@ -2276,19 +2319,23 @@ const Server = struct {
             try self.sendRedraw(self.loop, pty_instance, msg, client);
         }
 
-        // Write initial command to PTY if specified
-        if (parsed.cmd) |cmd| {
-            log.info("Writing initial command to PTY {}: {s}", .{ pty_id, cmd });
-            const cmd_with_newline = try std.fmt.allocPrint(self.allocator, "{s}\n", .{cmd});
-            defer self.allocator.free(cmd_with_newline);
+        // Write initial command to PTY if specified. Skipped in argv mode:
+        // the target program is already running as the PTY child, so writing
+        // a shell command would be fed to it as stdin instead of executed.
+        if (parsed.argv == null) {
+            if (parsed.cmd) |cmd| {
+                log.info("Writing initial command to PTY {}: {s}", .{ pty_id, cmd });
+                const cmd_with_newline = try std.fmt.allocPrint(self.allocator, "{s}\n", .{cmd});
+                defer self.allocator.free(cmd_with_newline);
 
-            var total_written: usize = 0;
-            while (total_written < cmd_with_newline.len) {
-                const written = posix.write(process.master, cmd_with_newline[total_written..]) catch |err| {
-                    log.warn("Failed to write initial command to PTY {}: {}", .{ pty_id, err });
-                    break;
-                };
-                total_written += written;
+                var total_written: usize = 0;
+                while (total_written < cmd_with_newline.len) {
+                    const written = posix.write(process.master, cmd_with_newline[total_written..]) catch |err| {
+                        log.warn("Failed to write initial command to PTY {}: {}", .{ pty_id, err });
+                        break;
+                    };
+                    total_written += written;
+                }
             }
         }
 
@@ -3575,6 +3622,25 @@ test "parseSpawnPtyParams" {
 
     // Without cmd param - null
     try testing.expectEqual(@as(?[]const u8, null), p1.cmd);
+
+    // With argv param - direct exec path
+    var argv_values = [_]msgpack.Value{
+        .{ .string = "prisectl-ui" },
+        .{ .string = "plug-status" },
+    };
+    var params_with_argv = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 30 } },
+        .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 120 } },
+        .{ .key = .{ .string = "argv" }, .value = .{ .array = &argv_values } },
+    };
+    const p6 = Server.parseSpawnPtyParams(.{ .map = &params_with_argv });
+    try testing.expect(p6.argv != null);
+    try testing.expectEqual(@as(usize, 2), p6.argv.?.len);
+    try testing.expectEqualStrings("prisectl-ui", p6.argv.?[0].string);
+    try testing.expectEqualStrings("plug-status", p6.argv.?[1].string);
+
+    // Without argv param - null
+    try testing.expectEqual(@as(?[]const msgpack.Value, null), p1.argv);
 }
 
 test "prepareSpawnEnv" {
