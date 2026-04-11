@@ -671,6 +671,12 @@ pub const App = struct {
     /// whose completion we would otherwise be running in.
     pending_force_quit: bool = false,
 
+    /// Set by the .detached handler after surfaces are drained. Acted on
+    /// outside any task callback for the same reason as pending_force_quit —
+    /// the handler runs on recv_task's completion stack, so cancelling
+    /// recv_task from there corrupts the io.Loop's task state. See PR #112.
+    pending_detach: bool = false,
+
     pub const PendingColorQuery = struct {
         pty_id: u32,
         target: ServerAction.ColorQueryTarget.Target,
@@ -836,6 +842,51 @@ pub const App = struct {
         if (self.render_timer) |*task| {
             if (self.io_loop) |loop| task.cancel(loop) catch {};
             self.render_timer = null;
+        }
+        if (self.pipe_read_task) |*task| {
+            if (self.io_loop) |loop| task.cancel(loop) catch {};
+            self.pipe_read_task = null;
+        }
+        if (self.send_task) |*task| {
+            if (self.io_loop) |loop| task.cancel(loop) catch {};
+            self.send_task = null;
+        }
+        if (self.connected) {
+            posix.close(self.fd);
+            self.connected = false;
+        }
+        self.vx.deviceStatusReport(self.tty.writer()) catch {};
+    }
+
+    /// Runs the deferred detach cleanup outside any task callback.
+    ///
+    /// Called from onPipeRead after the .detached handler set pending_detach
+    /// — we're no longer on recv_task's completion stack, so cancelling it
+    /// is safe. Cancelling recv_task from inside onRecv corrupts the io.Loop's
+    /// task state and produces `panic: switch on corrupt value`. See PR #112.
+    ///
+    /// Kept parallel to forceQuitIfPending rather than shared: the two paths
+    /// have different telemetry (force-quit vs detach-complete) and the detach
+    /// path has no up-front autosave_timer cleanup, so it must cancel it here.
+    fn detachIfPending(self: *App) void {
+        if (!self.pending_detach) return;
+        self.pending_detach = false;
+        if (self.state.should_quit) return;
+
+        log.info("detachIfPending: detach complete — quitting", .{});
+        self.state.should_quit = true;
+
+        if (self.recv_task) |*task| {
+            if (self.io_loop) |loop| task.cancel(loop) catch {};
+            self.recv_task = null;
+        }
+        if (self.render_timer) |*task| {
+            if (self.io_loop) |loop| task.cancel(loop) catch {};
+            self.render_timer = null;
+        }
+        if (self.autosave_timer) |*task| {
+            if (self.io_loop) |loop| task.cancel(loop) catch {};
+            self.autosave_timer = null;
         }
         if (self.pipe_read_task) |*task| {
             if (self.io_loop) |loop| task.cancel(loop) catch {};
@@ -1060,9 +1111,12 @@ pub const App = struct {
     fn onPipeRead(l: *io.Loop, completion: io.Completion) anyerror!void {
         const app = completion.userdataCast(@This());
 
-        // Act on any deferred force-quit request from the pty_exited handler.
-        // Safe here because we're on onPipeRead's stack, not recv_task's.
+        // Act on any deferred force-quit or detach request from the event
+        // handlers. Safe here because we're on onPipeRead's stack, not
+        // recv_task's. See PR #112 and detachIfPending for the re-entrancy
+        // hazard these flags exist to avoid.
         app.forceQuitIfPending();
+        app.detachIfPending();
         if (app.state.should_quit) return;
 
         switch (completion.result) {
@@ -2341,7 +2395,9 @@ pub const App = struct {
                             },
                             .detached => {
                                 log.info("Detach complete, cleaning up {} surfaces", .{app.surfaces.count()});
-                                // Clean up all surfaces before closing
+                                // Clean up all surfaces before closing. Surface
+                                // teardown touches no io.Loop task state, so it
+                                // is safe to run from onRecv's stack.
                                 var surface_it = app.surfaces.valueIterator();
                                 while (surface_it.next()) |surface| {
                                     log.info("Cleaning up surface", .{});
@@ -2351,40 +2407,13 @@ pub const App = struct {
                                 log.info("Cleared surfaces", .{});
                                 app.surfaces.clearRetainingCapacity();
 
-                                app.state.should_quit = true;
-
-                                // Cancel pending tasks before closing fd
-                                if (app.recv_task) |*task| {
-                                    task.cancel(l) catch {};
-                                    app.recv_task = null;
-                                }
-                                if (app.render_timer) |*task| {
-                                    task.cancel(l) catch {};
-                                    app.render_timer = null;
-                                }
-                                if (app.autosave_timer) |*task| {
-                                    task.cancel(l) catch {};
-                                    app.autosave_timer = null;
-                                }
-                                if (app.pipe_read_task) |*task| {
-                                    task.cancel(l) catch {};
-                                    app.pipe_read_task = null;
-                                }
-                                if (app.send_task) |*task| {
-                                    task.cancel(l) catch {};
-                                    app.send_task = null;
-                                }
-
-                                log.info("Closing connection", .{});
-                                if (app.connected) {
-                                    posix.close(app.fd);
-                                    app.connected = false;
-                                }
-                                // Wake up TTY thread so it can exit
-                                log.info("Waking TTY thread", .{});
-                                app.vx.deviceStatusReport(app.tty.writer()) catch {};
-                                log.info("Returning from detach handler", .{});
-                                return;
+                                // Defer task cancellation + fd close out of onRecv
+                                // — we're on recv_task's completion stack, and
+                                // cancelling it from here corrupts the io.Loop's
+                                // task state. detachIfPending runs from onPipeRead
+                                // instead, which is a different task. See PR #112.
+                                log.info("Detach complete — deferring cleanup to detachIfPending", .{});
+                                app.pending_detach = true;
                             },
                             .color_query => |query| {
                                 try app.handleColorQuery(query);
