@@ -28,6 +28,32 @@ local utils = require("utils")
 ---@field pane Pane The actual pane
 ---@field visible boolean Whether the floating pane is visible
 
+---@class TabOverlay
+---@field pane Pane The pane with PTY
+---@field visible boolean Whether currently shown
+
+---@class OverlayConfig
+---@field key string Keybind to toggle
+---@field cmd? string Command to run. By default, wrapped in `exec` so the
+---                    overlay auto-dismisses when the command exits. Must be
+---                    an external binary — shell builtins and compound
+---                    statements need `shell = true` instead.
+---@field shell? boolean If true, spawn a persistent login shell with cmd
+---                       typed into it. The overlay stays up after cmd
+---                       exits until the shell itself exits. Default false.
+---@field width? number Width in columns (default 100)
+---@field height? number Height in rows (default 30)
+---@field anchor? string Position anchor (default "center")
+---@field x? number Explicit x offset
+---@field y? number Explicit y offset
+---@field border? string Border style
+---@field border_color? string Border color
+
+---@class OverlayState
+---@field width number Current width (may differ from config after resize)
+---@field height number Current height
+---@field pending boolean Waiting for PTY to attach
+
 ---@class PaletteRegion
 ---@field start_y number
 ---@field end_y number
@@ -2605,6 +2631,50 @@ local open_rename
 ---Forward declaration for open_session_picker
 ---@type fun()
 local open_session_picker
+
+---Toggle a named overlay: spawn if new, show/hide if existing
+---@param name string Overlay name (e.g. "floating", "lazygit")
+toggle_overlay = function(name)
+    local cfg = config.overlays[name]
+    local ost = state.overlay_state[name]
+    if not cfg or not ost then
+        return
+    end
+
+    local tab = get_active_tab()
+    if not tab then
+        return
+    end
+
+    tab.overlays = tab.overlays or {}
+
+    if not tab.overlays[name] then
+        -- No overlay pane exists yet — spawn one (skip if already pending)
+        if ost.pending then
+            return
+        end
+        ost.pending = true
+        local pty = get_focused_pty()
+        local spawn_cmd = cfg.cmd
+        if spawn_cmd and not cfg.shell then
+            spawn_cmd = "exec " .. spawn_cmd
+        end
+        prise.spawn({ cwd = pty and pty:cwd(), cmd = spawn_cmd })
+    else
+        -- Toggle visibility
+        local overlay = tab.overlays[name]
+        overlay.visible = not overlay.visible
+        if overlay.visible then
+            state.active_overlay_name = name
+        else
+            -- Clear active if we just hid it
+            if state.active_overlay_name == name then
+                state.active_overlay_name = nil
+            end
+        end
+        prise.request_frame()
+    end
+end
 
 ---Command palette commands
 ---@type Command[]

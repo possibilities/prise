@@ -1635,9 +1635,6 @@ end
 -- Cleanup: leave renderer config nil + warn latch reset for any tests that follow.
 t.set_tab_bar_render(nil)
 t.reset_tab_bar_render_warned()
--- Cleanup: leave renderer config nil + warn latch reset for any tests that follow.
-t.set_tab_bar_render(nil)
-t.reset_tab_bar_render_warned()
 
 -- === serialize_node ===
 
@@ -1676,3 +1673,174 @@ assert(live_serialized ~= nil, "serialize_node live: returns non-nil")
 assert(live_serialized.type == "pane", "serialize_node live: type is pane")
 assert(live_serialized.pty_id == 7, "serialize_node live: pty_id from pty:id()")
 assert(live_serialized.id == 7, "serialize_node live: id from node.id")
+
+-- === Overlay System ===
+
+local mock_tracked_pty = helpers.mock_tracked_pty
+
+-- Helper: set up a tab with overlay config
+---@param overlay_configs table<string, OverlayConfig>
+---@param root? Pane|Split
+local function setup_overlay_test(overlay_configs, root)
+    root = root or mock_pane(1)
+    -- Clear overlay state from prior tests
+    local pre_st = t.get_state()
+    pre_st.overlay_state = {}
+    pre_st.active_overlay_name = nil
+    pre_st.overlay_resize_mode = false
+    -- Configure overlays via setup
+    tiling.setup({ overlays = overlay_configs })
+    -- Set up a tab
+    t.set_state({
+        tabs = { { id = 1, root = root, last_focused_id = 1 } },
+        active_tab = 1,
+        focused_id = 1,
+    })
+    -- Clear all pending flags (in case prior tests left residue)
+    local st = t.get_state()
+    for _, ost in pairs(st.overlay_state) do
+        ost.pending = false
+    end
+end
+
+-- Test: overlay config initialization — setup creates overlay_state entries
+setup_overlay_test({
+    floating = { key = "<leader>f", width = 100, height = 30 },
+    lazygit = { key = "<leader>g", cmd = "lazygit", width = 140, height = 40 },
+})
+local st = t.get_state()
+assert(st.overlay_state.floating ~= nil, "overlay: floating state created")
+assert(st.overlay_state.floating.width == 100, "overlay: floating width from config")
+assert(st.overlay_state.floating.height == 30, "overlay: floating height from config")
+assert(st.overlay_state.floating.pending == false, "overlay: floating not pending")
+assert(st.overlay_state.lazygit ~= nil, "overlay: lazygit state created")
+assert(st.overlay_state.lazygit.width == 140, "overlay: lazygit width from config")
+assert(st.overlay_state.lazygit.height == 40, "overlay: lazygit height from config")
+
+-- Test: overlay defaults — width/height default to 100/30
+setup_overlay_test({
+    minimal = { key = "<leader>m" },
+})
+assert(st.overlay_state.minimal ~= nil, "overlay defaults: state created")
+-- Re-read state after setup
+st = t.get_state()
+assert(st.overlay_state.minimal.width == 100, "overlay defaults: width is 100")
+assert(st.overlay_state.minimal.height == 30, "overlay defaults: height is 30")
+
+-- Test: toggle_overlay spawns when no overlay pane exists
+local spawn_calls = {}
+local prise_mock = package.loaded["prise"]
+prise_mock.spawn = function(opts)
+    table.insert(spawn_calls, opts)
+end
+setup_overlay_test({
+    test_overlay = { key = "<leader>t", cmd = "htop", width = 80, height = 20 },
+})
+spawn_calls = {}
+t.toggle_overlay("test_overlay")
+st = t.get_state()
+assert(st.overlay_state.test_overlay.pending == true, "toggle spawn: sets pending")
+assert(#spawn_calls == 1, "toggle spawn: calls prise.spawn")
+assert(spawn_calls[1].cmd == "exec htop", "toggle spawn: wraps cmd in exec by default")
+
+-- Test: toggle_overlay with shell = true passes cmd through unchanged
+setup_overlay_test({
+    shelled = { key = "<leader>w", cmd = "lazygit", shell = true, width = 80, height = 20 },
+})
+spawn_calls = {}
+t.toggle_overlay("shelled")
+assert(#spawn_calls == 1, "toggle shell opt-in: calls prise.spawn")
+assert(spawn_calls[1].cmd == "lazygit", "toggle shell opt-in: cmd not wrapped when shell = true")
+
+-- Test: toggle_overlay with nil cmd is unaffected by exec wrapping
+setup_overlay_test({
+    bare = { key = "<leader>b", width = 80, height = 20 },
+})
+spawn_calls = {}
+t.toggle_overlay("bare")
+assert(#spawn_calls == 1, "toggle nil cmd: calls prise.spawn")
+assert(spawn_calls[1].cmd == nil, "toggle nil cmd: cmd stays nil (no exec prefix)")
+
+-- Test: toggle_overlay toggles visibility when pane exists
+setup_overlay_test({
+    test_vis = { key = "<leader>v", width = 80, height = 20 },
+})
+local tab = st.tabs[1]
+tab.overlays = {
+    test_vis = { pane = mock_pane(42), visible = true },
+}
+t.toggle_overlay("test_vis")
+assert(tab.overlays.test_vis.visible == false, "toggle vis: hides visible overlay")
+t.toggle_overlay("test_vis")
+assert(tab.overlays.test_vis.visible == true, "toggle vis: shows hidden overlay")
+
+-- Test: active_overlay_name tracks last toggled visible
+setup_overlay_test({
+    ov_a = { key = "<leader>a", width = 80, height = 20 },
+    ov_b = { key = "<leader>b", width = 80, height = 20 },
+})
+st = t.get_state()
+tab = st.tabs[1]
+tab.overlays = {
+    ov_a = { pane = mock_pane(10), visible = false },
+    ov_b = { pane = mock_pane(20), visible = false },
+}
+t.toggle_overlay("ov_a")
+assert(st.active_overlay_name == "ov_a", "active overlay: set on toggle visible")
+t.toggle_overlay("ov_b")
+assert(st.active_overlay_name == "ov_b", "active overlay: updated to latest")
+t.toggle_overlay("ov_b")
+assert(st.active_overlay_name == nil, "active overlay: cleared on toggle hidden")
+
+-- Test: get_active_overlay returns active visible overlay
+setup_overlay_test({
+    ov_x = { key = "<leader>x", width = 80, height = 20 },
+})
+st = t.get_state()
+tab = st.tabs[1]
+local pty_x = mock_tracked_pty(50)
+tab.overlays = {
+    ov_x = { pane = { type = "pane", id = 50, pty = pty_x }, visible = true },
+}
+st.active_overlay_name = "ov_x"
+local name, overlay = t.get_active_overlay()
+assert(name == "ov_x", "get_active_overlay: returns active name")
+assert(overlay ~= nil, "get_active_overlay: returns overlay")
+assert(overlay.pane.id == 50, "get_active_overlay: correct pane")
+
+-- Test: get_active_overlay returns nil when no overlays visible
+tab.overlays.ov_x.visible = false
+st.active_overlay_name = nil
+name, overlay = t.get_active_overlay()
+assert(name == nil, "get_active_overlay: nil when none visible")
+assert(overlay == nil, "get_active_overlay: nil overlay when none visible")
+
+-- Test: pty_attach assigns to pending overlay
+setup_overlay_test({
+    attach_test = { key = "<leader>a", width = 80, height = 20 },
+})
+st = t.get_state()
+st.overlay_state.attach_test.pending = true
+local attach_pty = helpers.mock_pty(99)
+tiling.update({ type = "pty_attach", data = { pty = attach_pty } })
+tab = st.tabs[1]
+assert(tab.overlays ~= nil, "pty_attach overlay: overlays table created")
+assert(tab.overlays.attach_test ~= nil, "pty_attach overlay: overlay assigned")
+assert(tab.overlays.attach_test.pane.id == 99, "pty_attach overlay: correct pane id")
+assert(tab.overlays.attach_test.visible == true, "pty_attach overlay: starts visible")
+assert(st.overlay_state.attach_test.pending == false, "pty_attach overlay: pending cleared")
+assert(st.active_overlay_name == "attach_test", "pty_attach overlay: becomes active")
+
+-- Test: pty_exited cleans up overlay
+setup_overlay_test({
+    exit_test = { key = "<leader>e", width = 80, height = 20 },
+})
+st = t.get_state()
+tab = st.tabs[1]
+tab.overlays = {
+    exit_test = { pane = mock_pane(77), visible = true },
+}
+st.active_overlay_name = "exit_test"
+tiling.update({ type = "pty_exited", data = { id = 77 } })
+assert(tab.overlays.exit_test == nil, "pty_exited overlay: overlay removed")
+assert(st.active_overlay_name == nil, "pty_exited overlay: active cleared")
