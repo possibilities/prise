@@ -1683,11 +1683,15 @@ local mock_tracked_pty = helpers.mock_tracked_pty
 ---@param root? Pane|Split
 local function setup_overlay_test(overlay_configs, root)
     root = root or mock_pane(1)
-    -- Clear overlay state from prior tests
+    -- Clear overlay state AND config from prior tests. tiling.setup merges
+    -- into config.overlays rather than replacing it, so without resetting
+    -- config here, a malformed-input rejection test would leave a bad entry
+    -- behind that breaks the next test's setup pass.
     local pre_st = t.get_state()
     pre_st.overlay_state = {}
     pre_st.active_overlay_name = nil
     pre_st.overlay_resize_mode = false
+    t.reset_config_overlays()
     -- Configure overlays via setup
     tiling.setup({ overlays = overlay_configs })
     -- Set up a tab
@@ -1717,15 +1721,129 @@ assert(st.overlay_state.lazygit ~= nil, "overlay: lazygit state created")
 assert(st.overlay_state.lazygit.width == 140, "overlay: lazygit width from config")
 assert(st.overlay_state.lazygit.height == 40, "overlay: lazygit height from config")
 
--- Test: overlay defaults — width/height default to 100/30
+-- Test: overlay defaults — width/height default to "60%" / "70%" (pct-mode)
 setup_overlay_test({
     minimal = { key = "<leader>m" },
 })
-assert(st.overlay_state.minimal ~= nil, "overlay defaults: state created")
--- Re-read state after setup
 st = t.get_state()
-assert(st.overlay_state.minimal.width == 100, "overlay defaults: width is 100")
-assert(st.overlay_state.minimal.height == 30, "overlay defaults: height is 30")
+assert(st.overlay_state.minimal ~= nil, "overlay defaults: state created")
+assert(st.overlay_state.minimal.width_pct == 60, "overlay defaults: width_pct is 60")
+assert(st.overlay_state.minimal.height_pct == 70, "overlay defaults: height_pct is 70")
+-- Resolved cells come from the seed screen dims (80x24) and the MIN clamps.
+-- 60% of 80 cols = 48 (above FLOATING_MIN_WIDTH = 40).
+-- 70% of 24 rows = 16 (above FLOATING_MIN_HEIGHT = 10).
+assert(st.overlay_state.minimal.width == 48, "overlay defaults: width resolves to 48 cells")
+assert(st.overlay_state.minimal.height == 16, "overlay defaults: height resolves to 16 cells")
+
+-- Test: percentage strings parse into width_pct / height_pct
+setup_overlay_test({
+    pct = { key = "<leader>p", width = "80%", height = "50%" },
+})
+st = t.get_state()
+assert(st.overlay_state.pct.width_pct == 80, "overlay pct: width_pct parsed")
+assert(st.overlay_state.pct.height_pct == 50, "overlay pct: height_pct parsed")
+
+-- Test: malformed percentage strings raise from setup
+local ok_garbage = pcall(function()
+    setup_overlay_test({ bad = { key = "<leader>z", width = "abc" } })
+end)
+assert(not ok_garbage, "overlay pct: non-numeric string rejected")
+local ok_no_pct = pcall(function()
+    setup_overlay_test({ bad = { key = "<leader>z", width = "50" } })
+end)
+assert(not ok_no_pct, "overlay pct: bare number string (no percent sign) rejected")
+local ok_out_of_range = pcall(function()
+    setup_overlay_test({ bad = { key = "<leader>z", width = "200%" } })
+end)
+assert(not ok_out_of_range, "overlay pct: percentage outside [10, 100] rejected")
+
+-- Test: winsize event re-resolves percent-mode overlays immediately
+setup_overlay_test({
+    tracker = { key = "<leader>y", width = "50%", height = "50%" },
+})
+st = t.get_state()
+st.screen_cols = 100
+st.screen_rows = 30
+tiling.update({ type = "winsize", data = { cols = 200, rows = 60 } })
+st = t.get_state()
+-- 50% of 200 = 100 (clamped by FLOATING_MAX_WIDTH = 200, no change)
+-- 50% of 60 = 30 (clamped by FLOATING_MAX_HEIGHT = 50, no change)
+assert(st.overlay_state.tracker.width == 100, "overlay winsize: width resolves to 100 cells")
+assert(st.overlay_state.tracker.height == 30, "overlay winsize: height resolves to 30 cells")
+assert(st.overlay_state.tracker.width_pct == 50, "overlay winsize: width_pct preserved")
+
+-- Test: percent-mode clamped by absolute MAX bounds
+setup_overlay_test({
+    huge = { key = "<leader>H", width = "100%", height = "100%" },
+})
+st = t.get_state()
+st.screen_cols = 400
+st.screen_rows = 120
+tiling.update({ type = "winsize", data = { cols = 400, rows = 120 } })
+st = t.get_state()
+assert(st.overlay_state.huge.width == 200, "overlay pct clamp: width capped at FLOATING_MAX_WIDTH")
+assert(st.overlay_state.huge.height == 50, "overlay pct clamp: height capped at FLOATING_MAX_HEIGHT")
+
+-- Test: floating_increase_pct steps percentages and re-resolves
+setup_overlay_test({
+    step = { key = "<leader>S", width = "50%", height = "50%" },
+})
+st = t.get_state()
+st.screen_cols = 100
+st.screen_rows = 40
+st.active_overlay_name = "step"
+t.action_handlers.floating_increase_pct()
+st = t.get_state()
+assert(st.overlay_state.step.width_pct == 55, "floating_increase_pct: width_pct steps by 5")
+assert(st.overlay_state.step.height_pct == 55, "floating_increase_pct: height_pct steps by 5")
+assert(st.overlay_state.step.width == 55, "floating_increase_pct: width resolved against cols=100")
+assert(st.overlay_state.step.height == 22, "floating_increase_pct: height resolved against rows=40")
+t.action_handlers.floating_decrease_pct()
+st = t.get_state()
+assert(st.overlay_state.step.width_pct == 50, "floating_decrease_pct: width_pct steps back")
+assert(st.overlay_state.step.height_pct == 50, "floating_decrease_pct: height_pct steps back")
+
+-- Test: floating_increase_size drops pct tracking (cell-mode takeover)
+setup_overlay_test({
+    cell = { key = "<leader>C", width = "50%", height = "50%" },
+})
+st = t.get_state()
+st.active_overlay_name = "cell"
+local prev_width = st.overlay_state.cell.width
+t.action_handlers.floating_increase_size()
+st = t.get_state()
+assert(st.overlay_state.cell.width_pct == nil, "floating_increase_size: clears width_pct")
+assert(st.overlay_state.cell.height_pct == nil, "floating_increase_size: clears height_pct")
+assert(st.overlay_state.cell.width == prev_width + 5, "floating_increase_size: +5 cells")
+
+-- Test: floating_increase_pct upconverts a cell-mode overlay to percent-mode
+setup_overlay_test({
+    upconv = { key = "<leader>U", width = 100, height = 20 },
+})
+st = t.get_state()
+st.screen_cols = 200
+st.screen_rows = 40
+st.active_overlay_name = "upconv"
+-- Before: width = 100 cells on 200-col screen = 50%, step to 55%.
+t.action_handlers.floating_increase_pct()
+st = t.get_state()
+assert(st.overlay_state.upconv.width_pct == 55, "upconvert: width_pct computed from cells and stepped")
+assert(st.overlay_state.upconv.height_pct == 55, "upconvert: height_pct computed from cells and stepped")
+
+-- Test: persistence round-trips width_pct / height_pct
+setup_overlay_test({
+    saved = { key = "<leader>V", width = "60%", height = "70%" },
+})
+local exported = tiling.get_state()
+local found = nil
+for name, settings in pairs(exported.overlay_settings) do
+    if name == "saved" then
+        found = settings
+    end
+end
+assert(found ~= nil, "persistence: saved settings exist")
+assert(found.width_pct == 60, "persistence: width_pct serialized")
+assert(found.height_pct == 70, "persistence: height_pct serialized")
 
 -- Test: toggle_overlay spawns when no overlay pane exists
 local spawn_calls = {}
@@ -1783,7 +1901,7 @@ assert(spawn_calls[1].argv[2] == "plug-status", "toggle argv: argv[2] preserved"
 setup_overlay_test({
     test_vis = { key = "<leader>v", width = 80, height = 20 },
 })
-local tab = st.tabs[1]
+tab = st.tabs[1]
 tab.overlays = {
     test_vis = { pane = mock_pane(42), visible = true },
 }

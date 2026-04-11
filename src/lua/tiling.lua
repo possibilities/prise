@@ -44,8 +44,10 @@ local utils = require("utils")
 ---@field shell? boolean If true, spawn a persistent login shell with cmd
 ---                       typed into it. The overlay stays up after cmd
 ---                       exits until the shell itself exits. Default false.
----@field width? number Width in columns (default 100)
----@field height? number Height in rows (default 30)
+---@field width? number|string Width in columns, or a percentage string like
+---                              "60%" that tracks `screen_cols`. Default "60%".
+---@field height? number|string Height in rows, or a percentage string like
+---                              "70%" that tracks `screen_rows`. Default "70%".
 ---@field anchor? string Position anchor (default "center")
 ---@field x? number Explicit x offset
 ---@field y? number Explicit y offset
@@ -53,8 +55,10 @@ local utils = require("utils")
 ---@field border_color? string Border color
 
 ---@class OverlayState
----@field width number Current width (may differ from config after resize)
----@field height number Current height
+---@field width number Current resolved width in columns
+---@field height number Current resolved height in rows
+---@field width_pct? number If set, width is a percentage (10-100) of screen_cols
+---@field height_pct? number If set, height is a percentage (10-100) of screen_rows
 ---@field pending boolean Waiting for PTY to attach
 
 ---@class PaletteRegion
@@ -337,8 +341,10 @@ local POWERLINE_SYMBOLS = {
 ---@field unfocused_color? string Hex color for unfocused borders (default: "#585b70")
 
 ---@class PriseFloatingConfig
----@field width? number Width in columns (default: 100)
----@field height? number Height in rows (default: 30)
+---@field width? number|string Width in columns, or a percentage string like
+---                              "60%" that tracks `screen_cols`. Default "60%".
+---@field height? number|string Height in rows, or a percentage string like
+---                              "70%" that tracks `screen_rows`. Default "70%".
 
 ---@class PriseConfigOptions
 ---@field theme? PriseThemeOptions Color theme options
@@ -408,8 +414,8 @@ local config = {
         format_title = nil, -- Use titles as-is
     },
     floating = {
-        width = 100,
-        height = 30,
+        width = "60%",
+        height = "70%",
     },
     leader = "<D-k>",
     keybinds = {
@@ -450,6 +456,8 @@ local config = {
         ["<leader>f"] = "floating_toggle",
         ["<leader>+"] = "floating_increase_size",
         ["<leader>-"] = "floating_decrease_size",
+        ["<leader>)"] = "floating_increase_pct",
+        ["<leader>("] = "floating_decrease_pct",
         ["<leader>o"] = "layout_picker",
     },
     macos_option_as_alt = "false",
@@ -624,6 +632,18 @@ local M = {}
 ---@type table<string, fun()>
 local action_handlers
 
+---Forward declaration for toggle_overlay (defined with action_handlers)
+---@type fun(name: string)
+local toggle_overlay
+
+---Forward declaration for parse_overlay_size (defined near FLOATING_* constants)
+---@type fun(spec: any, axis: "width"|"height", overlay_name: string): number?, number?
+local parse_overlay_size
+
+---Forward declaration for resolve_overlay_size (defined near FLOATING_* constants)
+---@type fun(ost: OverlayState, screen_cols: number, screen_rows: number)
+local resolve_overlay_size
+
 ---Initialize keybinds by compiling the trie
 local function init_keybinds()
     if state.keybind_matcher then
@@ -638,9 +658,49 @@ function M.setup(opts)
     if opts then
         merge_config(config, opts)
     end
-    -- Apply floating pane config to state
-    state.floating.width = config.floating.width
-    state.floating.height = config.floating.height
+
+    -- Backwards compat: translate config.floating into config.overlays.floating
+    if not config.overlays.floating then
+        config.overlays.floating = {
+            key = "<leader>f",
+            width = config.floating.width,
+            height = config.floating.height,
+        }
+    end
+
+    -- Initialize overlay_state for each configured overlay.
+    -- Sizes can be absolute cells (number) or percentages ("60%"). Percent-mode
+    -- overlays are re-resolved against screen_cols/rows on every frame and
+    -- winsize event, so they track terminal size.
+    for name, cfg in pairs(config.overlays) do
+        if not state.overlay_state[name] then
+            local width_spec = cfg.width or "60%"
+            local height_spec = cfg.height or "70%"
+            local width_cells, width_pct = parse_overlay_size(width_spec, "width", name)
+            local height_cells, height_pct = parse_overlay_size(height_spec, "height", name)
+            local ost = {
+                width = width_cells or 0,
+                height = height_cells or 0,
+                width_pct = width_pct,
+                height_pct = height_pct,
+                pending = false,
+            }
+            -- Seed resolved cell values for pct-mode entries so downstream
+            -- readers always see a valid number, even before the first frame.
+            resolve_overlay_size(ost, state.screen_cols, state.screen_rows)
+            state.overlay_state[name] = ost
+        end
+    end
+
+    -- Auto-register keybinds for overlays
+    for name, cfg in pairs(config.overlays) do
+        if cfg.key then
+            config.keybinds[cfg.key] = function()
+                toggle_overlay(name)
+            end
+        end
+    end
+
     -- Mark keybinds for re-initialization on next key event
     -- (lazy init because UI pointer may not be available during config loading)
     state.keybind_matcher = nil
@@ -682,6 +742,73 @@ local FLOATING_MIN_HEIGHT = 10
 local FLOATING_MAX_HEIGHT = 50
 local FLOATING_WIDTH_STEP = 5
 local FLOATING_HEIGHT_STEP = 2
+
+-- Percent-mode bounds and step for overlays sized as a fraction of the screen.
+-- The resolved cell value is still clamped to FLOATING_MIN/MAX_WIDTH|HEIGHT so
+-- "100%" on an enormous terminal doesn't produce an unreadable overlay.
+local FLOATING_MIN_PCT = 10
+local FLOATING_MAX_PCT = 100
+local FLOATING_WIDTH_PCT_STEP = 5
+local FLOATING_HEIGHT_PCT_STEP = 5
+
+---Parse an overlay size spec. Accepts either a positive number (cells) or a
+---percentage string like "60%" (10-100).
+---@param spec any The user-supplied width or height value
+---@param axis "width"|"height" Used for error messages
+---@param overlay_name string Used for error messages
+---@return number? cells Resolved cell count (nil if pct-only)
+---@return number? pct Percentage (nil if cell-mode)
+parse_overlay_size = function(spec, axis, overlay_name)
+    if type(spec) == "number" then
+        return spec, nil
+    end
+    if type(spec) == "string" then
+        local digits = spec:match("^(%d+)%%$")
+        if digits then
+            local pct = tonumber(digits)
+            if pct and pct >= FLOATING_MIN_PCT and pct <= FLOATING_MAX_PCT then
+                return nil, pct
+            end
+            error(
+                "overlay "
+                    .. overlay_name
+                    .. ": "
+                    .. axis
+                    .. " percentage must be between "
+                    .. FLOATING_MIN_PCT
+                    .. " and "
+                    .. FLOATING_MAX_PCT
+                    .. ", got "
+                    .. spec
+            )
+        end
+    end
+    error(
+        "overlay "
+            .. overlay_name
+            .. ": "
+            .. axis
+            .. ' must be a number or percentage string like "60%", got '
+            .. tostring(spec)
+    )
+end
+
+---Resolve percent-mode width/height against current screen dims. No-op for
+---cell-mode overlays. Called from build_overlays each frame and from the
+---winsize event handler so the HUD reflects the new size immediately.
+---@param ost OverlayState
+---@param screen_cols number
+---@param screen_rows number
+resolve_overlay_size = function(ost, screen_cols, screen_rows)
+    if ost.width_pct then
+        local cells = math.floor(screen_cols * ost.width_pct / 100)
+        ost.width = math.max(FLOATING_MIN_WIDTH, math.min(cells, FLOATING_MAX_WIDTH))
+    end
+    if ost.height_pct then
+        local cells = math.floor(screen_rows * ost.height_pct / 100)
+        ost.height = math.max(FLOATING_MIN_HEIGHT, math.min(cells, FLOATING_MAX_HEIGHT))
+    end
+end
 
 -- --- Helpers ---
 
@@ -3297,15 +3424,65 @@ action_handlers = {
         end
     end,
     floating_increase_size = function()
-        state.floating.width = math.min(state.floating.width + FLOATING_WIDTH_STEP, FLOATING_MAX_WIDTH)
-        state.floating.height = math.min(state.floating.height + FLOATING_HEIGHT_STEP, FLOATING_MAX_HEIGHT)
-        state.floating.resize_mode = true
-        prise.request_frame()
+        -- Resize the active overlay (or "floating" if none active) by absolute
+        -- cells. Dragging the corner by hand drops percent-tracking: the user
+        -- has asked for a specific size, and we honor it until the next
+        -- pct-step action or config reload.
+        local name = state.active_overlay_name or "floating"
+        local ost = state.overlay_state[name]
+        if ost then
+            ost.width_pct = nil
+            ost.height_pct = nil
+            ost.width = math.min(ost.width + FLOATING_WIDTH_STEP, FLOATING_MAX_WIDTH)
+            ost.height = math.min(ost.height + FLOATING_HEIGHT_STEP, FLOATING_MAX_HEIGHT)
+            state.overlay_resize_mode = true
+            prise.request_frame()
+        end
     end,
     floating_decrease_size = function()
-        state.floating.width = math.max(state.floating.width - FLOATING_WIDTH_STEP, FLOATING_MIN_WIDTH)
-        state.floating.height = math.max(state.floating.height - FLOATING_HEIGHT_STEP, FLOATING_MIN_HEIGHT)
-        state.floating.resize_mode = true
+        -- Absolute-cell counterpart of floating_increase_size; same reasoning.
+        local name = state.active_overlay_name or "floating"
+        local ost = state.overlay_state[name]
+        if ost then
+            ost.width_pct = nil
+            ost.height_pct = nil
+            ost.width = math.max(ost.width - FLOATING_WIDTH_STEP, FLOATING_MIN_WIDTH)
+            ost.height = math.max(ost.height - FLOATING_HEIGHT_STEP, FLOATING_MIN_HEIGHT)
+            state.overlay_resize_mode = true
+            prise.request_frame()
+        end
+    end,
+    floating_increase_pct = function()
+        -- Step the overlay's percentage by FLOATING_WIDTH_PCT_STEP / HEIGHT_PCT_STEP
+        -- and re-resolve against current screen dims. If the overlay was in
+        -- cell mode, upconvert by rounding current cells to a pct so the step
+        -- lands somewhere sensible instead of jumping to a round number.
+        local name = state.active_overlay_name or "floating"
+        local ost = state.overlay_state[name]
+        if not ost then
+            return
+        end
+        local cur_w_pct = ost.width_pct or math.floor(ost.width / state.screen_cols * 100 + 0.5)
+        local cur_h_pct = ost.height_pct or math.floor(ost.height / state.screen_rows * 100 + 0.5)
+        ost.width_pct = math.min(cur_w_pct + FLOATING_WIDTH_PCT_STEP, FLOATING_MAX_PCT)
+        ost.height_pct = math.min(cur_h_pct + FLOATING_HEIGHT_PCT_STEP, FLOATING_MAX_PCT)
+        resolve_overlay_size(ost, state.screen_cols, state.screen_rows)
+        state.overlay_resize_mode = true
+        prise.request_frame()
+    end,
+    floating_decrease_pct = function()
+        -- Percent-mode counterpart of floating_increase_pct.
+        local name = state.active_overlay_name or "floating"
+        local ost = state.overlay_state[name]
+        if not ost then
+            return
+        end
+        local cur_w_pct = ost.width_pct or math.floor(ost.width / state.screen_cols * 100 + 0.5)
+        local cur_h_pct = ost.height_pct or math.floor(ost.height / state.screen_rows * 100 + 0.5)
+        ost.width_pct = math.max(cur_w_pct - FLOATING_WIDTH_PCT_STEP, FLOATING_MIN_PCT)
+        ost.height_pct = math.max(cur_h_pct - FLOATING_HEIGHT_PCT_STEP, FLOATING_MIN_PCT)
+        resolve_overlay_size(ost, state.screen_cols, state.screen_rows)
+        state.overlay_resize_mode = true
         prise.request_frame()
     end,
     layout_picker = function()
@@ -4774,6 +4951,11 @@ function M.update(event)
     elseif event.type == "winsize" then
         state.screen_cols = event.data.cols or state.screen_cols
         state.screen_rows = event.data.rows or state.screen_rows
+        -- Re-resolve percent-mode overlays eagerly so the resize HUD shows the
+        -- new cell count on the same frame the winsize event lands.
+        for _, ost in pairs(state.overlay_state) do
+            resolve_overlay_size(ost, state.screen_cols, state.screen_rows)
+        end
         prise.request_frame()
     elseif event.type == "focus_in" then
         state.app_focused = true
@@ -6525,20 +6707,46 @@ local function build_floating()
         return nil
     end
 
-    -- Create positioned terminal widget with size constraints
-    return prise.Positioned({
-        anchor = "center",
-        child = prise.Box({
-            border = config.borders.style,
-            style = { fg = config.borders.focused_color },
-            max_width = state.floating.width,
-            max_height = state.floating.height,
-            child = prise.Terminal({
-                pty = tab.floating.pane.pty,
-                focus = true,
-            }),
-        }),
-    })
+    local widgets = {}
+    local active_widget = nil
+    for name, overlay in pairs(tab.overlays) do
+        if overlay.visible and overlay.pane and overlay.pane.pty then
+            local cfg = config.overlays[name]
+            local ost = state.overlay_state[name]
+            if cfg and ost then
+                -- Re-resolve percent-mode sizes each frame so the overlay
+                -- tracks terminal resizes without a separate event hook.
+                resolve_overlay_size(ost, state.screen_cols, state.screen_rows)
+                local is_active = (name == state.active_overlay_name)
+                local widget = prise.Positioned({
+                    anchor = cfg.anchor or "center",
+                    x = cfg.x,
+                    y = cfg.y,
+                    child = prise.Box({
+                        border = cfg.border or config.borders.style,
+                        style = { fg = cfg.border_color or config.borders.focused_color },
+                        max_width = ost.width,
+                        max_height = ost.height,
+                        child = prise.Terminal({
+                            pty = overlay.pane.pty,
+                            focus = is_active,
+                        }),
+                    }),
+                })
+                -- Active overlay goes last (rendered on top)
+                if name == state.active_overlay_name then
+                    active_widget = widget
+                else
+                    table.insert(widgets, widget)
+                end
+            end
+        end
+    end
+    -- Active overlay rendered last = on top of the stack
+    if active_widget then
+        table.insert(widgets, active_widget)
+    end
+    return widgets
 end
 
 function M.view()
@@ -6657,6 +6865,17 @@ function M.get_state(cwd_lookup)
             last_focused_id = tab.last_focused_id,
             floating = serialize_floating(tab.floating, cwd_lookup),
         })
+    end
+
+    -- Serialize overlay settings (width/height per overlay, plus pct tracking)
+    local overlay_settings = {}
+    for name, ost in pairs(state.overlay_state) do
+        overlay_settings[name] = {
+            width = ost.width,
+            height = ost.height,
+            width_pct = ost.width_pct,
+            height_pct = ost.height_pct,
+        }
     end
 
     return {
@@ -6831,10 +7050,30 @@ function M.set_state(saved, pty_lookup)
         state.focused_id = saved.focused_id and remap[saved.focused_id] or nil
         state.next_split_id = saved.next_split_id or 1
 
-        -- Restore floating pane settings
-        if saved.floating_settings then
-            state.floating.width = saved.floating_settings.width or state.floating.width
-            state.floating.height = saved.floating_settings.height or state.floating.height
+        -- Restore overlay settings (width/height and optional pct tracking).
+        -- Save-shape precedence: if the save carries pct values, they win over
+        -- the raw cell values — re-resolving against the current screen gives
+        -- the right answer even if the window was resized while detached. Old
+        -- save files have no pct fields and fall back to cell-mode restore.
+        if saved.overlay_settings then
+            for name, settings in pairs(saved.overlay_settings) do
+                local ost = state.overlay_state[name]
+                if ost then
+                    ost.width = settings.width or ost.width
+                    ost.height = settings.height or ost.height
+                    ost.width_pct = settings.width_pct
+                    ost.height_pct = settings.height_pct
+                    resolve_overlay_size(ost, state.screen_cols, state.screen_rows)
+                end
+            end
+        end
+        -- Backwards compat: migrate old floating_settings
+        if saved.floating_settings and not saved.overlay_settings then
+            if state.overlay_state.floating then
+                state.overlay_state.floating.width = saved.floating_settings.width or state.overlay_state.floating.width
+                state.overlay_state.floating.height = saved.floating_settings.height
+                    or state.overlay_state.floating.height
+            end
         end
 
         -- Ensure active_tab is valid
@@ -7007,6 +7246,14 @@ M._test = {
         return state.focused_id
     end,
     serialize_node = serialize_node,
+    toggle_overlay = toggle_overlay,
+    get_active_overlay = get_active_overlay,
+    action_handlers = action_handlers,
+    -- Clear config.overlays between test cases so a malformed overlay from
+    -- one rejection test doesn't pollute a later test's setup iteration.
+    reset_config_overlays = function()
+        config.overlays = {}
+    end,
 }
 
 M._test.build_tab_bar_custom = build_tab_bar_custom
