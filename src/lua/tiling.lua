@@ -38,6 +38,9 @@ local utils = require("utils")
 ---                    overlay auto-dismisses when the command exits. Must be
 ---                    an external binary — shell builtins and compound
 ---                    statements need `shell = true` instead.
+---@field argv? string[] Direct argv for exec, bypassing the login shell.
+---                       Eliminates the shell-prompt flash during overlay
+---                       startup. Mutually exclusive with cmd.
 ---@field shell? boolean If true, spawn a persistent login shell with cmd
 ---                       typed into it. The overlay stays up after cmd
 ---                       exits until the shell itself exits. Default false.
@@ -2655,11 +2658,17 @@ toggle_overlay = function(name)
         end
         ost.pending = true
         local pty = get_focused_pty()
-        local spawn_cmd = cfg.cmd
-        if spawn_cmd and not cfg.shell then
-            spawn_cmd = "exec " .. spawn_cmd
+        if cfg.argv then
+            -- argv exec bypasses the shell entirely; no exec-wrap needed since
+            -- the target program IS the PTY child, so it auto-dismisses on exit.
+            prise.spawn({ cwd = pty and pty:cwd(), argv = cfg.argv })
+        else
+            local spawn_cmd = cfg.cmd
+            if spawn_cmd and not cfg.shell then
+                spawn_cmd = "exec " .. spawn_cmd
+            end
+            prise.spawn({ cwd = pty and pty:cwd(), cmd = spawn_cmd })
         end
-        prise.spawn({ cwd = pty and pty:cwd(), cmd = spawn_cmd })
     else
         -- Toggle visibility
         local overlay = tab.overlays[name]

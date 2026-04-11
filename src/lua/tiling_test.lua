@@ -1761,6 +1761,24 @@ t.toggle_overlay("bare")
 assert(#spawn_calls == 1, "toggle nil cmd: calls prise.spawn")
 assert(spawn_calls[1].cmd == nil, "toggle nil cmd: cmd stays nil (no exec prefix)")
 
+-- Test: toggle_overlay with argv bypasses cmd/exec-wrap entirely
+setup_overlay_test({
+    argv_overlay = {
+        key = "<leader>a",
+        argv = { "prisectl-ui", "plug-status" },
+        width = 80,
+        height = 20,
+    },
+})
+spawn_calls = {}
+t.toggle_overlay("argv_overlay")
+assert(#spawn_calls == 1, "toggle argv: calls prise.spawn")
+assert(spawn_calls[1].cmd == nil, "toggle argv: cmd is nil")
+assert(type(spawn_calls[1].argv) == "table", "toggle argv: argv passed as table")
+assert(#spawn_calls[1].argv == 2, "toggle argv: argv length preserved")
+assert(spawn_calls[1].argv[1] == "prisectl-ui", "toggle argv: argv[1] preserved")
+assert(spawn_calls[1].argv[2] == "plug-status", "toggle argv: argv[2] preserved")
+
 -- Test: toggle_overlay toggles visibility when pane exists
 setup_overlay_test({
     test_vis = { key = "<leader>v", width = 80, height = 20 },
