@@ -2803,7 +2803,7 @@ function M.update(event)
         -- Apply any queued title rename from spawn placement
         local rename = state.pending_title_renames[new_pane.id]
         if rename then
-            local tab = get_active_tab()
+            local _, tab = find_tab_for_pane(new_pane.id)
             if tab then
                 tab.title = rename
                 prise.save()
