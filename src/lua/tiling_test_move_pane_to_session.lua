@@ -32,6 +32,16 @@ local function mock_pane(id)
     return { type = "pane", id = id, pty = mock_pty(id) }
 end
 
+---Mock pane whose pty tracks close() calls.
+local function mock_tracked_close_pane(id)
+    local pty = mock_pty(id)
+    pty._closed = false
+    pty.close = function()
+        pty._closed = true
+    end
+    return { type = "pane", id = id, pty = pty }
+end
+
 local function mock_split(id, direction, children)
     return { type = "split", split_id = id, direction = direction, children = children }
 end
@@ -494,3 +504,75 @@ s = t.get_state()
 assert(#place_calls == 0, "missing-fields: place_pty_in_session never called")
 assert(s.tabs[1].root.type == "split", "missing-fields: source tree unchanged")
 assert(save_calls == 0, "missing-fields: no saves fired")
+
+-- === Solo main-tree pane with floating: floating closed on tab drop ===
+
+do
+    reset_captures()
+    local float_pane = mock_tracked_close_pane(77)
+    local tab1 = {
+        id = 1,
+        root = mock_pane(1),
+        last_focused_id = 1,
+    }
+    tab1.floating = { pane = float_pane, visible = true }
+    t.set_state({
+        tabs = {
+            tab1,
+            { id = 2, root = mock_pane(99), last_focused_id = 99 },
+        },
+        active_tab = 2,
+        focused_id = 99,
+        next_tab_id = 3,
+    })
+    tiling.update({
+        type = "move_pane_to_session",
+        data = {
+            pty_id = 1,
+            session_name = "bar",
+            cwd = "/tmp/bar",
+            tab_title = "float-orphan",
+        },
+    })
+    s = t.get_state()
+    assert(#s.tabs == 1, "float-orphan: source tab dropped")
+    assert(s.tabs[1].root.id == 99, "float-orphan: surviving tab is the sibling")
+    assert(float_pane.pty._closed, "float-orphan: floating pane pty closed")
+    assert(#place_calls == 1, "float-orphan: place_pty_in_session called")
+end
+
+-- === Solo main-tree pane with overlay: overlay closed on tab drop ===
+
+do
+    reset_captures()
+    local overlay_pane = mock_tracked_close_pane(88)
+    local tab1 = {
+        id = 1,
+        root = mock_pane(2),
+        last_focused_id = 2,
+    }
+    tab1.overlays = { tools = { pane = overlay_pane, visible = true } }
+    t.set_state({
+        tabs = {
+            tab1,
+            { id = 2, root = mock_pane(99), last_focused_id = 99 },
+        },
+        active_tab = 2,
+        focused_id = 99,
+        next_tab_id = 3,
+    })
+    tiling.update({
+        type = "move_pane_to_session",
+        data = {
+            pty_id = 2,
+            session_name = "baz",
+            cwd = "/tmp/baz",
+            tab_title = "overlay-orphan",
+        },
+    })
+    s = t.get_state()
+    assert(#s.tabs == 1, "overlay-orphan: source tab dropped")
+    assert(s.tabs[1].root.id == 99, "overlay-orphan: surviving tab is the sibling")
+    assert(overlay_pane.pty._closed, "overlay-orphan: overlay pane pty closed")
+    assert(#place_calls == 1, "overlay-orphan: place_pty_in_session called")
+end

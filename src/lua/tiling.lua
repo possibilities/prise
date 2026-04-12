@@ -1060,6 +1060,26 @@ local function swap_tabs(idx1, idx2)
     prise.save()
 end
 
+---Close any floating and overlay panes attached to a tab.
+---Used before dropping a tab whose main-tree root has been emptied,
+---so auxiliary panes don't become orphaned.
+---@param tab Tab
+local function close_auxiliary_panes(tab)
+    if tab.floating and tab.floating.pane then
+        local fp = tab.floating.pane
+        if fp.pty and fp.pty.close then
+            fp.pty:close()
+        end
+    end
+    if tab.overlays then
+        for _, overlay in pairs(tab.overlays) do
+            if overlay.pane and overlay.pane.pty and overlay.pane.pty.close then
+                overlay.pane.pty:close()
+            end
+        end
+    end
+end
+
 ---Remove a pane by id from the appropriate tab
 ---@param id number
 ---@return boolean was_last True if this was the last pane in the last tab (app will quit)
@@ -3257,6 +3277,9 @@ function M.update(event)
         local new_root, next_focus = remove_pane_recursive(src_tab.root, pty_id)
 
         if new_root == nil then
+            -- Close floating/overlay panes that would be orphaned by
+            -- dropping this tab.
+            close_auxiliary_panes(src_tab)
             -- Source tab emptied — drop it and pick a new active tab if
             -- we were on it.
             table.remove(state.tabs, src_tab_idx)
