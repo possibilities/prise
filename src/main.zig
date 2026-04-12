@@ -826,46 +826,14 @@ fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     var stdout = std.fs.File.stdout().writer(&buf);
     defer stdout.interface.flush() catch {};
 
-    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
-        log.err("Failed to create socket: {}", .{err});
-        return error.SocketError;
-    };
+    const sock = try connectToServer(socket_path);
     defer posix.close(sock);
-
-    var addr: posix.sockaddr.un = .{ .path = undefined };
-    @memcpy(addr.path[0..socket_path.len], socket_path);
-    addr.path[socket_path.len] = 0;
-
-    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            try stdout.interface.print("Server not running.\n", .{});
-            return;
-        }
-        return err;
-    };
 
     const request = try msgpack.encode(allocator, .{ 0, 1, "list_ptys", .{} });
     defer allocator.free(request);
 
-    _ = try posix.write(sock, request);
-
-    var response_buf: [16384]u8 = undefined;
-    const n = try posix.read(sock, &response_buf);
-    if (n == 0) {
-        try stdout.interface.print("No response from server.\n", .{});
-        return;
-    }
-
-    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch |err| {
-        log.err("Failed to decode response: {}", .{err});
-        return error.DecodeError;
-    };
+    const msg = try sendRpcRequest(allocator, sock, request);
     defer msg.deinit(allocator);
-
-    if (msg != .response) {
-        try stdout.interface.print("Unexpected response type.\n", .{});
-        return;
-    }
 
     if (msg.response.err) |err_val| {
         const err_str = if (err_val == .string) err_val.string else "unknown error";
@@ -928,46 +896,14 @@ fn killPty(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32) !
     var stdout = std.fs.File.stdout().writer(&buf);
     defer stdout.interface.flush() catch {};
 
-    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
-        log.err("Failed to create socket: {}", .{err});
-        return error.SocketError;
-    };
+    const sock = try connectToServer(socket_path);
     defer posix.close(sock);
-
-    var addr: posix.sockaddr.un = .{ .path = undefined };
-    @memcpy(addr.path[0..socket_path.len], socket_path);
-    addr.path[socket_path.len] = 0;
-
-    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            try stdout.interface.print("Server not running.\n", .{});
-            return;
-        }
-        return err;
-    };
 
     const request = try msgpack.encode(allocator, .{ 0, 1, "close_pty", .{.{ "id", pty_id }} });
     defer allocator.free(request);
 
-    _ = try posix.write(sock, request);
-
-    var response_buf: [16384]u8 = undefined;
-    const n = try posix.read(sock, &response_buf);
-    if (n == 0) {
-        try stdout.interface.print("No response from server.\n", .{});
-        return;
-    }
-
-    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch |err| {
-        log.err("Failed to decode response: {}", .{err});
-        return error.DecodeError;
-    };
+    const msg = try sendRpcRequest(allocator, sock, request);
     defer msg.deinit(allocator);
-
-    if (msg != .response) {
-        try stdout.interface.print("Unexpected response type.\n", .{});
-        return;
-    }
 
     if (msg.response.err) |err_val| {
         const err_str = if (err_val == .string) err_val.string else "unknown error";
