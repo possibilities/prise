@@ -686,6 +686,7 @@ pub const App = struct {
 
     pending_attach_ids: ?[]u32 = null,
     pending_attach_count: usize = 0,
+    pending_attach_pty_id: ?u32 = null,
     session_json: ?[]const u8 = null,
     pending_attach_cwd: std.AutoHashMap(u32, []const u8) = undefined,
     // Maps old PTY IDs to new PTY IDs when spawning fresh PTYs due to validity mismatch
@@ -1020,6 +1021,15 @@ pub const App = struct {
                 try app_ptr.createSession(session_name);
             }
         }.createCb);
+
+        // Register attach_pty callback (deferred from Lua via prise.attach)
+        self.ui.queue_attach_pty_callback = struct {
+            fn attachCb(ctx: *anyopaque, pty_id: u32) void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                app_ptr.pending_attach_pty_id = pty_id;
+            }
+        }.attachCb;
+        self.ui.queue_attach_pty_ctx = @ptrCast(self);
 
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
@@ -2395,6 +2405,20 @@ pub const App = struct {
                                 app.copyToClipboard(text);
                             },
                             .none => {},
+                        }
+
+                        // Drain deferred attach from Lua prise.attach()
+                        if (app.pending_attach_pty_id) |pty_id| {
+                            app.pending_attach_pty_id = null;
+                            log.info("Draining deferred attach_pty for PTY {}", .{pty_id});
+                            app.send_buffer = try msgpack.encode(
+                                app.allocator,
+                                .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{ @as(i64, pty_id), "false" } },
+                            );
+                            _ = try l.send(app.fd, app.send_buffer.?, .{
+                                .ptr = app,
+                                .cb = onSendComplete,
+                            });
                         }
 
                         // Remove consumed bytes from buffer

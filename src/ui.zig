@@ -92,6 +92,8 @@ pub const UI = struct {
     delete_session_ctx: *anyopaque = undefined,
     create_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
     create_session_ctx: *anyopaque = undefined,
+    queue_attach_pty_callback: ?*const fn (ctx: *anyopaque, pty_id: u32) void = null,
+    queue_attach_pty_ctx: *anyopaque = undefined,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -409,6 +411,10 @@ pub const UI = struct {
         // Register switch_session
         lua.pushFunction(ziglua.wrap(switchSession));
         lua.setField(-2, "switch_session");
+
+        // Register attach (queue attach_pty from Lua)
+        lua.pushFunction(ziglua.wrap(luaAttach));
+        lua.setField(-2, "attach");
 
         // Register create_session
         lua.pushFunction(ziglua.wrap(createSession));
@@ -750,6 +756,28 @@ pub const UI = struct {
             lua.pushBoolean(false);
         }
         return 1;
+    }
+
+    fn luaAttach(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            log.warn("luaAttach: failed to get ui pointer", .{});
+            return 0;
+        };
+        lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+
+        const pty_id = lua.toInteger(1) catch {
+            log.warn("luaAttach: failed to get pty_id", .{});
+            return 0;
+        };
+
+        if (ui.queue_attach_pty_callback) |cb| {
+            cb(ui.queue_attach_pty_ctx, @intCast(pty_id));
+        } else {
+            log.warn("luaAttach: no callback registered", .{});
+        }
+        return 0;
     }
 
     fn createSession(lua: *ziglua.Lua) i32 {
