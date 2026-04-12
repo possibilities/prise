@@ -178,7 +178,11 @@ local utils = require("utils")
 ---@field type "cwd_changed"
 ---@field data table
 
----@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent
+---@class MovePaneToSessionEvent
+---@field type "move_pane_to_session"
+---@field data { pty_id: number, session_name: string, cwd: string, tab_title?: string }
+
+---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|MovePaneToSessionEvent
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -3190,6 +3194,137 @@ function M.update(event)
         if not was_last then
             prise.save()
         end
+    elseif event.type == "move_pane_to_session" then
+        -- Move a pane out of its current tab AND out of the current session
+        -- entirely, landing it in another session's saved state. Callers
+        -- own the policy of which session to land in (cwd basename, per-
+        -- project routing, etc.); this primitive just executes the move.
+        --
+        -- Invariant caveat: the tree mutation happens BEFORE the cross-
+        -- session file write. If prise.place_pty_in_session fails, we log
+        -- and leave the PTY orphaned in memory — no rollback primitive
+        -- exists and re-attaching the leaf would race with an in-flight
+        -- save.
+        local pty_id = event.data and event.data.pty_id
+        local session_name = event.data and event.data.session_name
+        local cwd = event.data and event.data.cwd
+        local tab_title = event.data and event.data.tab_title
+        if type(pty_id) ~= "number" then
+            return
+        end
+        if type(session_name) ~= "string" or session_name == "" then
+            return
+        end
+        if type(cwd) ~= "string" or cwd == "" then
+            return
+        end
+
+        local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
+        if not src_tab then
+            return
+        end
+        -- find_tab_for_pane also resolves floating/overlay panes; require
+        -- the leaf to live in the tileable tree. Doubles as a nil-guard
+        -- on the tree walk.
+        if not find_node_path(src_tab.root, pty_id) then
+            return
+        end
+
+        -- Solo-pane in the only tab: refusing the move keeps the current
+        -- session from going empty. Multi-tab solo panes fall through —
+        -- dropping one tab still leaves the session non-empty.
+        if is_pane(src_tab.root) and src_tab.root.id == pty_id and #state.tabs == 1 then
+            return
+        end
+
+        local was_active = (src_tab_idx == state.active_tab)
+        local was_focused = (state.focused_id == pty_id)
+
+        -- Clear any zoom bookkeeping so the next save doesn't emit a
+        -- dangling reference to the moved pane.
+        if state.zoomed_pane_id == pty_id then
+            state.zoomed_pane_id = nil
+        end
+        for _, t in ipairs(state.tabs) do
+            if t.zoomed_pane_id == pty_id then
+                t.zoomed_pane_id = nil
+            end
+        end
+
+        -- Detach the leaf. remove_pane_recursive collapses single-child
+        -- splits on the way up; if the source tab was a solo pane in a
+        -- multi-tab session, new_root is nil and we drop the whole tab.
+        local new_root, next_focus = remove_pane_recursive(src_tab.root, pty_id)
+
+        if new_root == nil then
+            -- Source tab emptied — drop it and pick a new active tab if
+            -- we were on it.
+            table.remove(state.tabs, src_tab_idx)
+            if was_active then
+                -- Prefer the tab that shifted into the old slot; fall
+                -- back to the new tail when the removed tab was last.
+                local new_idx = math.min(src_tab_idx, #state.tabs)
+                state.active_tab = new_idx
+                local new_tab = state.tabs[new_idx]
+                local new_focus = new_tab and new_tab.last_focused_id
+                if new_tab and new_focus and not find_node_path(new_tab.root, new_focus) then
+                    local first = get_first_leaf(new_tab.root)
+                    new_focus = first and first.id or nil
+                end
+                if new_tab and not new_focus then
+                    local first = get_first_leaf(new_tab.root)
+                    new_focus = first and first.id or nil
+                end
+                local old_focused = state.focused_id
+                state.focused_id = new_focus
+                update_pty_focus(old_focused, new_focus)
+            elseif src_tab_idx < state.active_tab then
+                -- Removing a tab before the active one shifts every
+                -- index after it down by one.
+                state.active_tab = state.active_tab - 1
+            end
+        else
+            src_tab.root = new_root
+            if src_tab.last_focused_id == pty_id then
+                if next_focus then
+                    src_tab.last_focused_id = next_focus
+                else
+                    local first = get_first_leaf(src_tab.root)
+                    src_tab.last_focused_id = first and first.id or nil
+                end
+            end
+            if was_active and was_focused then
+                -- Source tab stayed active but its focused pane left.
+                -- Retarget state.focused_id in-place; we're not changing
+                -- tabs so set_active_tab_index would early-return.
+                local new_focus = src_tab.last_focused_id
+                if new_focus and not find_node_path(src_tab.root, new_focus) then
+                    local first = get_first_leaf(src_tab.root)
+                    new_focus = first and first.id or nil
+                end
+                local old_focused = state.focused_id
+                state.focused_id = new_focus
+                update_pty_focus(old_focused, new_focus)
+            end
+        end
+
+        -- Write the detached leaf into the target session's saved state.
+        -- Point of no return: any failure here leaves the PTY orphaned
+        -- in-memory (still alive, no tree reference). We log and move on
+        -- — saving the mutated source state is more important than
+        -- trying to unwind half a cross-session move.
+        local ok = prise.place_pty_in_session(session_name, pty_id, cwd, tab_title)
+        if not ok then
+            prise.log.warn(
+                "move_pane_to_session: place failed for pty="
+                    .. tostring(pty_id)
+                    .. " session="
+                    .. session_name
+            )
+        end
+
+        prise.save()
+        prise.request_frame()
     elseif event.type == "mouse" then
         local d = event.data
 
