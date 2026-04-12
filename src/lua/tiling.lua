@@ -178,7 +178,11 @@ local utils = require("utils")
 ---@field type "cwd_changed"
 ---@field data table
 
----@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent
+---@class BreakPaneEvent
+---@field type "break_pane"
+---@field data { pty_id: number }
+
+---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|BreakPaneEvent
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -682,6 +686,27 @@ find_node_path = function(current, target_id, path)
     -- Not found in this branch
     table.remove(path)
     return nil
+end
+
+---List pty_ids of all main-tree panes sharing a tab with pty_id.
+---Returns nil if pty_id is unknown or lives in a floating/overlay slot
+---rather than the tileable tree. Traversal order matches collect_panes.
+---@param pty_id number
+---@return number[]?
+function M.list_tab_pty_ids(pty_id)
+    local _, tab = find_tab_for_pane(pty_id)
+    if not tab then
+        return nil
+    end
+    -- find_tab_for_pane only walks tab.root, so a hit already implies the
+    -- pty lives in the main tileable tree. Floating/overlay panes are held
+    -- on tab.floating (outside root) and are not returned.
+    local panes = collect_panes(tab.root, {})
+    local ids = {}
+    for _, p in ipairs(panes) do
+        table.insert(ids, p.id)
+    end
+    return ids
 end
 
 ---@param node? Node
@@ -3190,6 +3215,93 @@ function M.update(event)
         if not was_last then
             prise.save()
         end
+    elseif event.type == "break_pane" then
+        -- Move a pane out of its current tab into a brand-new tab of its own.
+        -- Dumb primitive: no "which pane should break?" policy lives here —
+        -- callers decide. Focus follows the moved pane if (and only if) the
+        -- source tab is the currently active tab; otherwise the operation is
+        -- silent with no focus steal.
+        local pty_id = event.data and event.data.pty_id
+        if type(pty_id) ~= "number" then
+            return
+        end
+
+        local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
+        if not src_tab then
+            return
+        end
+
+        -- Require the pane to live in the tileable tree (not a floating or
+        -- overlay slot). find_tab_for_pane only walks tab.root, so a non-nil
+        -- src_tab already implies this — find_node_path here is belt-and-
+        -- suspenders and doubles as a handle on the leaf node reference.
+        local src_path = find_node_path(src_tab.root, pty_id)
+        if not src_path then
+            return
+        end
+        local src_leaf = src_path[#src_path]
+
+        -- Defensive solo-pane no-op. Can't happen under the arthack policy
+        -- (it only breaks when cohabitants exist) but keeps this primitive
+        -- safe for direct callers: breaking the only pane in a tab would
+        -- leave the source empty and just shuffle tab ordering for nothing.
+        if is_pane(src_tab.root) and src_tab.root.id == pty_id then
+            return
+        end
+
+        local was_active = (src_tab_idx == state.active_tab)
+
+        -- Clear any zoom state referencing the moved pane so it doesn't
+        -- follow into the new tab with stale bookkeeping.
+        if state.zoomed_pane_id == pty_id then
+            state.zoomed_pane_id = nil
+        end
+        for _, t in ipairs(state.tabs) do
+            if t.zoomed_pane_id == pty_id then
+                t.zoomed_pane_id = nil
+            end
+        end
+
+        -- Detach the leaf from the source tree. remove_pane_recursive
+        -- collapses any single-child split on the way up, so the survivor
+        -- is automatically promoted.
+        local new_root, next_focus = remove_pane_recursive(src_tab.root, pty_id)
+        src_tab.root = new_root
+
+        -- Fix the source tab's saved focus if it pointed at the moved pane.
+        if src_tab.last_focused_id == pty_id then
+            if next_focus then
+                src_tab.last_focused_id = next_focus
+            else
+                local first = get_first_leaf(src_tab.root)
+                src_tab.last_focused_id = first and first.id or nil
+            end
+        end
+
+        -- Allocate a fresh tab whose root IS the moved leaf.
+        local tab_id = state.next_tab_id
+        state.next_tab_id = tab_id + 1
+        ---@type Tab
+        local new_tab = {
+            id = tab_id,
+            root = src_leaf,
+            last_focused_id = src_leaf.id,
+        }
+        table.insert(state.tabs, new_tab)
+
+        if was_active then
+            -- set_active_tab_index handles zoom save/restore on the old tab,
+            -- picks the new tab's last_focused_id (which we just set to the
+            -- moved pane), and fires update_pty_focus.
+            set_active_tab_index(#state.tabs)
+        end
+        -- When the source tab was inactive: state.active_tab is unchanged
+        -- (appending a tab doesn't shift existing indices) and state.focused_id
+        -- still refers to a pane in the still-active tab, which by invariant
+        -- cannot be the moved pane. No focus mutation needed.
+
+        prise.save()
+        prise.request_frame()
     elseif event.type == "mouse" then
         local d = event.data
 
