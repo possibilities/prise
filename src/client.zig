@@ -2411,9 +2411,12 @@ pub const App = struct {
                         if (app.pending_attach_pty_id) |pty_id| {
                             app.pending_attach_pty_id = null;
                             log.info("Draining deferred attach_pty for PTY {}", .{pty_id});
+                            const msgid = app.state.next_msgid;
+                            app.state.next_msgid += 1;
+                            try app.state.pending_requests.put(msgid, .{ .attach = .{ .pty_id = pty_id, .cwd = null } });
                             app.send_buffer = try msgpack.encode(
                                 app.allocator,
-                                .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{ @as(i64, pty_id), "false" } },
+                                .{ 0, msgid, "attach_pty", .{ @as(i64, pty_id), "false" } },
                             );
                             _ = try l.send(app.fd, app.send_buffer.?, .{
                                 .ptr = app,
