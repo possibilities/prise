@@ -698,9 +698,14 @@ function M.list_tab_pty_ids(pty_id)
     if not tab then
         return nil
     end
-    -- find_tab_for_pane only walks tab.root, so a hit already implies the
-    -- pty lives in the main tileable tree. Floating/overlay panes are held
-    -- on tab.floating (outside root) and are not returned.
+    -- find_tab_for_pane may resolve floating/overlay panes (held on
+    -- tab.floating, outside tab.root). Filter them out here — this
+    -- primitive only reports main-tileable-tree cohabitants, because
+    -- that is what break_pane can act on. Callers that care about
+    -- floats should reach for tab.floating through a different API.
+    if not find_node_path(tab.root, pty_id) then
+        return nil
+    end
     local panes = collect_panes(tab.root, {})
     local ids = {}
     for _, p in ipairs(panes) do
