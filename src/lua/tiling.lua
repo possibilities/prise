@@ -3266,6 +3266,12 @@ function M.update(event)
                 local new_idx = math.min(src_tab_idx, #state.tabs)
                 state.active_tab = new_idx
                 local new_tab = state.tabs[new_idx]
+                -- Restore zoom state from the destination tab (mirrors
+                -- remove_pane_by_id's handoff at the same point).
+                if new_tab then
+                    state.zoomed_pane_id = new_tab.zoomed_pane_id
+                    new_tab.zoomed_pane_id = nil
+                end
                 local new_focus = new_tab and new_tab.last_focused_id
                 if new_tab and new_focus and not find_node_path(new_tab.root, new_focus) then
                     local first = get_first_leaf(new_tab.root)
@@ -3278,6 +3284,7 @@ function M.update(event)
                 local old_focused = state.focused_id
                 state.focused_id = new_focus
                 update_pty_focus(old_focused, new_focus)
+                update_cached_git_branch()
             elseif src_tab_idx < state.active_tab then
                 -- Removing a tab before the active one shifts every
                 -- index after it down by one.
@@ -3305,6 +3312,7 @@ function M.update(event)
                 local old_focused = state.focused_id
                 state.focused_id = new_focus
                 update_pty_focus(old_focused, new_focus)
+                update_cached_git_branch()
             end
         end
 
