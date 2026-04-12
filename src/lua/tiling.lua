@@ -1086,6 +1086,26 @@ local function swap_tabs(idx1, idx2)
     prise.save()
 end
 
+---Close any floating and overlay panes attached to a tab.
+---Used before dropping a tab whose main-tree root has been emptied,
+---so auxiliary panes don't become orphaned.
+---@param tab Tab
+local function close_auxiliary_panes(tab)
+    if tab.floating and tab.floating.pane then
+        local fp = tab.floating.pane
+        if fp.pty and fp.pty.close then
+            fp.pty:close()
+        end
+    end
+    if tab.overlays then
+        for _, overlay in pairs(tab.overlays) do
+            if overlay.pane and overlay.pane.pty and overlay.pane.pty.close then
+                overlay.pane.pty:close()
+            end
+        end
+    end
+end
+
 ---Remove a pane by id from the appropriate tab
 ---@param id number
 ---@return boolean was_last True if this was the last pane in the last tab (app will quit)
@@ -3272,6 +3292,37 @@ function M.update(event)
         -- is automatically promoted.
         local new_root, next_focus = remove_pane_recursive(src_tab.root, pty_id)
         src_tab.root = new_root
+
+        -- Defensive: if the tree collapsed to nothing (should not happen —
+        -- the solo-pane guard returns above), close auxiliary panes and
+        -- remove the emptied tab rather than leaving it headless.
+        if not new_root and src_tab_idx then
+            close_auxiliary_panes(src_tab)
+            table.remove(state.tabs, src_tab_idx)
+            if was_active then
+                local new_idx = math.min(src_tab_idx, #state.tabs)
+                state.active_tab = new_idx
+                local new_tab = state.tabs[new_idx]
+                if new_tab then
+                    state.zoomed_pane_id = new_tab.zoomed_pane_id
+                    new_tab.zoomed_pane_id = nil
+                end
+                local new_focus_id = new_tab and new_tab.last_focused_id
+                if new_tab and new_focus_id and not find_node_path(new_tab.root, new_focus_id) then
+                    local first = get_first_leaf(new_tab.root)
+                    new_focus_id = first and first.id or nil
+                end
+                local old_focused = state.focused_id
+                state.focused_id = new_focus_id
+                update_pty_focus(old_focused, new_focus_id)
+                update_cached_git_branch()
+            elseif src_tab_idx < state.active_tab then
+                state.active_tab = state.active_tab - 1
+            end
+            prise.save()
+            prise.request_frame()
+            return
+        end
 
         -- Fix the source tab's saved focus if it pointed at the moved pane.
         if src_tab.last_focused_id == pty_id then

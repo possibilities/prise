@@ -391,3 +391,31 @@ s = t.get_state()
 assert(#s.tabs == 1, "break floating: floating pane is untreatable, no new tab")
 assert(s.tabs[1].floating ~= nil, "break floating: floating pane still attached to tab")
 assert(s.tabs[1].floating.pane.id == 77, "break floating: floating pane identity preserved")
+
+-- === break_pane on solo main-tree pane with floating in multi-tab: no-op ===
+-- The solo-pane guard prevents breaking the only tree pane even when
+-- auxiliary panes exist, so floating panes are never orphaned.
+
+do
+    local tab1 = {
+        id = 1,
+        root = mock_pane(1),
+        last_focused_id = 1,
+    }
+    tab1.floating = { pane = mock_pane(50), visible = true }
+    t.set_state({
+        tabs = {
+            tab1,
+            { id = 2, root = mock_pane(99), last_focused_id = 99 },
+        },
+        active_tab = 1,
+        focused_id = 1,
+        next_tab_id = 3,
+    })
+end
+tiling.update({ type = "break_pane", data = { pty_id = 1 } })
+s = t.get_state()
+assert(#s.tabs == 2, "break solo-float: tab count unchanged")
+assert(s.tabs[1].root.id == 1, "break solo-float: main-tree pane untouched")
+assert(s.tabs[1].floating ~= nil, "break solo-float: floating pane still attached")
+assert(s.tabs[1].floating.pane.id == 50, "break solo-float: floating pane identity preserved")
