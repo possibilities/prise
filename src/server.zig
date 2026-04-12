@@ -2344,6 +2344,17 @@ const Server = struct {
         // Send pty_spawned notification to all clients
         try self.sendPtySpawned(pty_id, cwd orelse "", parsed.session, parsed.tab, parsed.title);
 
+        // If no TUI client received the event and a session was specified,
+        // write directly to the session file so the PTY is discovered on attach.
+        if (parsed.session) |session_name| {
+            if (self.clients.items.len == 0) {
+                const tab_title = parsed.tab orelse parsed.title;
+                self.placePtyInSessionFile(session_name, pty_id, cwd orelse "", tab_title) catch |err| {
+                    log.warn("Failed to place PTY {} in session file '{s}': {}", .{ pty_id, session_name, err });
+                };
+            }
+        }
+
         return msgpack.Value{ .unsigned = pty_id };
     }
 
@@ -2929,6 +2940,122 @@ const Server = struct {
         for (self.clients.items) |client| {
             try client.sendData(self.loop, msg_bytes);
         }
+    }
+
+    /// Place a PTY into a session state file so it is discovered on next attach.
+    /// Used when no TUI client is connected to receive the pty_spawned event.
+    fn placePtyInSessionFile(self: *Server, session_name: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8) !void {
+        // Validate session name (no path traversal)
+        if (session_name.len == 0) return error.InvalidSessionName;
+        if (std.mem.indexOfAny(u8, session_name, "/\\") != null) return error.InvalidSessionName;
+        if (std.mem.indexOf(u8, session_name, "..") != null) return error.InvalidSessionName;
+        if (std.mem.indexOfScalar(u8, session_name, 0) != null) return error.InvalidSessionName;
+
+        const home = posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        // Ensure directory exists
+        std.fs.makeDirAbsolute(state_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
+                std.fs.makeDirAbsolute(parent) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+                std.fs.makeDirAbsolute(state_dir) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+            }
+        };
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
+        defer self.allocator.free(filename);
+
+        const path = try std.fs.path.join(self.allocator, &.{ state_dir, filename });
+        defer self.allocator.free(path);
+
+        const validity = self.start_time_ms;
+
+        // Try to read existing file
+        if (std.fs.openFileAbsolute(path, .{})) |file| {
+            defer file.close();
+            const existing = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+            defer self.allocator.free(existing);
+            try self.appendTabToSessionFile(path, existing, pty_id, cwd, tab_title, validity);
+        } else |_| {
+            try self.writeNewSessionFile(path, pty_id, cwd, tab_title, validity);
+        }
+
+        log.info("Placed PTY {d} in session file '{s}' (no TUI clients)", .{ pty_id, session_name });
+    }
+
+    /// Create a new session file with a single tab containing the given PTY.
+    fn writeNewSessionFile(self: *Server, path: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
+        const Pane = struct { type: []const u8, id: u32, pty_id: usize, cwd: []const u8 };
+        const Tab = struct { id: u32, title: ?[]const u8, root: Pane, last_focused_id: u32 };
+        const Session = struct { pty_validity: i64, tabs: []const Tab, active_tab: u32, next_split_id: u32, next_tab_id: u32 };
+
+        const pane: Pane = .{ .type = "pane", .id = 1, .pty_id = pty_id, .cwd = cwd };
+        const tab: Tab = .{ .id = 1, .title = tab_title, .root = pane, .last_focused_id = 1 };
+        const tabs = [_]Tab{tab};
+        const session: Session = .{ .pty_validity = validity, .tabs = &tabs, .active_tab = 1, .next_split_id = 2, .next_tab_id = 2 };
+
+        const json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(session, .{})});
+        defer self.allocator.free(json);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(json);
+    }
+
+    /// Append a new tab to an existing session JSON file.
+    fn appendTabToSessionFile(self: *Server, path: []const u8, existing_json: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, existing_json, .{});
+        defer parsed.deinit();
+
+        var root = &parsed.value.object;
+        const arena = parsed.arena.allocator();
+
+        // Extract and bump counters
+        const next_tab_val = root.get("next_tab_id") orelse return error.InvalidSessionFile;
+        const next_split_val = root.get("next_split_id") orelse return error.InvalidSessionFile;
+        const new_tab_id = if (next_tab_val == .integer) next_tab_val.integer else return error.InvalidSessionFile;
+        const new_split_id = if (next_split_val == .integer) next_split_val.integer else return error.InvalidSessionFile;
+
+        // Build the new tab as a Value tree
+        var pane_obj = std.json.ObjectMap.init(arena);
+        try pane_obj.put("type", .{ .string = "pane" });
+        try pane_obj.put("id", .{ .integer = new_split_id });
+        try pane_obj.put("pty_id", .{ .integer = @intCast(pty_id) });
+        try pane_obj.put("cwd", .{ .string = cwd });
+
+        var tab_obj = std.json.ObjectMap.init(arena);
+        try tab_obj.put("id", .{ .integer = new_tab_id });
+        if (tab_title) |t| {
+            try tab_obj.put("title", .{ .string = t });
+        } else {
+            try tab_obj.put("title", .null);
+        }
+        try tab_obj.put("root", .{ .object = pane_obj });
+        try tab_obj.put("last_focused_id", .{ .integer = new_split_id });
+
+        // Append to tabs array
+        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+        try tabs_val.array.append(.{ .object = tab_obj });
+
+        // Update counters and validity
+        try root.put("next_tab_id", .{ .integer = new_tab_id + 1 });
+        try root.put("next_split_id", .{ .integer = new_split_id + 1 });
+        try root.put("pty_validity", .{ .integer = validity });
+
+        // Serialize back
+        const output = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+        defer self.allocator.free(output);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(output);
     }
 
     fn sendCwdChanged(self: *Server, pty_instance: *Pty, cwd: []const u8) !void {
