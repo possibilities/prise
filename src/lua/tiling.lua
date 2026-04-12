@@ -3220,7 +3220,7 @@ function M.update(event)
         end
 
         local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
-        if not src_tab then
+        if not src_tab or not src_tab_idx then
             return
         end
         -- find_tab_for_pane also resolves floating/overlay panes; require
@@ -3316,10 +3316,7 @@ function M.update(event)
         local ok = prise.place_pty_in_session(session_name, pty_id, cwd, tab_title)
         if not ok then
             prise.log.warn(
-                "move_pane_to_session: place failed for pty="
-                    .. tostring(pty_id)
-                    .. " session="
-                    .. session_name
+                "move_pane_to_session: place failed for pty=" .. tostring(pty_id) .. " session=" .. session_name
             )
         end
 
