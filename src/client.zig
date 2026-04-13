@@ -5299,3 +5299,27 @@ test "dump path formatters fit in 64-byte buffer at max values" {
         pty_path,
     );
 }
+
+test "extractPtyIdsFromJson dedupes repeated pane pty_ids" {
+    const testing = std.testing;
+
+    // Mirrors the corrupt --project.json shape that crashed the server:
+    // 4 tabs, 2 unique pty_ids (3 and 5 each appearing twice).
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "pty_id": 3}},
+        \\    {"id": 2, "root": {"type": "pane", "pty_id": 3}},
+        \\    {"id": 3, "root": {"type": "pane", "pty_id": 5}},
+        \\    {"id": 4, "root": {"type": "pane", "pty_id": 5}}
+        \\  ]
+        \\}
+    ;
+
+    const ids = try App.extractPtyIdsFromJson(testing.allocator, json);
+    defer testing.allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expectEqual(@as(u32, 3), ids[0]);
+    try testing.expectEqual(@as(u32, 5), ids[1]);
+}
