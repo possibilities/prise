@@ -2344,10 +2344,19 @@ const Server = struct {
         // Send pty_spawned notification to all clients
         try self.sendPtySpawned(pty_id, cwd orelse "", parsed.session, parsed.tab, parsed.title);
 
-        // If no TUI client received the event and a session was specified,
+        // If no TUI client (other than the RPC caller) can receive the event,
         // write directly to the session file so the PTY is discovered on attach.
+        // The RPC caller (e.g. prisectl) is always in self.clients during this
+        // call but discards notifications — it can't handle pty_spawned.
         if (parsed.session) |session_name| {
-            if (self.clients.items.len == 0) {
+            var has_tui_client = false;
+            for (self.clients.items) |c| {
+                if (c != client) {
+                    has_tui_client = true;
+                    break;
+                }
+            }
+            if (!has_tui_client) {
                 const tab_title = parsed.tab orelse parsed.title;
                 self.placePtyInSessionFile(session_name, pty_id, cwd orelse "", tab_title) catch |err| {
                     log.warn("Failed to place PTY {} in session file '{s}': {}", .{ pty_id, session_name, err });
