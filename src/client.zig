@@ -2794,10 +2794,30 @@ pub const App = struct {
         defer parsed.deinit();
 
         var ids: std.ArrayList(u32) = .empty;
-        errdefer ids.deinit(allocator);
+        defer ids.deinit(allocator);
 
         try collectPtyIds(&ids, allocator, parsed.value);
-        return ids.toOwnedSlice(allocator);
+
+        // Dedupe in first-seen order. A corrupt session file can list the same
+        // pty_id in multiple tabs (see fix/dedupe-restore-pty-ids); attaching
+        // to the same pty twice in one restore round-trips as two attach_pty
+        // RPCs, the second of which trips the addClient precondition and
+        // panics the server.
+        var seen: std.AutoHashMap(u32, void) = .init(allocator);
+        defer seen.deinit();
+        try seen.ensureTotalCapacity(@intCast(ids.items.len));
+
+        var deduped: std.ArrayList(u32) = .empty;
+        errdefer deduped.deinit(allocator);
+        try deduped.ensureTotalCapacity(allocator, ids.items.len);
+
+        for (ids.items) |id| {
+            const gop = seen.getOrPutAssumeCapacity(id);
+            if (!gop.found_existing) {
+                deduped.appendAssumeCapacity(id);
+            }
+        }
+        return deduped.toOwnedSlice(allocator);
     }
 
     fn collectPtyIds(ids: *std.ArrayList(u32), allocator: std.mem.Allocator, value: std.json.Value) !void {
@@ -3399,4 +3419,28 @@ test "UnixSocketClient - connection refused" {
     try loop.run(.until_done);
     try testing.expect(got_error);
     try testing.expectEqual(error.ConnectionRefused, err_value.?);
+}
+
+test "extractPtyIdsFromJson dedupes repeated pane pty_ids" {
+    const testing = std.testing;
+
+    // Mirrors the corrupt --project.json shape that crashed the server:
+    // 4 tabs, 2 unique pty_ids (3 and 5 each appearing twice).
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "pty_id": 3}},
+        \\    {"id": 2, "root": {"type": "pane", "pty_id": 3}},
+        \\    {"id": 3, "root": {"type": "pane", "pty_id": 5}},
+        \\    {"id": 4, "root": {"type": "pane", "pty_id": 5}}
+        \\  ]
+        \\}
+    ;
+
+    const ids = try App.extractPtyIdsFromJson(testing.allocator, json);
+    defer testing.allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expectEqual(@as(u32, 3), ids[0]);
+    try testing.expectEqual(@as(u32, 5), ids[1]);
 }
