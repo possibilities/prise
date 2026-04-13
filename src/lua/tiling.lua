@@ -3526,6 +3526,7 @@ local function build_palette()
         if type(cmd_name) == "function" then
             cmd_name = cmd_name()
         end
+        ---@cast cmd_name string
         table.insert(items, format_palette_item(cmd_name, cmd.shortcut, PALETTE_INNER_WIDTH))
     end
 
