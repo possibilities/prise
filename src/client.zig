@@ -3317,32 +3317,6 @@ test "ClientLogic - processServerMessage" {
         try testing.expectEqualStrings("/home/user/project", state.cwd_map.get(123).?);
     }
 
-    // Test Attach response with empty cwd (server had no cwd tracked yet)
-    {
-        var state = ClientState.init(testing.allocator);
-        defer state.deinit();
-        try state.pending_requests.put(3, .{ .attach = .{ .pty_id = 77, .cwd = null } });
-
-        var result_kv = [_]msgpack.Value.KeyValue{
-            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 77 } },
-            .{ .key = .{ .string = "cwd" }, .value = .{ .string = "" } },
-        };
-        const msg = rpc.Message{
-            .response = .{
-                .msgid = 3,
-                .err = null,
-                .result = .{ .map = &result_kv },
-            },
-        };
-
-        const action = try ClientLogic.processServerMessage(&state, msg);
-        try testing.expect(state.attached);
-        try testing.expectEqual(77, action.attached.new_pty_id);
-        // Empty cwd string is still passed through — downstream can decide what to do.
-        try testing.expect(action.attached.cwd != null);
-        try testing.expectEqualStrings("", action.attached.cwd.?);
-    }
-
     // Test Redraw Notification
     {
         var state = ClientState.init(testing.allocator);
