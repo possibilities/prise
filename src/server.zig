@@ -3022,11 +3022,29 @@ const Server = struct {
         const new_tab_id = if (next_tab_val == .integer) next_tab_val.integer else return error.InvalidSessionFile;
         const new_split_id = if (next_split_val == .integer) next_split_val.integer else return error.InvalidSessionFile;
 
+        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+
+        // Ensure unique pty_id within the file. When the server bounces,
+        // the new PTY can get the same ID as an old tab's PTY. The client's
+        // spawn-fallback remap keys by pty_id, so duplicates cause one
+        // mapping to clobber the other → two tabs share one PTY → crash.
+        var file_pty_id: i64 = @intCast(pty_id);
+        for (tabs_val.array.items) |tab_entry| {
+            if (tab_entry != .object) continue;
+            const root_pane = tab_entry.object.get("root") orelse continue;
+            if (root_pane != .object) continue;
+            const existing_id = root_pane.object.get("pty_id") orelse continue;
+            if (existing_id == .integer and existing_id.integer >= file_pty_id) {
+                file_pty_id = existing_id.integer + 1;
+            }
+        }
+
         // Build the new tab as a Value tree
         var pane_obj = std.json.ObjectMap.init(arena);
         try pane_obj.put("type", .{ .string = "pane" });
         try pane_obj.put("id", .{ .integer = new_split_id });
-        try pane_obj.put("pty_id", .{ .integer = @intCast(pty_id) });
+        try pane_obj.put("pty_id", .{ .integer = file_pty_id });
         try pane_obj.put("cwd", .{ .string = cwd });
 
         var tab_obj = std.json.ObjectMap.init(arena);
@@ -3040,8 +3058,6 @@ const Server = struct {
         try tab_obj.put("last_focused_id", .{ .integer = new_split_id });
 
         // Append to tabs array
-        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
-        if (tabs_val.* != .array) return error.InvalidSessionFile;
         try tabs_val.array.append(.{ .object = tab_obj });
 
         // Update counters and validity
