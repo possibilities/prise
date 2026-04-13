@@ -4330,6 +4330,14 @@ pub const App = struct {
 
         const validity = self.state.pty_validity orelse 0;
 
+        // Diagnostic: capture pid + on-disk state before mutation. The next
+        // duplicate-pty_id repro needs to discriminate between H1/H2 (single
+        // client double-dispatch — same pid logs the same pty_id twice with
+        // existing_pty_ids growing) and H3 (multi-client race — different
+        // pids with overlapping placements). Keep at .info so it stays in
+        // ReleaseSafe production logs.
+        self.logPlacePtyIntent(path, session_name, pty_id, cwd, tab_title);
+
         // Try to read existing file
         if (std.fs.openFileAbsolute(path, .{})) |file| {
             defer file.close();
@@ -4342,6 +4350,62 @@ pub const App = struct {
         }
 
         log.info("Placed PTY {d} in session '{s}'", .{ pty_id, session_name });
+    }
+
+    /// Best-effort diagnostic snapshot for the pre-write state of the target
+    /// session file. Any failure swallows itself silently — a missing
+    /// existing_pty_ids field is better than a failed log call. Allocates a
+    /// throwaway formatted slice; cleanup is local to this function.
+    fn logPlacePtyIntent(
+        self: *App,
+        path: []const u8,
+        session_name: []const u8,
+        pty_id: u32,
+        cwd: []const u8,
+        tab_title: ?[]const u8,
+    ) void {
+        const pid = currentPid();
+
+        var existing_owned: ?[]u8 = null;
+        defer if (existing_owned) |s| self.allocator.free(s);
+        var existing_str: []const u8 = "?";
+
+        if (std.fs.openFileAbsolute(path, .{})) |file| {
+            defer file.close();
+            const json = file.readToEndAlloc(self.allocator, 1024 * 1024) catch null;
+            if (json) |j| {
+                defer self.allocator.free(j);
+                if (extractPtyIdsFromJson(self.allocator, j)) |ids| {
+                    defer self.allocator.free(ids);
+                    std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+                    if (formatU32List(self.allocator, ids)) |formatted| {
+                        existing_owned = formatted;
+                        existing_str = formatted;
+                    } else |_| {}
+                } else |_| {}
+            }
+        } else |_| {
+            existing_str = "[]";
+        }
+
+        log.info(
+            "placePtyInSession: pid={d} pty_id={d} session={s} cwd={s} tab_title={?s} existing_pty_ids={s}",
+            .{ pid, pty_id, session_name, cwd, tab_title, existing_str },
+        );
+    }
+
+    fn formatU32List(allocator: std.mem.Allocator, ids: []const u32) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.append(allocator, '[');
+        for (ids, 0..) |id, i| {
+            if (i > 0) try out.appendSlice(allocator, ", ");
+            const num = try std.fmt.allocPrint(allocator, "{d}", .{id});
+            defer allocator.free(num);
+            try out.appendSlice(allocator, num);
+        }
+        try out.append(allocator, ']');
+        return out.toOwnedSlice(allocator);
     }
 
     /// Create a new session file with a single tab containing the given PTY.
@@ -4370,6 +4434,22 @@ pub const App = struct {
 
         var root = &parsed.value.object;
         const arena = parsed.arena.allocator();
+
+        // No-op-on-duplicate: if pty_id already lives in any tab's pane tree,
+        // skip the write entirely. The bug we hit (server panic on session
+        // restore from a corrupt --project.json) was the read-time symptom of
+        // this writer producing duplicates. Idempotency here means the file
+        // never grows a second tab for the same pty_id no matter how many
+        // times the move dispatch fires.
+        if (root.get("tabs")) |tabs_val| {
+            if (findTabHostingPtyId(tabs_val, pty_id)) |host_tab_id| {
+                log.warn(
+                    "appendTabToSessionFile: pty_id={d} already in session file {s} at tab_id={d} — skipping write",
+                    .{ pty_id, path, host_tab_id },
+                );
+                return;
+            }
+        }
 
         // Extract and bump counters — return error if session file is missing fields
         const next_tab_val = root.get("next_tab_id") orelse return error.InvalidSessionFile;
@@ -4411,6 +4491,52 @@ pub const App = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(output);
+    }
+
+    /// Returns the tab id that already hosts pty_id (anywhere in its pane
+    /// tree), or null if no tab in `tabs_val` references pty_id. The tab id
+    /// is used purely for the diagnostic log; if the matched tab is missing
+    /// an integer id field we return 0 rather than null so the caller can
+    /// still detect the duplicate.
+    fn findTabHostingPtyId(tabs_val: std.json.Value, pty_id: u32) ?i64 {
+        if (tabs_val != .array) return null;
+        for (tabs_val.array.items) |tab_val| {
+            if (!paneSubtreeContainsPtyId(tab_val, pty_id)) continue;
+            if (tab_val == .object) {
+                if (tab_val.object.get("id")) |id_val| {
+                    if (id_val == .integer) return id_val.integer;
+                }
+            }
+            return 0;
+        }
+        return null;
+    }
+
+    fn paneSubtreeContainsPtyId(value: std.json.Value, pty_id: u32) bool {
+        switch (value) {
+            .object => |obj| {
+                if (obj.get("type")) |type_val| {
+                    if (type_val == .string and std.mem.eql(u8, type_val.string, "pane")) {
+                        if (obj.get("pty_id")) |pid_val| {
+                            if (pid_val == .integer and @as(u32, @intCast(pid_val.integer)) == pty_id) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    if (paneSubtreeContainsPtyId(entry.value_ptr.*, pty_id)) return true;
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    if (paneSubtreeContainsPtyId(item, pty_id)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
     }
 
     fn ensureSessionDir(state_dir: []const u8) !void {
@@ -5803,4 +5929,30 @@ test "dump path formatters fit in 64-byte buffer at max values" {
         "/tmp/prise-pty-4294967295-2147483647-4294967295",
         pty_path,
     );
+}
+
+test "findTabHostingPtyId detects pre-existing pty_id at any tree depth" {
+    const testing = std.testing;
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "pty_id": 7}},
+        \\    {"id": 4, "root": {
+        \\      "type": "split",
+        \\      "children": [
+        \\        {"type": "pane", "pty_id": 11},
+        \\        {"type": "pane", "pty_id": 13}
+        \\      ]
+        \\    }}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const tabs = parsed.value.object.get("tabs").?;
+
+    try testing.expectEqual(@as(?i64, 1), App.findTabHostingPtyId(tabs, 7));
+    try testing.expectEqual(@as(?i64, 4), App.findTabHostingPtyId(tabs, 11));
+    try testing.expectEqual(@as(?i64, 4), App.findTabHostingPtyId(tabs, 13));
+    try testing.expectEqual(@as(?i64, null), App.findTabHostingPtyId(tabs, 99));
 }
