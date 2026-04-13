@@ -54,6 +54,13 @@ back: *vaxis.AllocatingScreen,
 allocator: std.mem.Allocator,
 rows: u16,
 cols: u16,
+// Cursor position is tracked here rather than on the vaxis screens because
+// upstream vaxis dropped InternalScreen.cursor_row/cursor_col as unused —
+// they were a logical-PTY concern, not a vaxis rendering concern.
+front_cursor_row: u16 = 0,
+front_cursor_col: u16 = 0,
+back_cursor_row: u16 = 0,
+back_cursor_col: u16 = 0,
 cursor_shape: redraw.UIEvent.CursorShape.Shape = .block,
 mouse_shape: redraw.UIEvent.MouseShape.Shape = .default,
 dirty: bool = false,
@@ -167,13 +174,13 @@ pub fn resize(self: *Surface, rows: u16, cols: u16) !void {
     }
 
     // Copy cursor state (clamped to new bounds)
-    new_front.cursor_row = @min(self.front.cursor_row, rows -| 1);
-    new_front.cursor_col = @min(self.front.cursor_col, cols -| 1);
+    self.front_cursor_row = @min(self.front_cursor_row, rows -| 1);
+    self.front_cursor_col = @min(self.front_cursor_col, cols -| 1);
     new_front.cursor_vis = self.front.cursor_vis;
     new_front.cursor_shape = self.front.cursor_shape;
 
-    new_back.cursor_row = @min(self.back.cursor_row, rows -| 1);
-    new_back.cursor_col = @min(self.back.cursor_col, cols -| 1);
+    self.back_cursor_row = @min(self.back_cursor_row, rows -| 1);
+    self.back_cursor_col = @min(self.back_cursor_col, cols -| 1);
     new_back.cursor_vis = self.back.cursor_vis;
     new_back.cursor_shape = self.back.cursor_shape;
 
@@ -209,8 +216,8 @@ fn applyCursor(self: *Surface, params: msgpack.Value) void {
         else => true,
     };
 
-    self.back.cursor_row = row;
-    self.back.cursor_col = col;
+    self.back_cursor_row = row;
+    self.back_cursor_col = col;
     self.back.cursor_vis = visible;
     self.dirty = true;
 }
@@ -559,8 +566,8 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
                     }
                 }
             }
-            self.front.cursor_row = self.back.cursor_row;
-            self.front.cursor_col = self.back.cursor_col;
+            self.front_cursor_row = self.back_cursor_row;
+            self.front_cursor_col = self.back_cursor_col;
             self.front.cursor_vis = self.back.cursor_vis;
 
             // Reset cursor visibility for the next frame. If we don't receive a cursor_pos
@@ -662,9 +669,9 @@ fn resolveDefaultBg(self: *const Surface) [3]u8 {
 
 fn renderCursor(self: *const Surface, win: vaxis.Window, focused: bool) void {
     if (!focused or !self.front.cursor_vis) return;
-    if (self.front.cursor_col >= win.width or self.front.cursor_row >= win.height) return;
+    if (self.front_cursor_col >= win.width or self.front_cursor_row >= win.height) return;
 
-    win.showCursor(self.front.cursor_col, self.front.cursor_row);
+    win.showCursor(self.front_cursor_col, self.front_cursor_row);
     const shape: vaxis.Cell.CursorShape = switch (self.cursor_shape) {
         .block => .block,
         .beam => .beam,
@@ -867,8 +874,8 @@ test "Surface - cursor rendering" {
     defer surface.deinit();
 
     // Set cursor position
-    surface.front.cursor_col = 5;
-    surface.front.cursor_row = 5;
+    surface.front_cursor_col = 5;
+    surface.front_cursor_row = 5;
     surface.front.cursor_vis = true;
     surface.dirty = true;
 
