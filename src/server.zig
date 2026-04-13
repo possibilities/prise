@@ -2400,7 +2400,17 @@ const Server = struct {
 
         try self.sendRedraw(self.loop, pty_instance, msg, client);
 
-        return msgpack.Value{ .unsigned = parsed.pty_id };
+        // Snapshot cwd under the terminal mutex — the read thread mutates it.
+        const cwd_copy = blk: {
+            pty_instance.terminal_mutex.lock();
+            defer pty_instance.terminal_mutex.unlock();
+            break :blk try self.allocator.dupe(u8, pty_instance.cwd.items);
+        };
+
+        var entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        entries[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = parsed.pty_id } };
+        entries[1] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd_copy } };
+        return msgpack.Value{ .map = entries };
     }
 
     fn handleWritePty(self: *Server, params: msgpack.Value) !msgpack.Value {

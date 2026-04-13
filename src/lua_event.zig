@@ -19,6 +19,7 @@ pub const CellSize = struct {
 
 pub const PtyAttachInfo = struct {
     id: u32,
+    cwd: []const u8 = "",
     surface: *Surface,
     app: *anyopaque,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
@@ -133,7 +134,10 @@ fn pushPtyAttachEvent(lua: *ziglua.Lua, info: PtyAttachInfo) void {
     _ = lua.pushString("pty_attach");
     lua.setField(-2, "type");
 
-    lua.createTable(0, 1);
+    lua.createTable(0, 2);
+
+    _ = lua.pushString(info.cwd);
+    lua.setField(-2, "cwd");
 
     const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
     pty.* = .{

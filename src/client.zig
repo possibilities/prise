@@ -211,7 +211,7 @@ pub const ServerAction = union(enum) {
     send_attach: i64,
     spawn_pty_with_cwd: struct { cwd: ?[]const u8 },
     redraw: msgpack.Value,
-    attached: struct { new_pty_id: i64, old_pty_id: ?u32 = null },
+    attached: struct { new_pty_id: i64, old_pty_id: ?u32 = null, cwd: ?[]const u8 = null },
     pty_exited: struct { pty_id: u32, status: u32 },
     pty_spawned: struct { pty_id: u32, cwd: []const u8, session: ?[]const u8 = null, tab: ?[]const u8 = null, title: ?[]const u8 = null },
     cwd_changed: struct { pty_id: u32, cwd: []const u8 },
@@ -286,13 +286,29 @@ pub const ClientLogic = struct {
                 .attach => |attach_info| {
                     state.pty_id = attach_info.pty_id;
                     state.attached = true;
-                    if (attach_info.cwd) |c| {
+                    // Server returns a map with pty_id and cwd; prefer the
+                    // server's live cwd over the client-side attach_info.cwd
+                    // (only populated on session restore).
+                    var server_cwd: ?[]const u8 = null;
+                    if (result == .map) {
+                        for (result.map) |kv| {
+                            if (kv.key != .string) continue;
+                            if (std.mem.eql(u8, kv.key.string, "cwd") and kv.value == .string) {
+                                server_cwd = kv.value.string;
+                            }
+                        }
+                    }
+                    const effective_cwd = server_cwd orelse attach_info.cwd;
+                    var cwd_for_event: ?[]const u8 = null;
+                    if (effective_cwd) |c| {
                         const owned_cwd = state.allocator.dupe(u8, c) catch return .{ .attached = .{ .new_pty_id = attach_info.pty_id } };
                         state.cwd_map.put(attach_info.pty_id, owned_cwd) catch {
                             state.allocator.free(owned_cwd);
+                            return .{ .attached = .{ .new_pty_id = attach_info.pty_id } };
                         };
+                        cwd_for_event = owned_cwd;
                     }
-                    return .{ .attached = .{ .new_pty_id = attach_info.pty_id } };
+                    return .{ .attached = .{ .new_pty_id = attach_info.pty_id, .cwd = cwd_for_event } };
                 },
                 .detach => .detached,
                 .get_server_info => handleServerInfoResult(state, result),
@@ -2070,6 +2086,7 @@ pub const App = struct {
                                         app.ui.update(.{
                                             .pty_attach = .{
                                                 .id = pty_id,
+                                                .cwd = info.cwd orelse "",
                                                 .surface = surface,
                                                 .app = app,
                                                 .send_key_fn = struct {
@@ -3272,17 +3289,21 @@ test "ClientLogic - processServerMessage" {
         try testing.expectEqual(null, action.attached.old_pty_id);
     }
 
-    // Test Attach response (already have pty_id)
+    // Test Attach response (server returns map with pty_id and cwd)
     {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
         try state.pending_requests.put(2, .{ .attach = .{ .pty_id = 123, .cwd = null } });
 
+        var result_kv = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 123 } },
+            .{ .key = .{ .string = "cwd" }, .value = .{ .string = "/home/user/project" } },
+        };
         const msg = rpc.Message{
             .response = .{
                 .msgid = 2,
                 .err = null,
-                .result = .{ .integer = 0 }, // Result of attach is typically success/pty_id
+                .result = .{ .map = &result_kv },
             },
         };
 
@@ -3290,6 +3311,36 @@ test "ClientLogic - processServerMessage" {
         try testing.expect(state.attached);
         try testing.expectEqual(std.meta.Tag(ServerAction).attached, std.meta.activeTag(action));
         try testing.expectEqual(123, action.attached.new_pty_id);
+        try testing.expect(action.attached.cwd != null);
+        try testing.expectEqualStrings("/home/user/project", action.attached.cwd.?);
+        // cwd_map seeded with server cwd — pty:cwd() will see this on reattach
+        try testing.expectEqualStrings("/home/user/project", state.cwd_map.get(123).?);
+    }
+
+    // Test Attach response with empty cwd (server had no cwd tracked yet)
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+        try state.pending_requests.put(3, .{ .attach = .{ .pty_id = 77, .cwd = null } });
+
+        var result_kv = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 77 } },
+            .{ .key = .{ .string = "cwd" }, .value = .{ .string = "" } },
+        };
+        const msg = rpc.Message{
+            .response = .{
+                .msgid = 3,
+                .err = null,
+                .result = .{ .map = &result_kv },
+            },
+        };
+
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expect(state.attached);
+        try testing.expectEqual(77, action.attached.new_pty_id);
+        // Empty cwd string is still passed through — downstream can decide what to do.
+        try testing.expect(action.attached.cwd != null);
+        try testing.expectEqualStrings("", action.attached.cwd.?);
     }
 
     // Test Redraw Notification
