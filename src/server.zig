@@ -3016,14 +3016,28 @@ const Server = struct {
         var root = &parsed.value.object;
         const arena = parsed.arena.allocator();
 
+        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+
+        // No-op-on-duplicate (parity with the client-side appendTabToSessionFile
+        // in src/client.zig on feat/plug-system). If the exact pty_id is
+        // already present anywhere in the tab tree, this call is a redundant
+        // placement; skip the write. Sits alongside the remap-on-collision
+        // logic below, which handles the bounced-server scenario where a new
+        // PTY happens to reuse an old, dead PTY's id.
+        if (tabsContainPtyId(tabs_val.*, @intCast(pty_id))) |host_tab_id| {
+            log.warn(
+                "appendTabToSessionFile: pty_id={d} already in session file {s} at tab_id={d} — skipping write",
+                .{ pty_id, path, host_tab_id },
+            );
+            return;
+        }
+
         // Extract and bump counters
         const next_tab_val = root.get("next_tab_id") orelse return error.InvalidSessionFile;
         const next_split_val = root.get("next_split_id") orelse return error.InvalidSessionFile;
         const new_tab_id = if (next_tab_val == .integer) next_tab_val.integer else return error.InvalidSessionFile;
         const new_split_id = if (next_split_val == .integer) next_split_val.integer else return error.InvalidSessionFile;
-
-        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
-        if (tabs_val.* != .array) return error.InvalidSessionFile;
 
         // Ensure unique pty_id within the file. When the server bounces,
         // the new PTY can get the same ID as an old tab's PTY. The client's
@@ -3072,6 +3086,52 @@ const Server = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(output);
+    }
+
+    /// Returns the tab id that already hosts pty_id (anywhere in its pane
+    /// tree), or null if no tab in `tabs_val` references pty_id. The tab id
+    /// is used purely for the diagnostic warn; if the matched tab is missing
+    /// an integer id field we return 0 rather than null so the caller can
+    /// still detect the duplicate.
+    fn tabsContainPtyId(tabs_val: std.json.Value, pty_id: i64) ?i64 {
+        if (tabs_val != .array) return null;
+        for (tabs_val.array.items) |tab_val| {
+            if (!paneSubtreeContainsPtyId(tab_val, pty_id)) continue;
+            if (tab_val == .object) {
+                if (tab_val.object.get("id")) |id_val| {
+                    if (id_val == .integer) return id_val.integer;
+                }
+            }
+            return 0;
+        }
+        return null;
+    }
+
+    fn paneSubtreeContainsPtyId(value: std.json.Value, pty_id: i64) bool {
+        switch (value) {
+            .object => |obj| {
+                if (obj.get("type")) |type_val| {
+                    if (type_val == .string and std.mem.eql(u8, type_val.string, "pane")) {
+                        if (obj.get("pty_id")) |pid_val| {
+                            if (pid_val == .integer and pid_val.integer == pty_id) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    if (paneSubtreeContainsPtyId(entry.value_ptr.*, pty_id)) return true;
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    if (paneSubtreeContainsPtyId(item, pty_id)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
     }
 
     fn sendCwdChanged(self: *Server, pty_instance: *Pty, cwd: []const u8) !void {
@@ -4117,4 +4177,30 @@ test "server - pty exit notification" {
         }
     }
     try testing.expect(found_send);
+}
+
+test "Server.tabsContainPtyId detects pre-existing pty_id at any tree depth" {
+    const testing = std.testing;
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "pty_id": 7}},
+        \\    {"id": 4, "root": {
+        \\      "type": "split",
+        \\      "children": [
+        \\        {"type": "pane", "pty_id": 11},
+        \\        {"type": "pane", "pty_id": 13}
+        \\      ]
+        \\    }}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const tabs = parsed.value.object.get("tabs").?;
+
+    try testing.expectEqual(@as(?i64, 1), Server.tabsContainPtyId(tabs, 7));
+    try testing.expectEqual(@as(?i64, 4), Server.tabsContainPtyId(tabs, 11));
+    try testing.expectEqual(@as(?i64, 4), Server.tabsContainPtyId(tabs, 13));
+    try testing.expectEqual(@as(?i64, null), Server.tabsContainPtyId(tabs, 99));
 }
