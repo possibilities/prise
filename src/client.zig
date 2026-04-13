@@ -1928,8 +1928,8 @@ pub const App = struct {
             .seq = self.screen_dump_seq,
             .cols = @intCast(cols),
             .rows = @intCast(rows),
-            .cursor_row = screen.cursor_row,
-            .cursor_col = screen.cursor_col,
+            .cursor_row = screen.cursor.row,
+            .cursor_col = screen.cursor.col,
             .text_len = @intCast(text_len),
             .styles_offset = @intCast(styles_offset),
         };
@@ -2062,8 +2062,8 @@ pub const App = struct {
             .seq = state.seq,
             .cols = @intCast(cols),
             .rows = @intCast(rows),
-            .cursor_row = front.cursor_row,
-            .cursor_col = front.cursor_col,
+            .cursor_row = surface.front_cursor_row,
+            .cursor_col = surface.front_cursor_col,
             .text_len = @intCast(text_len),
             .styles_offset = @intCast(styles_offset),
         };
