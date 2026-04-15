@@ -611,6 +611,12 @@ pub const App = struct {
     pipe_read_task: ?io.Task = null,
     vx: vaxis.Vaxis = undefined,
     tty: vaxis.Tty = undefined,
+    /// Tracks whether `initTty` ran to completion so `deinit` can skip the
+    /// Writer-using teardown paths that would otherwise dereference the
+    /// undefined tty (0xaa sentinel bytes → segfault in Io.Writer.writeAll).
+    /// `initTty` is called after `defer app.deinit()` is registered, so any
+    /// error from it leaves the defer in place with no valid tty.
+    tty_initialized: bool = false,
     tty_thread: ?std.Thread = null,
     io_loop: ?*io.Loop = null,
     tty_buffer: [4096]u8 = undefined,
@@ -733,6 +739,7 @@ pub const App = struct {
     /// since the tty writer holds a pointer to tty_buffer.
     pub fn initTty(self: *App) !void {
         self.tty = try vaxis.Tty.init(&self.tty_buffer);
+        self.tty_initialized = true;
         log.info("TTY initialized", .{});
     }
 
@@ -741,9 +748,14 @@ pub const App = struct {
         self.ui.deinit();
         self.state.should_quit = true;
 
-        // Wake up TTY thread by sending a Device Status Report request.
-        // This causes the terminal to send a response, unblocking the read.
-        self.vx.deviceStatusReport(self.tty.writer()) catch {};
+        // Only touch tty/tty_writer when initTty succeeded. When it did not,
+        // `self.tty` is still the App.init `undefined` sentinel and the Writer
+        // vtable pointer is 0xaa… — segfault on any writeAll.
+        if (self.tty_initialized) {
+            // Wake up TTY thread by sending a Device Status Report request.
+            // This causes the terminal to send a response, unblocking the read.
+            self.vx.deviceStatusReport(self.tty.writer()) catch {};
+        }
 
         // Cancel pending recv task
         if (self.recv_task) |*task| {
@@ -805,8 +817,17 @@ pub const App = struct {
         }
         if (self.hit_regions.len > 0) self.allocator.free(self.hit_regions);
         if (self.split_handles.len > 0) self.allocator.free(self.split_handles);
-        self.vx.deinit(self.allocator, self.tty.writer());
-        self.tty.deinit();
+
+        // vx.deinit and tty.deinit both touch the tty writer / termios state
+        // installed by initTty; skip them when initTty never ran. vx.deinit
+        // still frees its own screen allocations, so do that unconditionally.
+        if (self.tty_initialized) {
+            self.vx.deinit(self.allocator, self.tty.writer());
+            self.tty.deinit();
+        } else {
+            self.vx.screen.deinit(self.allocator);
+            self.vx.screen_last.deinit(self.allocator);
+        }
 
         posix.close(self.pipe_read_fd);
         posix.close(self.pipe_write_fd);
