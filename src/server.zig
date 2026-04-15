@@ -59,7 +59,6 @@ pub const LIMITS = struct {
     // Plenty of room for realistic program invocations without unbounded
     // stack buffers.
     pub const SPAWN_ARGV_MAX: usize = 64;
-    pub const PLUGS_MAX: usize = 16;
     pub const PLUG_NAME_MAX: usize = 64;
     pub const CALL_FORWARD_TIMEOUT_MS: i64 = 30_000;
     pub const PENDING_FORWARDS_MAX: usize = 256;
@@ -1220,6 +1219,13 @@ fn buildRedrawMessageFromPty(
 }
 
 const Client = struct {
+    /// Monotonic id assigned by the server at onAccept time. Stable for
+    /// the lifetime of the connection and never reused. Exposed to plugs
+    /// via the client_connected / client_disconnected / pty_attach /
+    /// pty_detach notifications and addressable through notify_plug_client.
+    /// Default is 0 so the hand-rolled Client literals in tests keep
+    /// compiling — the production path always overwrites it in onAccept.
+    id: u64 = 0,
     fd: posix.fd_t,
     /// Per-process-lifetime stable id, assigned monotonically at accept-time
     /// from `Server.next_client_id`. Used as the deterministic broker-pick key
@@ -1355,6 +1361,21 @@ const Client = struct {
     fn finishClose(self: *Client, loop: *io.Loop) void {
         const server = self.server;
         const allocator = server.allocator;
+
+        // Non-plug clients fan out pty_detach for any still-attached PTYs,
+        // then client_disconnected as the final farewell. The latter only
+        // fires if client_connected was fired (notified_plugs flips on the
+        // first non-register_plug RPC), so a client that bails during the
+        // initial handshake never produces an orphan disconnect.
+        // Plug clients announce via broadcastPlugDisconnected below.
+        if (self.plug_name == null) {
+            for (self.attached_ptys.items) |pty_id| {
+                server.forwardPtyClientEvent("pty_detach", self.id, pty_id);
+            }
+            if (self.notified_plugs) {
+                server.forwardClientEvent("client_disconnected", self.id);
+            }
+        }
 
         // Free any remaining queued sends
         for (self.send_queue.items) |buf| {
@@ -2377,6 +2398,9 @@ const Server = struct {
     sweep_timer_task: ?io.Task = null,
     /// Set true during shutdown to gate restart timer callbacks.
     shutting_down: bool = false,
+    /// Monotonic allocator for Client.id. Starts at 1 so 0 can encode
+    /// "unknown client" in payloads if ever needed.
+    next_client_id: u64 = 1,
 
     const ParsedSpawnPty = struct {
         size: pty.Winsize,
@@ -3060,6 +3084,7 @@ const Server = struct {
             try client.attached_ptys.append(self.allocator, parsed.pty_id);
             log.info("Client {} attached to PTY {}", .{ client.fd, parsed.pty_id });
             crash_context.record("attach pty_id={d} client_fd={d}", .{ parsed.pty_id, client.fd });
+            self.forwardPtyClientEvent("pty_attach", client.id, parsed.pty_id);
         } else {
             log.info("Client {} attach_pty for PTY {} was no-op (already attached)", .{ client.fd, parsed.pty_id });
         }
@@ -3223,13 +3248,18 @@ const Server = struct {
         };
 
         pty_instance.removeClient(client);
+        var was_attached = false;
         for (client.attached_ptys.items, 0..) |pid, i| {
             if (pid == pty_id) {
                 _ = client.attached_ptys.swapRemove(i);
+                was_attached = true;
                 break;
             }
         }
         log.info("Client {} detached from PTY {}", .{ client.fd, pty_id });
+        if (was_attached) {
+            self.forwardPtyClientEvent("pty_detach", client.id, pty_id);
+        }
 
         return msgpack.Value.nil;
     }
@@ -3249,13 +3279,18 @@ const Server = struct {
 
             if (self.ptys.get(pty_id)) |pty_instance| {
                 pty_instance.removeClient(client);
+                var was_attached = false;
                 for (client.attached_ptys.items, 0..) |pid, i| {
                     if (pid == pty_id) {
                         _ = client.attached_ptys.swapRemove(i);
+                        was_attached = true;
                         break;
                     }
                 }
                 std.log.info("Client {} detached from PTY {}", .{ client.fd, pty_id });
+                if (was_attached) {
+                    self.forwardPtyClientEvent("pty_detach", client.id, pty_id);
+                }
             }
         }
 
@@ -3419,12 +3454,14 @@ const Server = struct {
     }
 
     fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
-        // On the first non-register_plug RPC, send existing plug notifications.
-        // This is deferred from onAccept so plug clients don't receive
-        // unsolicited messages before their register_plug response.
+        // On the first non-register_plug RPC, send existing plug notifications
+        // and announce the client to subscribed plugs. Both are deferred from
+        // onAccept so plug clients don't emit spurious client_connected
+        // events for themselves before the register_plug handshake lands.
         if (!client.notified_plugs and !std.mem.eql(u8, method, "register_plug")) {
             client.notified_plugs = true;
             self.notifyExistingPlugs(self.loop, client);
+            self.forwardClientEvent("client_connected", client.id);
         }
 
         if (std.mem.eql(u8, method, "ping")) {
@@ -3459,6 +3496,8 @@ const Server = struct {
             return try self.handleSessionSwitch(params);
         } else if (std.mem.eql(u8, method, "notify_plug")) {
             return self.handleNotifyPlug(params);
+        } else if (std.mem.eql(u8, method, "notify_plug_client")) {
+            return self.handleNotifyPlugClient(params);
         } else if (std.mem.eql(u8, method, "spawn_plug")) {
             return self.handleSpawnPlug(params);
         } else if (std.mem.eql(u8, method, "register_plug")) {
@@ -3504,10 +3543,6 @@ const Server = struct {
 
         if (plug_name.len == 0 or plug_name.len > LIMITS.PLUG_NAME_MAX) {
             return error.InvalidPlugName;
-        }
-
-        if (self.plugs.count() >= LIMITS.PLUGS_MAX) {
-            return error.PlugLimitReached;
         }
 
         if (self.plugs.contains(plug_name)) {
@@ -3576,7 +3611,47 @@ const Server = struct {
 
         self.broadcastPlugConnected(self.loop, owned_name);
 
+        // Replay client_connected for every non-plug client already on the
+        // server. The newly-registered plug sees the same event stream
+        // whether the client existed before or after registration, so the
+        // megaplug mirror doesn't need a separate "initial snapshot" path.
+        if (client.isSubscribedPlug("client_connected")) {
+            for (self.clients.items) |c| {
+                if (c.plug_name != null) continue;
+                if (c.closing) continue;
+                if (c == client) continue;
+                if (!c.notified_plugs) continue;
+                self.sendClientConnectedTo(client, c.id);
+            }
+        }
+
         return msgpack.Value{ .string = response };
+    }
+
+    /// Send a single client_connected notification to one specific plug.
+    /// Used by the register-time replay path so the new plug sees an event
+    /// for every existing non-plug client without re-broadcasting.
+    fn sendClientConnectedTo(self: *Server, plug_client: *Client, client_id: u64) void {
+        var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
+            log.err("Failed to alloc client_connected replay: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "client_id" }, .value = .{ .unsigned = client_id } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = msgpack.encode(self.allocator, .{ 2, "client_connected", params }) catch |err| {
+            log.err("Failed to encode client_connected replay: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(msg_bytes);
+
+        plug_client.sendData(self.loop, msg_bytes) catch |err| {
+            log.err("Failed to replay client_connected to plug '{s}': {}", .{
+                plug_client.plug_name orelse "unknown",
+                err,
+            });
+        };
     }
 
     /// Send a plug_connected notification to a single client.
@@ -3601,12 +3676,35 @@ const Server = struct {
     }
 
     /// Notify all non-plug TUI clients that a plug has connected.
+    /// Other subscribed plugs also receive the notification — a plug that
+    /// subscribes to `plug_connected` / `plug_disconnected` can observe
+    /// siblings joining and leaving without polling. The just-registered
+    /// plug is excluded from the forward so it does not receive a
+    /// plug_connected event describing itself (it already knows it
+    /// just registered from handleRegisterPlug's return value).
     fn broadcastPlugConnected(self: *Server, loop: *io.Loop, plug_name: []const u8) void {
         for (self.clients.items) |c| {
             if (c.plug_name != null) continue;
             if (c.closing) continue;
             self.sendPlugConnectedTo(loop, c, plug_name);
         }
+
+        var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
+            log.err("Failed to alloc plug_connected forward: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "plug" }, .value = .{ .string = plug_name } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = msgpack.encode(self.allocator, .{ 2, "plug_connected", params }) catch |err| {
+            log.err("Failed to encode plug_connected forward: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(msg_bytes);
+
+        const just_registered = self.plugs.get(plug_name);
+        self.forwardToSubscribedPlugs("plug_connected", msg_bytes, just_registered);
     }
 
     /// Notify a single client about all already-registered plugs.
@@ -3618,6 +3716,9 @@ const Server = struct {
     }
 
     /// Notify all non-plug TUI clients that a plug has disconnected.
+    /// Subscribed plugs also see the notification (see broadcastPlugConnected).
+    /// Excludes the disconnecting plug itself so it does not receive its own
+    /// farewell while finishClose is still tearing down the send path.
     fn broadcastPlugDisconnected(self: *Server, loop: *io.Loop, plug_name: []const u8) !void {
         var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
         defer self.allocator.free(map_items);
@@ -3634,6 +3735,9 @@ const Server = struct {
                 log.err("Failed to send plug_disconnected to client fd={}: {}", .{ c.fd, err });
             };
         }
+
+        const departing = self.plugs.get(plug_name);
+        self.forwardToSubscribedPlugs("plug_disconnected", msg_bytes, departing);
     }
 
     /// Look up a managed plug by name. Returns null if not found.
@@ -3834,6 +3938,49 @@ const Server = struct {
         return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
     }
 
+    /// Send a notification to a single client addressed by its monotonic id.
+    /// The megaplug dispatches UI-specific notifications through this path —
+    /// per-client refocus commands, targeted state snapshots, etc.
+    fn handleNotifyPlugClient(self: *Server, params: msgpack.Value) !msgpack.Value {
+        if (params != .map) return error.InvalidParams;
+
+        var client_id: ?u64 = null;
+        var method: ?[]const u8 = null;
+        var notif_params: msgpack.Value = .nil;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "client_id")) {
+                client_id = switch (kv.value) {
+                    .unsigned => |u| u,
+                    .integer => |i| if (i >= 0) @intCast(i) else null,
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "method")) {
+                method = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "params")) {
+                notif_params = kv.value;
+            }
+        }
+
+        const cid = client_id orelse return error.MissingClientId;
+        const meth = method orelse return error.MissingMethod;
+
+        const target = blk: {
+            for (self.clients.items) |c| {
+                if (c.id == cid) break :blk c;
+            }
+            return error.ClientNotFound;
+        };
+
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, meth, notif_params });
+        defer self.allocator.free(msg_bytes);
+
+        try target.sendData(self.loop, msg_bytes);
+
+        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+    }
+
     // -- spawn_plug types and handlers --
 
     const SpawnPlugParams = struct {
@@ -3914,10 +4061,6 @@ const Server = struct {
         if (self.plugs.contains(parsed.name)) {
             // Externally connected plug — cannot verify command
             return error.PlugConfigConflict;
-        }
-
-        if (self.managed_plugs.items.len >= LIMITS.PLUGS_MAX) {
-            return error.PlugLimitReached;
         }
 
         // Dupe name (params are transient)
@@ -4152,8 +4295,12 @@ const Server = struct {
                     return;
                 }
 
+                const assigned_id = self.next_client_id;
+                self.next_client_id += 1;
+
                 const client = try self.allocator.create(Client);
                 client.* = .{
+                    .id = assigned_id,
                     .fd = client_fd,
                     .id = self.next_client_id,
                     .server = self,
@@ -4607,6 +4754,50 @@ const Server = struct {
                 });
             };
         }
+    }
+
+    /// Encode a single-key map `{client_id: id}` and forward it to subscribed
+    /// plugs under the given event name. Used for client_connected and
+    /// client_disconnected. Allocation failures are logged and swallowed —
+    /// one missed event does not warrant unwinding the caller.
+    fn forwardClientEvent(self: *Server, event_name: []const u8, client_id: u64) void {
+        var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
+            log.err("Failed to alloc {s} forward: {}", .{ event_name, err });
+            return;
+        };
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "client_id" }, .value = .{ .unsigned = client_id } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = msgpack.encode(self.allocator, .{ 2, event_name, params }) catch |err| {
+            log.err("Failed to encode {s} forward: {}", .{ event_name, err });
+            return;
+        };
+        defer self.allocator.free(msg_bytes);
+
+        self.forwardToSubscribedPlugs(event_name, msg_bytes, null);
+    }
+
+    /// Encode `{client_id, pty_id}` and forward it to subscribed plugs. Used
+    /// for pty_attach and pty_detach — a plug subscribed to either gets the
+    /// pair that lets it reconstruct which client is holding which pty.
+    fn forwardPtyClientEvent(self: *Server, event_name: []const u8, client_id: u64, pty_id: usize) void {
+        var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 2) catch |err| {
+            log.err("Failed to alloc {s} forward: {}", .{ event_name, err });
+            return;
+        };
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "client_id" }, .value = .{ .unsigned = client_id } };
+        map_items[1] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = msgpack.encode(self.allocator, .{ 2, event_name, params }) catch |err| {
+            log.err("Failed to encode {s} forward: {}", .{ event_name, err });
+            return;
+        };
+        defer self.allocator.free(msg_bytes);
+
+        self.forwardToSubscribedPlugs(event_name, msg_bytes, null);
     }
 
     /// Build and send pty_exited notification to all clients
@@ -9611,4 +9802,334 @@ test "handleRegisterPlug - cancels pending restart timer on late registration" {
     try testing.expect(mp.registered);
     try testing.expect(mp.restart_timer_task == null);
     try testing.expect(mp.restart_ctx == null);
+}
+
+test "next_client_id is monotonic and unique" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Simulate the onAccept id-assignment pattern.
+    const first = server.next_client_id;
+    server.next_client_id += 1;
+    const second = server.next_client_id;
+    server.next_client_id += 1;
+    const third = server.next_client_id;
+    server.next_client_id += 1;
+
+    try testing.expectEqual(@as(u64, 1), first);
+    try testing.expectEqual(@as(u64, 2), second);
+    try testing.expectEqual(@as(u64, 3), third);
+    try testing.expect(first != second and second != third and first != third);
+}
+
+test "handleNotifyPlugClient - delivers to exact client" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Two non-plug clients; the notify should land only on id=7.
+    var other: Client = .{
+        .id = 3,
+        .fd = 40,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        if (other.send_buffer) |buf| testing.allocator.free(buf);
+        for (other.send_queue.items) |buf| testing.allocator.free(buf);
+        other.msg_buffer.deinit(testing.allocator);
+        other.send_queue.deinit(testing.allocator);
+        other.attached_ptys.deinit(testing.allocator);
+    }
+
+    var target: Client = .{
+        .id = 7,
+        .fd = 41,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        if (target.send_buffer) |buf| testing.allocator.free(buf);
+        for (target.send_queue.items) |buf| testing.allocator.free(buf);
+        target.msg_buffer.deinit(testing.allocator);
+        target.send_queue.deinit(testing.allocator);
+        target.attached_ptys.deinit(testing.allocator);
+    }
+
+    try server.clients.append(testing.allocator, &other);
+    try server.clients.append(testing.allocator, &target);
+
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "client_id" }, .value = .{ .unsigned = 7 } },
+        .{ .key = .{ .string = "method" }, .value = .{ .string = "refocus" } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    const result = try server.handleNotifyPlugClient(params);
+    testing.allocator.free(result.string);
+
+    // Target got the message, other did not.
+    try testing.expect(target.send_buffer != null);
+    try testing.expect(other.send_buffer == null);
+    try testing.expectEqual(@as(usize, 0), other.send_queue.items.len);
+}
+
+test "handleNotifyPlugClient - unknown client_id returns error" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "client_id" }, .value = .{ .unsigned = 999 } },
+        .{ .key = .{ .string = "method" }, .value = .{ .string = "refocus" } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.ClientNotFound, server.handleNotifyPlugClient(params));
+}
+
+test "forwardPtyClientEvent - delivers to subscribed plug" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-register a plug that subscribes to pty_attach via the wildcard.
+    const plug_name = try testing.allocator.dupe(u8, "megaplug");
+    const sub = try testing.allocator.dupe(u8, "*");
+    var subs = try testing.allocator.alloc([]const u8, 1);
+    subs[0] = sub;
+
+    var plug_client: Client = .{
+        .id = 0,
+        .fd = 55,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+        .plug_name = plug_name,
+        .plug_subscriptions = subs,
+    };
+    defer {
+        if (plug_client.send_buffer) |buf| testing.allocator.free(buf);
+        for (plug_client.send_queue.items) |buf| testing.allocator.free(buf);
+        if (plug_client.plug_name) |pn| testing.allocator.free(pn);
+        if (plug_client.plug_subscriptions) |ss| {
+            for (ss) |s| testing.allocator.free(s);
+            testing.allocator.free(ss);
+        }
+        plug_client.msg_buffer.deinit(testing.allocator);
+        plug_client.send_queue.deinit(testing.allocator);
+        plug_client.attached_ptys.deinit(testing.allocator);
+    }
+
+    try server.clients.append(testing.allocator, &plug_client);
+    try server.plugs.put(plug_name, &plug_client);
+
+    server.forwardPtyClientEvent("pty_attach", 42, 7);
+
+    // The plug should have received one message.
+    try testing.expect(plug_client.send_buffer != null);
+}
+
+test "handleRegisterPlug - replays client_connected for existing clients" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp_item| mp_item.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Two non-plug clients already on the server, both confirmed non-plug
+    // (notified_plugs=true simulates having sent their first non-register RPC).
+    var tui_a: Client = .{
+        .id = 11,
+        .fd = 60,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+        .notified_plugs = true,
+    };
+    defer {
+        if (tui_a.send_buffer) |buf| testing.allocator.free(buf);
+        for (tui_a.send_queue.items) |buf| testing.allocator.free(buf);
+        tui_a.msg_buffer.deinit(testing.allocator);
+        tui_a.send_queue.deinit(testing.allocator);
+        tui_a.attached_ptys.deinit(testing.allocator);
+    }
+    var tui_b: Client = .{
+        .id = 12,
+        .fd = 61,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+        .notified_plugs = true,
+    };
+    defer {
+        if (tui_b.send_buffer) |buf| testing.allocator.free(buf);
+        for (tui_b.send_queue.items) |buf| testing.allocator.free(buf);
+        tui_b.msg_buffer.deinit(testing.allocator);
+        tui_b.send_queue.deinit(testing.allocator);
+        tui_b.attached_ptys.deinit(testing.allocator);
+    }
+    try server.clients.append(testing.allocator, &tui_a);
+    try server.clients.append(testing.allocator, &tui_b);
+
+    // Managed plug pre-seeded so handleRegisterPlug finds its token.
+    const token = Server.generatePlugToken();
+    const mp_name = try testing.allocator.dupe(u8, "replay-plug");
+    const cmd_arg = try testing.allocator.dupe(u8, "echo");
+    const cmd_slice = try testing.allocator.alloc([]const u8, 1);
+    cmd_slice[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = mp_name,
+        .cmd = cmd_slice,
+        .restart = false,
+        .restart_delay_ms = 0,
+        .token = token,
+        .pid = 12345,
+    });
+
+    // Plug subscribes to client_connected (via wildcard) so the replay fires.
+    var plug_client: Client = .{
+        .id = 0,
+        .fd = 62,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    defer {
+        if (plug_client.send_buffer) |buf| testing.allocator.free(buf);
+        for (plug_client.send_queue.items) |buf| testing.allocator.free(buf);
+        if (plug_client.plug_name) |pn| testing.allocator.free(pn);
+        if (plug_client.plug_subscriptions) |ss| {
+            for (ss) |s| testing.allocator.free(s);
+            testing.allocator.free(ss);
+        }
+        plug_client.msg_buffer.deinit(testing.allocator);
+        plug_client.send_queue.deinit(testing.allocator);
+        plug_client.attached_ptys.deinit(testing.allocator);
+    }
+    try server.clients.append(testing.allocator, &plug_client);
+
+    var sub_arr: [1]msgpack.Value = .{.{ .string = "*" }};
+    var kv_buf: [3]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "replay-plug" } },
+        .{ .key = .{ .string = "token" }, .value = .{ .string = &token } },
+        .{ .key = .{ .string = "subscribe" }, .value = .{ .array = &sub_arr } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    const result = try server.handleRegisterPlug(&plug_client, params);
+    testing.allocator.free(result.string);
+
+    // Plug should have client_connected for both tui_a and tui_b: first
+    // lands in send_buffer, the second queues behind it. No extras.
+    try testing.expect(plug_client.send_buffer != null);
+    try testing.expectEqual(@as(usize, 1), plug_client.send_queue.items.len);
 }

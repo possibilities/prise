@@ -129,6 +129,8 @@ pub const UI = struct {
     plug_call_ctx: *anyopaque = undefined,
     plug_notify_callback: ?*const fn (ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value) anyerror!void = null,
     plug_notify_ctx: *anyopaque = undefined,
+    plug_notify_client_callback: ?*const fn (ctx: *anyopaque, client_id: u64, method: []const u8, params: msgpack.Value) anyerror!void = null,
+    plug_notify_client_ctx: *anyopaque = undefined,
     plug_list_callback: ?*const fn (ctx: *anyopaque, callback_ref: i32) anyerror!void = null,
     plug_list_ctx: *anyopaque = undefined,
     text_inputs: std.AutoHashMap(u32, *TextInput),
@@ -356,6 +358,11 @@ pub const UI = struct {
         self.plug_notify_callback = cb;
     }
 
+    pub fn setPlugNotifyClientCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, client_id: u64, method: []const u8, params: msgpack.Value) anyerror!void) void {
+        self.plug_notify_client_ctx = ctx;
+        self.plug_notify_client_callback = cb;
+    }
+
     pub fn setPlugListCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, callback_ref: i32) anyerror!void) void {
         self.plug_list_ctx = ctx;
         self.plug_list_callback = cb;
@@ -520,6 +527,9 @@ pub const UI = struct {
 
         lua.pushFunction(ziglua.wrap(notifyPlug));
         lua.setField(-2, "notify_plug");
+
+        lua.pushFunction(ziglua.wrap(notifyPlugClient));
+        lua.setField(-2, "notify_plug_client");
 
         lua.pushFunction(ziglua.wrap(listPlugs));
         lua.setField(-2, "list_plugs");
@@ -899,6 +909,41 @@ pub const UI = struct {
         // walks this error path.
         cb(ui.plug_notify_ctx, name, method, params) catch |err| {
             lua.raiseErrorStr("notify_plug failed: %s", .{@errorName(err).ptr});
+        };
+
+        return 0;
+    }
+
+    /// Lua: prise.notify_plug_client(client_id, "update", {data="hello"})
+    /// Sends a notification to exactly one connected client, addressed by the
+    /// monotonic client_id delivered via client_connected / pty_attach events.
+    fn notifyPlugClient(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.raiseErrorStr("UI not available", .{});
+        };
+        lua.pop(1);
+
+        const cb = ui.plug_notify_client_callback orelse {
+            lua.raiseErrorStr("notify_plug_client callback not configured", .{});
+        };
+
+        const raw_id = lua.checkInteger(1);
+        if (raw_id < 0) lua.raiseErrorStr("notify_plug_client: client_id must be non-negative", .{});
+        const client_id: u64 = @intCast(raw_id);
+        const method = lua.checkString(2);
+
+        const lua_msgpack = @import("lua_msgpack.zig");
+        const params = if (lua.getTop() >= 3)
+            lua_msgpack.luaToMsgpackValue(lua, ui.allocator, 3) catch |err| {
+                lua.raiseErrorStr("notify_plug_client: failed to convert params: %s", .{@errorName(err).ptr});
+            }
+        else
+            msgpack.Value.nil;
+
+        // Callback takes unconditional ownership of params (matches notify_plug).
+        cb(ui.plug_notify_client_ctx, client_id, method, params) catch |err| {
+            lua.raiseErrorStr("notify_plug_client failed: %s", .{@errorName(err).ptr});
         };
 
         return 0;

@@ -132,6 +132,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&test_cmd.step);
 
+    // test-compile installs the test binary without running it. The macOS
+    // Zig 0.15.2 orchestrator hangs when `zig build test` actually invokes
+    // the test runner, so this step lets us compile + type-check tests in
+    // isolation and then execute the artifact directly under `.zig-cache/`.
+    const test_compile_step = b.step("test-compile", "Compile tests without running");
+    test_compile_step.dependOn(&b.addInstallArtifact(tests, .{}).step);
+
     const check_fmt = b.addSystemCommand(&.{
         "sh", "-c",
         \\zig fmt --check src --exclude src/lua && zig fmt --check tools build.zig && stylua --check src/lua || {

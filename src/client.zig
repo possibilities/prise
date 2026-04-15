@@ -1606,6 +1606,13 @@ pub const App = struct {
             }
         }.cb);
 
+        self.ui.setPlugNotifyClientCallback(self, struct {
+            fn cb(ctx: *anyopaque, client_id: u64, method: []const u8, params: msgpack.Value) anyerror!void {
+                const app: *App = @ptrCast(@alignCast(ctx));
+                try app.sendNotifyPlugClient(client_id, method, params);
+            }
+        }.cb);
+
         self.ui.setPlugListCallback(self, struct {
             fn cb(ctx: *anyopaque, callback_ref: i32) anyerror!void {
                 const app: *App = @ptrCast(@alignCast(ctx));
@@ -3993,6 +4000,26 @@ pub const App = struct {
         try self.state.pending_requests.put(msgid, .notify_plug);
 
         const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "notify_plug", msgpack.Value{ .map = map_items } });
+        defer self.allocator.free(msg);
+        try self.sendDirect(msg);
+    }
+
+    fn sendNotifyPlugClient(self: *App, client_id: u64, method: []const u8, params: msgpack.Value) !void {
+        // Ownership mirrors sendNotifyPlug: we own params; defer deinits on
+        // both success and error paths.
+        defer params.deinit(self.allocator);
+
+        const map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "client_id" }, .value = .{ .unsigned = client_id } };
+        map_items[1] = .{ .key = .{ .string = "method" }, .value = .{ .string = method } };
+        map_items[2] = .{ .key = .{ .string = "params" }, .value = params };
+
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+        try self.state.pending_requests.put(msgid, .notify_plug);
+
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "notify_plug_client", msgpack.Value{ .map = map_items } });
         defer self.allocator.free(msg);
         try self.sendDirect(msg);
     }
