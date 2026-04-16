@@ -419,3 +419,83 @@ assert(#s.tabs == 2, "break solo-float: tab count unchanged")
 assert(s.tabs[1].root.id == 1, "break solo-float: main-tree pane untouched")
 assert(s.tabs[1].floating ~= nil, "break solo-float: floating pane still attached")
 assert(s.tabs[1].floating.pane.id == 50, "break solo-float: floating pane identity preserved")
+
+-- === break_pane with was_active=true AND focus=false: no focus steal ===
+-- The caller opts out of focus-follow via data.focus=false. Source tab is
+-- the active tab and the focused pane is a sibling of the moved pane, so
+-- without the opt-out we'd yank focus to the new tab. With focus=false the
+-- break is silent: active_tab and focused_id stay pinned to the sibling.
+
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+tiling.update({ type = "break_pane", data = { pty_id = 2, focus = false } })
+s = t.get_state()
+assert(s.active_tab == 1, "break active+focus=false: active_tab unchanged, got " .. tostring(s.active_tab))
+assert(s.focused_id == 1, "break active+focus=false: focused_id unchanged, got " .. tostring(s.focused_id))
+assert(#s.tabs == 2, "break active+focus=false: new tab still appended")
+assert(s.tabs[2].root.id == 2, "break active+focus=false: moved pane landed in new tab")
+
+-- === break_pane with was_active=true AND focus=true: focus still follows ===
+-- Explicit focus=true matches default behavior — regression protection for
+-- the opt-in path when callers want to be explicit about following.
+
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+tiling.update({ type = "break_pane", data = { pty_id = 2, focus = true } })
+s = t.get_state()
+assert(s.active_tab == 2, "break active+focus=true: active_tab moved to new tab, got " .. tostring(s.active_tab))
+assert(s.focused_id == 2, "break active+focus=true: focus followed to moved pane, got " .. tostring(s.focused_id))
+
+-- === break_pane with was_active=false AND focus=false: no-op on focus either way ===
+-- When the source tab is inactive, follow_focus is a no-op — existing
+-- behavior already leaves focus alone. Confirms the opt-out doesn't flip
+-- any off-path behavior.
+
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+        { id = 2, root = mock_pane(99), last_focused_id = 99 },
+    },
+    active_tab = 2,
+    focused_id = 99,
+    next_tab_id = 3,
+})
+tiling.update({ type = "break_pane", data = { pty_id = 2, focus = false } })
+s = t.get_state()
+assert(s.active_tab == 2, "break inactive+focus=false: active_tab unchanged")
+assert(s.focused_id == 99, "break inactive+focus=false: focus unchanged")
+assert(#s.tabs == 3, "break inactive+focus=false: new tab appended")
+assert(s.tabs[3].root.id == 2, "break inactive+focus=false: moved pane is in the new tab")

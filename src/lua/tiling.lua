@@ -180,7 +180,7 @@ local utils = require("utils")
 
 ---@class BreakPaneEvent
 ---@field type "break_pane"
----@field data { pty_id: number }
+---@field data { pty_id: number, focus?: boolean }
 
 ---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|BreakPaneEvent
 
@@ -3244,12 +3244,20 @@ function M.update(event)
         -- Move a pane out of its current tab into a brand-new tab of its own.
         -- Dumb primitive: no "which pane should break?" policy lives here —
         -- callers decide. Focus follows the moved pane if (and only if) the
-        -- source tab is the currently active tab; otherwise the operation is
-        -- silent with no focus steal.
+        -- source tab is the currently active tab AND the caller did not opt
+        -- out via data.focus = false; otherwise the operation is silent with
+        -- no focus steal.
         local pty_id = event.data and event.data.pty_id
         if type(pty_id) ~= "number" then
             return
         end
+
+        -- Opt-out focus-follow. Default true preserves historical behavior;
+        -- callers pass focus = false to break a pane in the background even
+        -- when the source tab is active (e.g. the user is focused on a
+        -- different pane in the same tab and shouldn't be yanked to the new
+        -- tab).
+        local follow_focus = not (event.data and event.data.focus == false)
 
         local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
         if not src_tab then
@@ -3300,6 +3308,9 @@ function M.update(event)
             close_auxiliary_panes(src_tab)
             table.remove(state.tabs, src_tab_idx)
             if was_active then
+                -- Keep state.active_tab valid even when follow_focus is
+                -- false — the active tab was just removed, so the index
+                -- must be retargeted regardless.
                 local new_idx = math.min(src_tab_idx, #state.tabs)
                 state.active_tab = new_idx
                 local new_tab = state.tabs[new_idx]
@@ -3307,15 +3318,17 @@ function M.update(event)
                     state.zoomed_pane_id = new_tab.zoomed_pane_id
                     new_tab.zoomed_pane_id = nil
                 end
-                local new_focus_id = new_tab and new_tab.last_focused_id
-                if new_tab and new_focus_id and not find_node_path(new_tab.root, new_focus_id) then
-                    local first = get_first_leaf(new_tab.root)
-                    new_focus_id = first and first.id or nil
+                if follow_focus then
+                    local new_focus_id = new_tab and new_tab.last_focused_id
+                    if new_tab and new_focus_id and not find_node_path(new_tab.root, new_focus_id) then
+                        local first = get_first_leaf(new_tab.root)
+                        new_focus_id = first and first.id or nil
+                    end
+                    local old_focused = state.focused_id
+                    state.focused_id = new_focus_id
+                    update_pty_focus(old_focused, new_focus_id)
+                    update_cached_git_branch()
                 end
-                local old_focused = state.focused_id
-                state.focused_id = new_focus_id
-                update_pty_focus(old_focused, new_focus_id)
-                update_cached_git_branch()
             elseif src_tab_idx < state.active_tab then
                 state.active_tab = state.active_tab - 1
             end
@@ -3345,16 +3358,19 @@ function M.update(event)
         }
         table.insert(state.tabs, new_tab)
 
-        if was_active then
+        if was_active and follow_focus then
             -- set_active_tab_index handles zoom save/restore on the old tab,
             -- picks the new tab's last_focused_id (which we just set to the
             -- moved pane), and fires update_pty_focus.
             set_active_tab_index(#state.tabs)
         end
-        -- When the source tab was inactive: state.active_tab is unchanged
-        -- (appending a tab doesn't shift existing indices) and state.focused_id
-        -- still refers to a pane in the still-active tab, which by invariant
-        -- cannot be the moved pane. No focus mutation needed.
+        -- When the source tab was inactive OR the caller opted out of focus-
+        -- follow: state.active_tab is unchanged (appending a tab doesn't
+        -- shift existing indices) and state.focused_id still refers to a
+        -- pane in the still-active tab — in the inactive case, not the moved
+        -- pane by invariant; in the opt-out case, the focused pane is a
+        -- sibling of the moved pane in the (still-active) source tab. No
+        -- focus mutation needed either way.
 
         prise.save()
         prise.request_frame()
