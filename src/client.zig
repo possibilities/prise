@@ -2469,6 +2469,18 @@ pub const App = struct {
                     current_bytes_read = n;
                 }
 
+                // Drain a session switch queued during the message batch we
+                // just processed. plug_notification → init.lua plug-method
+                // handler → prise.switch_session lands the target on
+                // pending_session_switch but does not kick the input pipe,
+                // so without this the queued switch sits idle until the
+                // next keystroke fires onPipeRead. Safe here because we are
+                // past all Lua processing for the current batch and
+                // switchToSession does not touch recv_task — only
+                // forceQuitIfPending / detachIfPending cancel it, and those
+                // remain onPipeRead-only.
+                app.switchSessionIfPending();
+
                 // Keep receiving unless we're quitting
                 if (!app.state.should_quit) {
                     app.recv_task = try l.recv(app.fd, &app.recv_buffer, .{
