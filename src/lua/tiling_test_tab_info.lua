@@ -106,3 +106,23 @@ state.active_tab = 1
 state.focused_id = 99
 idx = tiling.get_focused_pane_index()
 assert(idx == nil, "get_focused_pane_index: pane not in tab returns nil")
+
+-- === get_focused_id ===
+
+-- Test: get_focused_id returns the raw pty_id of the focused pane
+state.tabs = { mock_tab(mock_split(1, "row", { mock_pane(10), mock_pane(20) })) }
+state.active_tab = 1
+state.focused_id = 20
+assert(tiling.get_focused_id() == 20, "get_focused_id: returns focused pty_id")
+
+-- Test: get_focused_id returns nil when no pane is focused
+state.focused_id = nil
+assert(tiling.get_focused_id() == nil, "get_focused_id: returns nil when no focus")
+
+-- Test: get_focused_id is indifferent to whether the pane lives in the
+-- active tab — it just mirrors state.focused_id. Callers that want a
+-- "focus lives in active tab" guarantee layer that check on top.
+state.tabs = { mock_tab(mock_pane(10)), mock_tab(mock_pane(20)) }
+state.active_tab = 1
+state.focused_id = 42
+assert(tiling.get_focused_id() == 42, "get_focused_id: mirrors state.focused_id verbatim")

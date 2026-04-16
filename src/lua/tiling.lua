@@ -4505,6 +4505,16 @@ function M.get_focused_pane_index()
     return nil
 end
 
+---Return the raw pty_id of the focused pane, or nil when no pane is
+---focused. Complements `get_focused_pane_index` for callers that need to
+---reference the focused pane by its actual identifier rather than by
+---position within a tab — e.g. plugs comparing against pane ids they
+---emitted elsewhere.
+---@return number?
+function M.get_focused_id()
+    return state.focused_id
+end
+
 -- Export internal functions for testing
 M._test = {
     is_pane = is_pane,
