@@ -2407,9 +2407,23 @@ const Server = struct {
             break :blk try self.allocator.dupe(u8, pty_instance.cwd.items);
         };
 
+        // Keys must be allocator-owned: handleRpcRequest defers
+        // result.deinit which calls allocator.free on every Value.string,
+        // including map keys. A literal "pty_id" / "cwd" sits in rodata
+        // and freeing it bus-errors the server. Other RPC handlers in this
+        // file follow the same dupe-keys convention (handleSpawnPty,
+        // handleListPtys, etc.). Notification builders use literals and
+        // are safe because their maps are encoded then thrown away
+        // without going through Value.deinit.
         var entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
-        entries[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = parsed.pty_id } };
-        entries[1] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd_copy } };
+        entries[0] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "pty_id") },
+            .value = .{ .unsigned = parsed.pty_id },
+        };
+        entries[1] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "cwd") },
+            .value = .{ .string = cwd_copy },
+        };
         return msgpack.Value{ .map = entries };
     }
 
