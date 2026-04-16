@@ -6305,6 +6305,22 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     const signal_pipe_fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
     signal_write_fd = signal_pipe_fds[1];
 
+    // Ignore SIGPIPE. The upstream io layer (kqueue.zig completeSend) calls
+    // posix.send(fd, buf, 0) with no MSG_NOSIGNAL flag. On macOS, writing to
+    // a broken socket delivers SIGPIPE — default action is silent process
+    // termination (no panic handler, no crash bundle, no error). With plugs,
+    // forwardToSubscribedPlugs writes to plug sockets that can go stale when
+    // a plug process dies and restarts. Ignoring SIGPIPE makes posix.send
+    // return EPIPE instead, which the io layer catches and returns as an
+    // .err completion. forwardToSubscribedPlugs already has a catch block
+    // that logs the error and continues.
+    const ignore: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &ignore, null);
+
     var sa: posix.Sigaction = .{
         .handler = .{ .handler = signalHandler },
         .mask = posix.sigemptyset(),
