@@ -576,3 +576,116 @@ do
     assert(overlay_pane.pty._closed, "overlay-orphan: overlay pane pty closed")
     assert(#place_calls == 1, "overlay-orphan: place_pty_in_session called")
 end
+
+-- === Return value: true on happy path ===
+
+reset_captures()
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+local happy_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 2,
+        session_name = "foo",
+        cwd = "/home/user/code/foo",
+        tab_title = "my-claude",
+    },
+})
+assert(happy_ret == true, "return-happy: returns true on successful move")
+
+-- === Return value: false when pane not in viewer's state ===
+
+reset_captures()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+        { id = 2, root = mock_pane(2), last_focused_id = 2 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 3,
+})
+local missing_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 999, -- not in state.tabs
+        session_name = "foo",
+        cwd = "/tmp/foo",
+        tab_title = "ghost",
+    },
+})
+assert(missing_ret == false, "return-missing: returns false when pane absent from state")
+assert(#place_calls == 0, "return-missing: place_pty_in_session NOT called")
+assert(save_calls == 0, "return-missing: prise.save NOT called")
+
+-- === Return value: false on solo-pane-in-only-tab refusal ===
+
+reset_captures()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+local solo_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 1,
+        session_name = "foo",
+        cwd = "/tmp",
+        tab_title = "t",
+    },
+})
+assert(solo_ret == false, "return-solo: returns false when refusing to empty session")
+
+-- === Return value: false on bad args ===
+
+reset_captures()
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+local bad_pty_ret = tiling.update({
+    type = "move_pane_to_session",
+    ---@diagnostic disable-next-line: assign-type-mismatch
+    data = { pty_id = "not-a-number", session_name = "foo", cwd = "/tmp", tab_title = "t" },
+})
+assert(bad_pty_ret == false, "return-bad-pty: returns false on non-number pty_id")
+
+local bad_session_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = { pty_id = 2, session_name = "", cwd = "/tmp", tab_title = "t" },
+})
+assert(bad_session_ret == false, "return-bad-session: returns false on empty session_name")
+
+local bad_cwd_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = { pty_id = 2, session_name = "foo", cwd = "", tab_title = "t" },
+})
+assert(bad_cwd_ret == false, "return-bad-cwd: returns false on empty cwd")

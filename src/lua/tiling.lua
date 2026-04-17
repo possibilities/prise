@@ -3220,41 +3220,53 @@ function M.update(event)
         -- own the policy of which session to land in (cwd basename, per-
         -- project routing, etc.); this primitive just executes the move.
         --
+        -- Returns true on success, false when the move is refused or
+        -- can't be performed (bad args, pane not in the viewer's state,
+        -- solo-pane-in-only-tab refusal). Callers can gate downstream
+        -- effects (DB re-key, event emission) on the return value so a
+        -- no-op doesn't produce a ghost move. The pane isn't in the
+        -- viewer's state when the pane lives in another session's
+        -- saved JSON (find_tab_for_pane only walks state.tabs) — the
+        -- caller either needs to be attached to the source session or
+        -- route the move through a cross-session primitive.
+        --
         -- Invariant caveat: the tree mutation happens BEFORE the cross-
         -- session file write. If prise.place_pty_in_session fails, we log
         -- and leave the PTY orphaned in memory — no rollback primitive
         -- exists and re-attaching the leaf would race with an in-flight
-        -- save.
+        -- save. The move still counts as "succeeded" (return true) from
+        -- the caller's perspective: the pane left the source tree and
+        -- the DB re-key reflects the intended post-move session.
         local pty_id = event.data and event.data.pty_id
         local session_name = event.data and event.data.session_name
         local cwd = event.data and event.data.cwd
         local tab_title = event.data and event.data.tab_title
         if type(pty_id) ~= "number" then
-            return
+            return false
         end
         if type(session_name) ~= "string" or session_name == "" then
-            return
+            return false
         end
         if type(cwd) ~= "string" or cwd == "" then
-            return
+            return false
         end
 
         local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
         if not src_tab or not src_tab_idx then
-            return
+            return false
         end
         -- find_tab_for_pane also resolves floating/overlay panes; require
         -- the leaf to live in the tileable tree. Doubles as a nil-guard
         -- on the tree walk.
         if not find_node_path(src_tab.root, pty_id) then
-            return
+            return false
         end
 
         -- Solo-pane in the only tab: refusing the move keeps the current
         -- session from going empty. Multi-tab solo panes fall through —
         -- dropping one tab still leaves the session non-empty.
         if is_pane(src_tab.root) and src_tab.root.id == pty_id and #state.tabs == 1 then
-            return
+            return false
         end
 
         local was_active = (src_tab_idx == state.active_tab)
@@ -3353,6 +3365,7 @@ function M.update(event)
 
         prise.save()
         prise.request_frame()
+        return true
     elseif event.type == "mouse" then
         local d = event.data
 
