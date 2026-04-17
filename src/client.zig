@@ -4665,12 +4665,79 @@ pub const App = struct {
 
         try removeLeafFromTabsJson(tabs_val, pty_id);
 
+        // After splicing the leaf out, clear or reassign dangling focus
+        // references. Root `focused_id` falls back to null (the Lua loader
+        // reads missing-or-null focused_id as `state.focused_id = nil`;
+        // both round-trip identically). Per-tab `last_focused_id` points
+        // at the first surviving leaf in that tab so navigating back
+        // doesn't aim at a departed pty. Skip when the field wasn't
+        // present or didn't match — no spurious writes.
+        clearStaleFocusedIds(root, tabs_val.*, pty_id);
+
         const output = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
         defer self.allocator.free(output);
 
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(output);
+    }
+
+    /// Clear root `focused_id` and per-tab `last_focused_id` references
+    /// that still point at `removed_pty_id`. Assumes `tabs_val` has
+    /// already been rewritten by `removeLeafFromTabsJson` — surviving
+    /// tabs reflect the post-remove tree. Non-matching values are left
+    /// untouched so unrelated tabs keep their focus memory.
+    fn clearStaleFocusedIds(root: *std.json.ObjectMap, tabs_val: std.json.Value, removed_pty_id: u32) void {
+        if (root.getPtr("focused_id")) |fid| {
+            if (fid.* == .integer and @as(u32, @intCast(fid.integer)) == removed_pty_id) {
+                fid.* = .null;
+            }
+        }
+
+        if (tabs_val != .array) return;
+        for (tabs_val.array.items) |tab_val| {
+            if (tab_val != .object) continue;
+            var tab_obj = tab_val.object;
+            const lfi = tab_obj.getPtr("last_focused_id") orelse continue;
+            if (lfi.* != .integer) continue;
+            if (@as(u32, @intCast(lfi.integer)) != removed_pty_id) continue;
+            const root_val = tab_obj.get("root") orelse {
+                lfi.* = .null;
+                continue;
+            };
+            if (firstPtyIdInPaneTree(root_val)) |survivor| {
+                lfi.* = .{ .integer = @as(i64, @intCast(survivor)) };
+            } else {
+                lfi.* = .null;
+            }
+        }
+    }
+
+    /// Return the pty_id of the first pane leaf encountered in a
+    /// pre-order walk of `value`. Splits recurse into children left-to-
+    /// right. Returns null on malformed trees or empty subtrees — caller
+    /// treats null as "no surviving focus target" and falls back to
+    /// JSON null.
+    fn firstPtyIdInPaneTree(value: std.json.Value) ?u32 {
+        if (value != .object) return null;
+        const obj = value.object;
+        const type_val = obj.get("type") orelse return null;
+        if (type_val != .string) return null;
+
+        if (std.mem.eql(u8, type_val.string, "pane")) {
+            const pid_val = obj.get("pty_id") orelse return null;
+            if (pid_val != .integer) return null;
+            return @as(u32, @intCast(pid_val.integer));
+        }
+
+        if (!std.mem.eql(u8, type_val.string, "split")) return null;
+
+        const children_val = obj.get("children") orelse return null;
+        if (children_val != .array) return null;
+        for (children_val.array.items) |child| {
+            if (firstPtyIdInPaneTree(child)) |pid| return pid;
+        }
+        return null;
     }
 
     /// In-place rewrite of `tabs_val.array` with the `pty_id`-hosting leaf

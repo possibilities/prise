@@ -1102,7 +1102,9 @@ assert(#place_calls == 0, "viewer-on-dest: place_pty_in_session NOT called (in-m
 assert(save_calls == 1, "viewer-on-dest: prise.save() called once")
 local vod_state = t.get_state()
 assert(#vod_state.tabs == 2, "viewer-on-dest: new tab appended to state.tabs")
-assert(vod_state.tabs[2].root.id == 42, "viewer-on-dest: new tab root has moved pty_id")
+assert(vod_state.tabs[2].root.pty_id == 42, "viewer-on-dest: new tab root has pty_id (fn-8 spec shape)")
+assert(vod_state.tabs[2].root.cwd == "/home/user/code/bravo", "viewer-on-dest: new tab root has cwd")
+assert(vod_state.tabs[2].root.id == nil, "viewer-on-dest: new tab root has no id field (fn-8 spec shape)")
 assert(vod_state.tabs[2].title == "moved", "viewer-on-dest: new tab has correct title")
 assert(vod_state.next_tab_id == 3, "viewer-on-dest: next_tab_id bumped")
 
