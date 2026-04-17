@@ -1591,6 +1591,8 @@ const Client = struct {
             try self.handleColorResponse(notif);
         } else if (std.mem.eql(u8, notif.method, "break_pane_reply")) {
             try self.server.handleBreakPaneReply(notif);
+        } else if (std.mem.eql(u8, notif.method, "session_file_changed")) {
+            try self.handleSessionFileChanged(notif);
         } else if (std.mem.startsWith(u8, notif.method, "plug.")) {
             if (self.plug_name) |name| {
                 try self.server.forwardPlugNotification(self.server.loop, notif, name);
@@ -2243,6 +2245,33 @@ const Client = struct {
         _ = pty_instance.flushResponses();
 
         log.debug("Filled color response slot {} for PTY {}: {s}", .{ response_slot, pid, response });
+    }
+
+    /// Receive a session_file_changed notification from a TUI client that
+    /// just mutated another session's saved-state file (e.g. via
+    /// placePtyInSession). Fan it out to every other TUI client so any
+    /// client currently attached to the named session can reload from disk
+    /// and avoid clobbering the mutation on its next save.
+    fn handleSessionFileChanged(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .map) {
+            log.warn("session_file_changed notification: invalid params (expected map)", .{});
+            return;
+        }
+
+        var session_name: ?[]const u8 = null;
+        for (notif.params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "session_name")) {
+                if (kv.value == .string) session_name = kv.value.string;
+            }
+        }
+
+        const name = session_name orelse {
+            log.warn("session_file_changed: missing session_name", .{});
+            return;
+        };
+
+        try self.server.broadcastSessionFileChanged(self.server.loop, name);
     }
 
     /// Parse u8 from msgpack value, returns null if invalid type.
@@ -3778,6 +3807,29 @@ const Server = struct {
             if (c.closing) continue;
             c.sendData(loop, msg_bytes) catch |err| {
                 log.err("Failed to send plug_notification to client fd={}: {}", .{ c.fd, err });
+            };
+        }
+    }
+
+    /// Broadcast a session_file_changed notification to all TUI clients so
+    /// anyone currently attached to the named session can reload their
+    /// in-memory state from disk. Mirrors forwardPlugNotification's shape
+    /// but uses a flat, prise-native method (no "plug." prefix) — this is
+    /// prise's own coherence signal, not a plug-originated intent.
+    fn broadcastSessionFileChanged(self: *Server, loop: *io.Loop, session_name: []const u8) !void {
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "session_name" }, .value = .{ .string = session_name } };
+
+        const params: msgpack.Value = .{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "session_file_changed", params });
+        defer self.allocator.free(msg_bytes);
+
+        for (self.clients.items) |c| {
+            if (c.plug_name != null) continue;
+            if (c.closing) continue;
+            c.sendData(loop, msg_bytes) catch |err| {
+                log.err("Failed to send session_file_changed to client fd={}: {}", .{ c.fd, err });
             };
         }
     }

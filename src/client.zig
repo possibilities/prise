@@ -279,6 +279,7 @@ pub const ServerAction = union(enum) {
     switch_detach_failed,
     restore_attach_failed,
     session_switch_requested: []const u8,
+    session_file_changed: []const u8,
     color_query: ColorQueryTarget,
     server_info: struct { pty_validity: i64 },
     copy_to_clipboard: []const u8,
@@ -581,6 +582,8 @@ pub const ClientLogic = struct {
             return parseBreakPaneApplied(notif.params);
         } else if (std.mem.eql(u8, notif.method, "session_switch")) {
             return parseSessionSwitch(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "session_file_changed")) {
+            return parseSessionFileChanged(notif.params);
         } else if (std.mem.eql(u8, notif.method, "plug_notification")) {
             return parsePlugNotification(notif.params);
         } else if (std.mem.eql(u8, notif.method, "plug_connected")) {
@@ -666,6 +669,16 @@ pub const ClientLogic = struct {
         const f = focus orelse return .none;
 
         return .{ .break_pane_applied = .{ .pty_id = pid, .focus = f } };
+    }
+
+    fn parseSessionFileChanged(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+        for (params.map) |kv| {
+            if (kv.key == .string and std.mem.eql(u8, kv.key.string, "session_name")) {
+                if (kv.value == .string) return .{ .session_file_changed = kv.value.string };
+            }
+        }
+        return .none;
     }
 
     fn parsePlugNotification(params: msgpack.Value) ServerAction {
@@ -3725,6 +3738,16 @@ pub const App = struct {
                                 log.info("Session switch requested to '{s}'", .{target});
                                 try app.switchToSession(target);
                             },
+                            .session_file_changed => |session_name| {
+                                // Another client mutated a session file. If
+                                // it's the one we're attached to, reload
+                                // from disk so our in-memory state reflects
+                                // the new shape before our next save writes
+                                // back and clobbers the mutation. Reloading
+                                // a session we're not attached to is a
+                                // silent no-op.
+                                app.handleSessionFileChanged(session_name);
+                            },
                             .copy_to_clipboard => |text| {
                                 app.copyToClipboard(text);
                             },
@@ -4334,6 +4357,38 @@ pub const App = struct {
         if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSessionName;
     }
 
+    /// Tell the server a session file was just mutated from the outside so
+    /// every other TUI client attached to that session can reload from disk
+    /// before its own save clobbers the change. Fire-and-forget — callers
+    /// that see this fail should log and move on, the file change is
+    /// already durable and the target client's stale-until-reattach
+    /// behavior is the fallback.
+    fn emitSessionFileChanged(self: *App, session_name: []const u8) !void {
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "session_name" }, .value = .{ .string = session_name } };
+
+        const params: msgpack.Value = .{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "session_file_changed", params });
+        defer self.allocator.free(msg_bytes);
+
+        try self.sendDirect(msg_bytes);
+    }
+
+    /// Receive-side of the session_file_changed coherence signal. If the
+    /// mutated session is the one we're attached to, reload from disk so
+    /// our in-memory state reflects the new shape. Not-our-session is a
+    /// silent no-op; not-yet-attached is a silent no-op (the full attach
+    /// will pick up the current file state anyway).
+    fn handleSessionFileChanged(self: *App, session_name: []const u8) void {
+        const current = self.current_session_name orelse return;
+        if (!std.mem.eql(u8, session_name, current)) return;
+        log.info("session_file_changed for attached session '{s}' — reloading", .{session_name});
+        self.loadSession(session_name) catch |err| {
+            log.err("loadSession failed during session_file_changed reload: {}", .{err});
+        };
+    }
+
     /// Place a PTY into a target session's saved state file without switching.
     /// If the session file doesn't exist, creates one. If it exists, appends a tab.
     pub fn placePtyInSession(self: *App, session_name: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8) !void {
@@ -4377,6 +4432,16 @@ pub const App = struct {
         }
 
         log.info("Placed PTY {d} in session '{s}'", .{ pty_id, session_name });
+
+        // Live-coherence broadcast: tell every other TUI client that
+        // `session_name`'s file just changed so any client currently
+        // attached there reloads before its own save clobbers the write.
+        // Failure here is non-fatal — the file change is already durable;
+        // other clients fall back to stale-until-reattach, matching the
+        // pre-broadcast status quo.
+        self.emitSessionFileChanged(session_name) catch |err| {
+            log.warn("emitSessionFileChanged failed for session '{s}': {}", .{ session_name, err });
+        };
     }
 
     /// Best-effort diagnostic snapshot for the pre-write state of the target
@@ -5297,6 +5362,82 @@ test "ClientLogic - processServerMessage" {
         try testing.expectEqual(std.meta.Tag(ServerAction).none, std.meta.activeTag(action));
         try testing.expectEqual(null, state.pty_id);
     }
+}
+
+test "ClientLogic - session_file_changed notification" {
+    const testing = std.testing;
+
+    // Valid map with session_name → action carries the name through.
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+
+        var params_kv = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "session_name" }, .value = .{ .string = "beta" } },
+        };
+        const msg: rpc.Message = .{ .notification = .{
+            .method = "session_file_changed",
+            .params = .{ .map = &params_kv },
+        } };
+
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expectEqual(std.meta.Tag(ServerAction).session_file_changed, std.meta.activeTag(action));
+        try testing.expectEqualStrings("beta", action.session_file_changed);
+    }
+
+    // Non-map params → .none (ignored, nothing to route).
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+        const msg: rpc.Message = .{ .notification = .{
+            .method = "session_file_changed",
+            .params = .nil,
+        } };
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expectEqual(std.meta.Tag(ServerAction).none, std.meta.activeTag(action));
+    }
+
+    // Missing session_name field → .none (no-op, no mis-routed reload).
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+        var params_kv = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "other" }, .value = .{ .string = "beta" } },
+        };
+        const msg: rpc.Message = .{ .notification = .{
+            .method = "session_file_changed",
+            .params = .{ .map = &params_kv },
+        } };
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expectEqual(std.meta.Tag(ServerAction).none, std.meta.activeTag(action));
+    }
+}
+
+test "session_file_changed wire format round-trips through rpc.decodeMessage" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Build the exact byte shape emitSessionFileChanged / broadcastSessionFileChanged
+    // produce: a type-2 notification with a single-key session_name map.
+    var map_items = try allocator.alloc(msgpack.Value.KeyValue, 1);
+    defer allocator.free(map_items);
+    map_items[0] = .{ .key = .{ .string = "session_name" }, .value = .{ .string = "beta" } };
+    const params: msgpack.Value = .{ .map = map_items };
+
+    const bytes = try msgpack.encode(allocator, .{ 2, "session_file_changed", params });
+    defer allocator.free(bytes);
+
+    var decoded = try rpc.decodeMessage(allocator, bytes);
+    defer decoded.deinit(allocator);
+
+    try testing.expectEqual(std.meta.Tag(rpc.Message).notification, std.meta.activeTag(decoded));
+    try testing.expectEqualStrings("session_file_changed", decoded.notification.method);
+
+    var state = ClientState.init(allocator);
+    defer state.deinit();
+    const action = try ClientLogic.processServerMessage(&state, decoded);
+    try testing.expectEqual(std.meta.Tag(ServerAction).session_file_changed, std.meta.activeTag(action));
+    try testing.expectEqualStrings("beta", action.session_file_changed);
 }
 
 test "ClientLogic - processPipeMessage" {
