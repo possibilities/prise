@@ -143,6 +143,14 @@ function prise.switch_session(target_session) end
 ---@return boolean success
 function prise.place_pty_in_session(session_name, pty_id, cwd, tab_title) end
 
+---Remove a PTY from a target session's saved state (mirror of place_pty_in_session).
+---Splices the leaf out of every tab's pane tree, collapsing one-child splits
+---and dropping emptied tabs. Missing file or absent pty_id is a noop-success.
+---@param session_name string Target session name
+---@param pty_id integer PTY ID to remove
+---@return boolean success
+function prise.remove_pty_from_session(session_name, pty_id) end
+
 ---Create a session
 ---@param session_name string
 ---@return boolean success

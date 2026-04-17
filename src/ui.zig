@@ -123,6 +123,8 @@ pub const UI = struct {
     queue_attach_pty_ctx: *anyopaque = undefined,
     place_pty_in_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8, pty_id: u32, cwd: []const u8, tab_title: ?[]const u8) anyerror!void = null,
     place_pty_in_session_ctx: *anyopaque = undefined,
+    remove_pty_from_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8, pty_id: u32) anyerror!void = null,
+    remove_pty_from_session_ctx: *anyopaque = undefined,
     plug_spawn_callback: ?*const fn (ctx: *anyopaque, opts: PlugSpawnOptions) anyerror!void = null,
     plug_spawn_ctx: *anyopaque = undefined,
     plug_call_callback: ?*const fn (ctx: *anyopaque, name: []const u8, method: []const u8, params: msgpack.Value, callback_ref: i32) anyerror!void = null,
@@ -343,6 +345,11 @@ pub const UI = struct {
         self.place_pty_in_session_callback = cb;
     }
 
+    pub fn setRemovePtyFromSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, session_name: []const u8, pty_id: u32) anyerror!void) void {
+        self.remove_pty_from_session_ctx = ctx;
+        self.remove_pty_from_session_callback = cb;
+    }
+
     pub fn setPlugSpawnCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, opts: PlugSpawnOptions) anyerror!void) void {
         self.plug_spawn_ctx = ctx;
         self.plug_spawn_callback = cb;
@@ -517,6 +524,10 @@ pub const UI = struct {
         // Register place_pty_in_session
         lua.pushFunction(ziglua.wrap(placePtyInSession));
         lua.setField(-2, "place_pty_in_session");
+
+        // Register remove_pty_from_session
+        lua.pushFunction(ziglua.wrap(removePtyFromSession));
+        lua.setField(-2, "remove_pty_from_session");
 
         // Register plug system functions
         lua.pushFunction(ziglua.wrap(spawnPlug));
@@ -1400,6 +1411,56 @@ pub const UI = struct {
             lua.pushBoolean(true);
         } else {
             log.warn("placePtyInSession: no callback registered", .{});
+            lua.pushBoolean(false);
+        }
+        return 1;
+    }
+
+    /// Mirror of `placePtyInSession`: remove `pty_id` from another session's
+    /// saved state file. Returns boolean success via Lua stack — at every
+    /// exit path push a bool so callers can gate on the return value.
+    fn removePtyFromSession(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        lua.pop(1);
+
+        const session_name_lua = lua.toString(1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        const pty_id_lua = lua.toInteger(2) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+
+        // Dupe strings — Lua GC owns the originals
+        const session_name = ui.allocator.dupe(u8, session_name_lua) catch {
+            log.warn("removePtyFromSession: failed to allocate session name", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        defer ui.allocator.free(session_name);
+
+        if (pty_id_lua < 0 or pty_id_lua > std.math.maxInt(u32)) {
+            log.warn("removePtyFromSession: pty_id out of u32 range: {d}", .{pty_id_lua});
+            lua.pushBoolean(false);
+            return 1;
+        }
+        const pty_id: u32 = @intCast(pty_id_lua);
+
+        log.info("removePtyFromSession: session='{s}' pty={d}", .{ session_name, pty_id });
+
+        if (ui.remove_pty_from_session_callback) |cb| {
+            cb(ui.remove_pty_from_session_ctx, session_name, pty_id) catch {
+                lua.pushBoolean(false);
+                return 1;
+            };
+            lua.pushBoolean(true);
+        } else {
+            log.warn("removePtyFromSession: no callback registered", .{});
             lua.pushBoolean(false);
         }
         return 1;

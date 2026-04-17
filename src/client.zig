@@ -1597,6 +1597,14 @@ pub const App = struct {
             }
         }.placeCb);
 
+        // Register remove_pty_from_session callback
+        self.ui.setRemovePtyFromSessionCallback(self, struct {
+            fn removeCb(ctx: *anyopaque, session_name: []const u8, pty_id: u32) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.removePtyFromSession(session_name, pty_id);
+            }
+        }.removeCb);
+
         // Register plug system callbacks
         self.ui.setPlugSpawnCallback(self, struct {
             fn cb(ctx: *anyopaque, opts: UI.PlugSpawnOptions) anyerror!void {
@@ -4444,6 +4452,53 @@ pub const App = struct {
         };
     }
 
+    /// Remove `pty_id` from `session_name`'s saved state file. Semantic
+    /// mirror of `placePtyInSession`: opens the session JSON, splices the
+    /// leaf out of every tab's pane tree (collapsing one-child splits,
+    /// dropping emptied tabs), writes back, and fires the coherence
+    /// broadcast. Noop-success when the file doesn't exist or the pty_id
+    /// is absent — the caller's intent ("this pty is gone from this
+    /// session") already holds, don't manufacture an error.
+    pub fn removePtyFromSession(self: *App, session_name: []const u8, pty_id: u32) !void {
+        try validateSessionName(session_name);
+
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
+        defer self.allocator.free(filename);
+
+        const path = try std.fs.path.join(self.allocator, &.{ state_dir, filename });
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+            // Missing session file — the pty is already "not there",
+            // treat as success so a double-call doesn't fail.
+            if (err == error.FileNotFound) {
+                log.info(
+                    "removePtyFromSession: session file '{s}' absent — noop-success for pty={d}",
+                    .{ path, pty_id },
+                );
+                return;
+            }
+            return err;
+        };
+        const existing = blk: {
+            defer file.close();
+            break :blk try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        };
+        defer self.allocator.free(existing);
+
+        try self.removePtyFromSessionFile(path, existing, pty_id);
+
+        log.info("Removed PTY {d} from session '{s}'", .{ pty_id, session_name });
+
+        self.emitSessionFileChanged(session_name) catch |err| {
+            log.warn("emitSessionFileChanged failed for session '{s}': {}", .{ session_name, err });
+        };
+    }
+
     /// Best-effort diagnostic snapshot for the pre-write state of the target
     /// session file. Any failure swallows itself silently — a missing
     /// existing_pty_ids field is better than a failed log call. Allocates a
@@ -4583,6 +4638,129 @@ pub const App = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(output);
+    }
+
+    /// Splice the pty_id leaf out of an existing session JSON file. Mirrors
+    /// `remove_pane_recursive` at the JSON-value level: nil-propagates
+    /// through split children, collapses single-child splits, drops
+    /// emptied tabs. Noop-success when the pty_id is not found anywhere
+    /// in the file — the desired post-state (pty not in this session)
+    /// already holds.
+    fn removePtyFromSessionFile(self: *App, path: []const u8, existing_json: []const u8, pty_id: u32) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, existing_json, .{});
+        defer parsed.deinit();
+
+        var root = &parsed.value.object;
+        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+
+        // Fast path: not in any tab — treat as noop-success.
+        if (findTabHostingPtyId(tabs_val.*, pty_id) == null) {
+            log.info(
+                "removePtyFromSessionFile: pty_id={d} not found in {s} — noop-success",
+                .{ pty_id, path },
+            );
+            return;
+        }
+
+        try removeLeafFromTabsJson(tabs_val, pty_id);
+
+        const output = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+        defer self.allocator.free(output);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(output);
+    }
+
+    /// In-place rewrite of `tabs_val.array` with the `pty_id`-hosting leaf
+    /// removed. Walks each tab's root; null-root tabs drop out of the
+    /// array. Split collapse and nil propagation live in
+    /// `removePtyFromPaneTree` so this stays a one-pass array rebuild.
+    fn removeLeafFromTabsJson(tabs_val: *std.json.Value, pty_id: u32) !void {
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+        const arr = &tabs_val.array;
+
+        var new_tabs = std.json.Array.init(arr.allocator);
+        errdefer new_tabs.deinit();
+
+        for (arr.items) |tab_val| {
+            if (tab_val != .object) {
+                try new_tabs.append(tab_val);
+                continue;
+            }
+            var tab_obj = tab_val.object;
+            const root_ptr = tab_obj.getPtr("root") orelse {
+                try new_tabs.append(tab_val);
+                continue;
+            };
+            const new_root_opt = removePtyFromPaneTree(root_ptr.*, arr.allocator, pty_id);
+            if (new_root_opt) |new_root| {
+                try tab_obj.put("root", new_root);
+                try new_tabs.append(.{ .object = tab_obj });
+            }
+            // else: tab's tree emptied — drop it by not appending.
+        }
+
+        tabs_val.* = .{ .array = new_tabs };
+    }
+
+    /// Recursive JSON-value walker: returns the rewritten subtree with
+    /// `pty_id`'s pane removed, or null if the subtree collapsed to
+    /// empty. Mirrors `remove_pane_recursive` in `tiling.lua` — when a
+    /// split ends up with a single surviving child it collapses into
+    /// that child. Caller passes the parser arena so new arrays land in
+    /// the same lifetime as the rest of the parsed tree.
+    fn removePtyFromPaneTree(value: std.json.Value, arena: std.mem.Allocator, pty_id: u32) ?std.json.Value {
+        if (value != .object) return value;
+        const obj = value.object;
+        const type_val = obj.get("type") orelse return value;
+        if (type_val != .string) return value;
+
+        if (std.mem.eql(u8, type_val.string, "pane")) {
+            if (obj.get("pty_id")) |pid_val| {
+                if (pid_val == .integer and @as(u32, @intCast(pid_val.integer)) == pty_id) {
+                    return null;
+                }
+            }
+            return value;
+        }
+
+        if (!std.mem.eql(u8, type_val.string, "split")) return value;
+
+        const children_val = obj.get("children") orelse return value;
+        if (children_val != .array) return value;
+
+        const arr = children_val.array;
+        var new_children = std.json.Array.init(arena);
+        errdefer new_children.deinit();
+
+        for (arr.items) |child| {
+            if (removePtyFromPaneTree(child, arena, pty_id)) |kept| {
+                new_children.append(kept) catch return value;
+            }
+        }
+
+        // All children gone — propagate nil.
+        if (new_children.items.len == 0) {
+            new_children.deinit();
+            return null;
+        }
+
+        // Single child — collapse into it.
+        if (new_children.items.len == 1) {
+            const survivor = new_children.items[0];
+            new_children.deinit();
+            return survivor;
+        }
+
+        // Multi-child survivor — replace children array and return the
+        // split object. Mutate via getPtr so the existing object map is
+        // kept (preserves sibling fields like split_id, direction).
+        var mutable_obj = obj;
+        const children_ptr = mutable_obj.getPtr("children") orelse return value;
+        children_ptr.* = .{ .array = new_children };
+        return .{ .object = mutable_obj };
     }
 
     /// Returns the tab id that already hosts pty_id (anywhere in its pane
