@@ -254,6 +254,7 @@ do
     assert(st.tabs[1].root.id == 99, "pty_exited overlay-orphan: surviving tab is sibling")
     assert(overlay_pty._closed, "pty_exited overlay-orphan: overlay pane pty closed")
 end
+
 -- === spawn placement ===
 
 -- Get state upvalue from tiling.update
@@ -291,6 +292,16 @@ assert(
         or (state_upvalue.pending_spawns[6] and state_upvalue.pending_spawns[6].new_tab == true),
     "pty_spawned: tab=<new> sets pending_new_tab"
 )
+state_upvalue.pending_title_renames = {}
+state_upvalue.pending_new_tab = false
+tiling.update({ type = "pty_spawned", data = { id = 5, title = "editor" } })
+assert(state_upvalue.pending_title_renames[5] == "editor", "pty_spawned: title queues pending rename")
+assert(state_upvalue.pending_new_tab == true, "pty_spawned: nil tab creates new tab")
+
+-- Test: pty_spawned with tab=<new> sets pending_new_tab
+state_upvalue.pending_new_tab = false
+tiling.update({ type = "pty_spawned", data = { id = 6, tab = "<new>" } })
+assert(state_upvalue.pending_new_tab == true, "pty_spawned: tab=<new> sets pending_new_tab")
 
 -- Test: pty_spawned without placement fields is no-op
 state_upvalue.pending_new_tab = false
@@ -302,6 +313,8 @@ assert(
         and (state_upvalue.pending_spawns[7] == nil or state_upvalue.pending_spawns[7].new_tab ~= true),
     "pty_spawned: no placement fields, pending_new_tab unchanged"
 )
+tiling.update({ type = "pty_spawned", data = { id = 7 } })
+assert(state_upvalue.pending_new_tab == false, "pty_spawned: no placement fields, pending_new_tab unchanged")
 assert(state_upvalue.pending_title_renames[7] == nil, "pty_spawned: no placement fields, no pending rename")
 
 -- === find_tab_by_title ===
@@ -338,6 +351,9 @@ assert(
         and (state_upvalue.pending_spawns[20] == nil or state_upvalue.pending_spawns[20].new_tab ~= true),
     "pty_spawned: known tab name does not create new tab"
 )
+tiling.update({ type = "pty_spawned", data = { id = 20, tab = "logs" } })
+assert(state_upvalue.active_tab == 2, "pty_spawned: known tab name activates tab")
+assert(state_upvalue.pending_new_tab == false, "pty_spawned: known tab name does not create new tab")
 
 -- Test: pty_spawned with unknown tab name creates new tab
 state_upvalue.tabs = {
@@ -352,6 +368,8 @@ assert(
         or (state_upvalue.pending_spawns[21] and state_upvalue.pending_spawns[21].new_tab == true),
     "pty_spawned: unknown tab name creates new tab"
 )
+tiling.update({ type = "pty_spawned", data = { id = 21, tab = "unknown" } })
+assert(state_upvalue.pending_new_tab == true, "pty_spawned: unknown tab name creates new tab")
 
 -- === pty_spawned with missing session ===
 
@@ -409,6 +427,7 @@ state_upvalue.floating = { pending = false, visible = false, width = 100, height
 tiling.update({ type = "pty_attach", data = { pty = mock_pty(10) } })
 assert(state_upvalue.tabs[1].title == "my-title", "pty_attach: pending title applied to tab")
 assert(state_upvalue.pending_title_renames[10] == nil, "pty_attach: pending rename cleared")
+
 -- === get_theme ===
 
 -- Test: get_theme returns default theme without setup
@@ -424,6 +443,7 @@ tiling.setup({ theme = { accent = "#ff0000" } })
 theme = tiling.get_theme()
 assert(theme.accent == "#ff0000", "get_theme: override applied")
 assert(theme.bg1 == "#1e1e2e", "get_theme: defaults preserved after override")
+
 -- === move_focus (wrap) ===
 
 ---Helper to set up a single-tab layout for focus tests
@@ -480,6 +500,7 @@ row_ab = mock_split(1, "row", { mock_pane(1), mock_pane(2) })
 setup_focus_test(row_ab, 2)
 t.move_focus("right")
 assert(t.get_state().focused_id == 2, "move_focus: non-wrapping at edge is no-op")
+
 -- Helper: capture warn calls inline so we can assert on them WITHOUT teaching
 -- test_helpers about a "warn-recording" mock (per branches.md, integration
 -- helpers stay inline). Returns a restore function the caller invokes after.
@@ -516,6 +537,21 @@ do
     local r = t.compute_focus_window({ 10, 10, 10, 10 }, 2, 20)
     assert(r.start == 6, "compute_focus_window: middle active centered (with separators)")
     assert(r.total_width == 43, "compute_focus_window: middle → total 43 (40 + 3 separators)")
+-- Test: fits within budget — start snaps to 0, total_width reports sum.
+do
+    local r = t.compute_focus_window({ 10, 10, 10 }, 2, 40)
+    assert(r.start == 0, "compute_focus_window: fits → start 0")
+    assert(r.total_width == 30, "compute_focus_window: fits → total 30")
+end
+
+-- Test: active in middle — centered when budget < total.
+-- Tabs: [0,10][10,20][20,30][30,40]. budget=20. active=2 at [10,20].
+-- focus_centre = 10 + floor(10/2) = 15. half = 10. start = 15-10 = 5.
+-- max_start = 40-20 = 20. 5 <= 20, so start = 5.
+do
+    local r = t.compute_focus_window({ 10, 10, 10, 10 }, 2, 20)
+    assert(r.start == 5, "compute_focus_window: middle active centered")
+    assert(r.total_width == 40, "compute_focus_window: middle → total 40")
 end
 
 -- Test: active near left — underflow branch → start = 0.
@@ -531,6 +567,11 @@ end
 do
     local r = t.compute_focus_window({ 10, 10, 10, 10 }, 4, 20)
     assert(r.start == 23, "compute_focus_window: near right → start clamps to max (with separators)")
+-- active=4 at [30,40]. focus_centre = 35. half = 10. start = 25.
+-- max_start = 40-20 = 20. 25 > 20 → clamp to 20.
+do
+    local r = t.compute_focus_window({ 10, 10, 10, 10 }, 4, 20)
+    assert(r.start == 20, "compute_focus_window: near right → start clamps to max")
 end
 
 -- Test: single tab wider than budget — start = 0 (total <= budget path doesn't
@@ -581,6 +622,12 @@ end
 -- Tabs (label+sep): [0,10] sep[10] [11,21] sep[21] [22,32]. start=10. budget=10. window=[10,20].
 -- tab1 cum[0,10]: 10>10 false → skip. tab2 cum[11,21]: 21>10 AND 11<20 → first=last=2.
 -- leading = 10-11 = -1 → 0. trailing = 21-20 = 1.
+-- inside [start, start+effective_budget]. leading_clip and trailing_clip
+-- report the cell-precise clip needed on the boundary tabs.
+
+-- Test: budget aligns with tab boundary — no clip.
+-- Tabs: [0,10][10,20][20,30]. start=10. budget=10. window = [10,20].
+-- first=2 (cum_start=10, cum_end=20), last=2. leading=0, trailing=0.
 do
     local r = t.derive_visible_range({ 10, 10, 10 }, 10, 10)
     assert(r.first_idx == 2, "derive_visible_range: aligned → first 2")
@@ -593,6 +640,14 @@ end
 -- Tabs: [0,10] sep[10] [11,21] sep[21] [22,32]. start=5. budget=10. window=[5,15].
 -- tab1 cum[0,10]: 10>5 AND 0<15 → first=1. tab2 cum[11,21]: 21>5 AND 11<15 → last=2.
 -- leading = 5-0 = 5. trailing = 21-15 = 6.
+    assert(r.trailing_clip == 0, "derive_visible_range: aligned → no trailing clip")
+end
+
+-- Test: leading edge mid-tab — leading_clip > 0.
+-- Tabs: [0,10][10,20][20,30]. start=5. budget=10. window = [5,15].
+-- first=1 (cum_start=0, cum_end=10, overlaps), last=2 (cum_start=10, cum_end=20, overlaps).
+-- leading = start - first_cum_start = 5 - 0 = 5.
+-- trailing = last_cum_end - window_end = 20 - 15 = 5.
 do
     local r = t.derive_visible_range({ 10, 10, 10 }, 5, 10)
     assert(r.first_idx == 1 and r.last_idx == 2, "derive_visible_range: mid-tab → 1..2")
@@ -604,6 +659,12 @@ end
 -- Tabs: [0,10] sep[10] [11,21] sep[21] [22,32]. start=10. budget=5. window=[10,15].
 -- tab1 cum[0,10]: 10>10 false. tab2 cum[11,21]: 21>10 AND 11<15 → first=last=2.
 -- leading = 10-11 = -1 → 0. trailing = 21-15 = 6.
+    assert(r.trailing_clip == 5, "derive_visible_range: mid-tab → trailing 5")
+end
+
+-- Test: trailing edge mid-tab only.
+-- Tabs: [0,10][10,20][20,30]. start=10. budget=5. window = [10,15].
+-- first=2 (10..20 overlaps 10..15), last=2. leading = 10-10 = 0. trailing = 20-15 = 5.
 do
     local r = t.derive_visible_range({ 10, 10, 10 }, 10, 5)
     assert(r.first_idx == 2 and r.last_idx == 2, "derive_visible_range: trailing-only → 2..2")
@@ -614,6 +675,12 @@ end
 -- Test: budget smaller than first tab — visible single tab, clipped both sides.
 -- Tabs: [0,20]. start=5. budget=10. window=[5,15]. first=1, last=1.
 -- leading = 5-0 = 5. trailing = 20-15 = 5. N=1 so no separator injection.
+    assert(r.trailing_clip == 5, "derive_visible_range: trailing-only → trailing 5")
+end
+
+-- Test: budget smaller than first tab — visible single tab, clipped both sides.
+-- Tabs: [0,20]. start=5. budget=10. window = [5,15]. first=1. last=1.
+-- leading = 5 - 0 = 5. trailing = 20 - 15 = 5.
 do
     local r = t.derive_visible_range({ 20 }, 5, 10)
     assert(r.first_idx == 1 and r.last_idx == 1, "derive_visible_range: narrow → single")
@@ -856,6 +923,9 @@ end
 -- first, never after the last, never adjacent to a zero-width boundary tab.
 
 -- Test: empty visible tabs — prefix + suffix only (no separator to inject).
+-- gutter + suffix into a flat segment list.
+
+-- Test: empty visible tabs — prefix + suffix only.
 do
     local out = t.compose_layout_segments({ { text = "P", style = {} } }, nil, {}, nil, { { text = "S", style = {} } })
     assert(#out == 2, "compose_layout_segments: prefix+suffix → 2")
@@ -863,6 +933,7 @@ do
 end
 
 -- Test: full pipeline with gutters — one separator injected between T1 and T2.
+-- Test: full pipeline with gutters.
 do
     local out = t.compose_layout_segments(
         { { text = "P", style = {} } },
@@ -937,6 +1008,19 @@ do
         {}, -- zero-width trailing tab
     }, nil, {})
     assert(#out == 1 and out[1].text == "A", "zero-width tabN: no separator injected")
+    assert(#out == 6, "compose_layout_segments: full → 6 segments")
+    assert(out[1].text == "P", "compose_layout_segments: [1]=prefix")
+    assert(out[2].text == "<", "compose_layout_segments: [2]=left gutter")
+    assert(out[3].text == "T1", "compose_layout_segments: [3]=T1")
+    assert(out[4].text == "T2", "compose_layout_segments: [4]=T2")
+    assert(out[5].text == ">", "compose_layout_segments: [5]=right gutter")
+    assert(out[6].text == "S", "compose_layout_segments: [6]=suffix")
+end
+
+-- Test: no gutters (nil args).
+do
+    local out = t.compose_layout_segments({}, nil, { { { text = "T", style = {} } } }, nil, {})
+    assert(#out == 1 and out[1].text == "T", "compose_layout_segments: no gutters")
 end
 
 -- === derive_click_regions ===
@@ -948,6 +1032,9 @@ end
 
 -- Test: correct per-tab regions — advances by `tab.width + 1` between tabs
 -- so the 1-cell separator sits between them and is NOT routed to any tab.
+-- one region per tab keyed by its original tab_index. Gutters aren't clickable.
+
+-- Test: correct per-tab regions, no gutters, no prefix.
 do
     local regs = t.derive_click_regions(0, 0, {
         { tab_index = 1, width = 5 },
@@ -963,6 +1050,10 @@ do
 end
 
 -- Test: gutter offset accounted (single tab, no separator).
+    assert(regs[2].start_x == 5 and regs[2].end_x == 15 and regs[2].tab_index == 2, "derive_click_regions: [2]=5..15")
+end
+
+-- Test: gutter offset accounted.
 do
     local regs = t.derive_click_regions(0, 1, {
         { tab_index = 3, width = 5 },
@@ -980,6 +1071,7 @@ do
 end
 
 -- Test: prefix + left gutter + multi — separator cell between tabs.
+-- Test: prefix + left gutter + multi.
 do
     local regs = t.derive_click_regions(3, 1, {
         { tab_index = 7, width = 4 },
@@ -988,6 +1080,9 @@ do
     -- First x = 3+1 = 4. First region 4..8. Separator cell 8 (dead). Second 9..15.
     assert(regs[1].start_x == 4 and regs[1].end_x == 8, "derive_click_regions: first at 4..8")
     assert(regs[2].start_x == 9 and regs[2].end_x == 15, "derive_click_regions: second at 9..15 (sep at 8)")
+    -- First x = 3+1 = 4. First region 4..8. Second 8..14.
+    assert(regs[1].start_x == 4 and regs[1].end_x == 8, "derive_click_regions: first at 4..8")
+    assert(regs[2].start_x == 8 and regs[2].end_x == 14, "derive_click_regions: second at 8..14")
 end
 
 -- Test: empty visible → no regions.
@@ -1144,6 +1239,8 @@ do
             tabs = {
                 { tab_index = 1, label_segments = { { text = "T1", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "T2", style = {} } } },
+                { tab_index = 1, segments = { { text = "T1", style = {} } } },
+                { tab_index = 2, segments = { { text = "T2", style = {} } } },
             },
             suffix = { { text = "SSSSSS", style = {} } },
         }
@@ -1180,6 +1277,8 @@ do
             tabs = {
                 { tab_index = 1, label_segments = { { text = "T1", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "T2", style = {} } } },
+                { tab_index = 1, segments = { { text = "T1", style = {} } } },
+                { tab_index = 2, segments = { { text = "T2", style = {} } } },
             },
             suffix = { { text = "S", style = {} } },
         }
@@ -1200,6 +1299,14 @@ do
     assert(#st.tab_regions == 2, "happy path: 2 click regions")
     -- Click regions account for the separator: x-advance between tabs is
     -- `tab.width + 1`. P=1 cell, T1 at 1..3, sep at 3..4 (dead), T2 at 4..6.
+    -- Expect: P T1 T2 S (no gutters — everything fits).
+    assert(#out == 4, "happy path: 4 segments (prefix + 2 tabs + suffix)")
+    assert(
+        out[1].text == "P" and out[2].text == "T1" and out[3].text == "T2" and out[4].text == "S",
+        "happy path: segment order"
+    )
+    local st = t.get_state()
+    assert(#st.tab_regions == 2, "happy path: 2 click regions")
     assert(
         st.tab_regions[1].tab_index == 1 and st.tab_regions[1].start_x == 1 and st.tab_regions[1].end_x == 3,
         "happy path: region 1 at 1..3"
@@ -1207,6 +1314,8 @@ do
     assert(
         st.tab_regions[2].tab_index == 2 and st.tab_regions[2].start_x == 4 and st.tab_regions[2].end_x == 6,
         "happy path: region 2 at 4..6 (separator cell 3..4 is dead click)"
+        st.tab_regions[2].tab_index == 2 and st.tab_regions[2].start_x == 3 and st.tab_regions[2].end_x == 5,
+        "happy path: region 2 at 3..5"
     )
 
     restore_warn()
@@ -1240,6 +1349,9 @@ do
                 { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
                 { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
+                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             gutter_left = { text = "L", style = { fg = "#ff0000" } },
@@ -1295,6 +1407,9 @@ do
                 { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
                 { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
+                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             gutter_left = { { text = "<", style = {} }, { text = " ", style = {} } },
@@ -1347,6 +1462,9 @@ do
                 { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
                 { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
+                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             -- no gutter_left / gutter_right → core falls back to config glyphs.
@@ -1387,6 +1505,7 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = { text = "L", style = {} },
             -- gutter_right deliberately absent → asymmetric → malformed.
@@ -1420,6 +1539,7 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = 42,
             gutter_right = { text = "R", style = {} },
@@ -1452,6 +1572,7 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = { text = {}, style = {} },
             gutter_right = { text = "R", style = {} },
@@ -1487,6 +1608,7 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
         }
     end)
@@ -1594,3 +1716,44 @@ end
 -- Cleanup: leave renderer config nil + warn latch reset for any tests that follow.
 t.set_tab_bar_render(nil)
 t.reset_tab_bar_render_warned()
+-- Cleanup: leave renderer config nil + warn latch reset for any tests that follow.
+t.set_tab_bar_render(nil)
+t.reset_tab_bar_render_warned()
+
+-- === serialize_node ===
+
+-- Skeleton pane (no .pty): serialize_node must not crash and must return fn-8 shape.
+local skel = {
+    type = "pane",
+    pty = nil,
+    pty_id = 42,
+    cwd = "/home/user/code/bravo",
+    id = nil,
+    ratio = nil,
+}
+local serialized = t.serialize_node(skel, nil)
+assert(serialized ~= nil, "serialize_node skeleton: returns non-nil")
+assert(serialized.type == "pane", "serialize_node skeleton: type is pane")
+assert(serialized.pty_id == 42, "serialize_node skeleton: pty_id preserved")
+assert(serialized.cwd == "/home/user/code/bravo", "serialize_node skeleton: cwd preserved")
+assert(serialized.id == nil, "serialize_node skeleton: no id field (fn-8 spec shape)")
+
+-- Skeleton with cwd_lookup: lookup skipped because node.pty is nil; node.cwd used directly.
+local lookup_called = false
+local serialized_with_lookup = t.serialize_node(skel, function(_)
+    lookup_called = true
+    return "/other"
+end)
+assert(not lookup_called, "serialize_node skeleton: cwd_lookup NOT called for skeleton")
+assert(
+    serialized_with_lookup.cwd == "/home/user/code/bravo",
+    "serialize_node skeleton: node.cwd used even when lookup provided"
+)
+
+-- Live pane (has .pty): existing path unchanged.
+local live = mock_pane(7)
+local live_serialized = t.serialize_node(live, nil)
+assert(live_serialized ~= nil, "serialize_node live: returns non-nil")
+assert(live_serialized.type == "pane", "serialize_node live: type is pane")
+assert(live_serialized.pty_id == 7, "serialize_node live: pty_id from pty:id()")
+assert(live_serialized.id == 7, "serialize_node live: id from node.id")

@@ -1696,6 +1696,15 @@ local function serialize_node(node, cwd_lookup)
         return nil
     end
     if is_pane(node) then
+        if node.pty == nil then
+            return {
+                type = "pane",
+                id = node.id,
+                pty_id = node.pty_id,
+                cwd = node.cwd,
+                ratio = node.ratio,
+            }
+        end
         local pty_id = node.pty:id()
         ---@type string?
         local cwd = nil
@@ -6918,6 +6927,7 @@ M._test = {
     get_focused_id = function()
         return state.focused_id
     end,
+    serialize_node = serialize_node,
 }
 
 M._test.build_tab_bar_custom = build_tab_bar_custom
