@@ -49,3 +49,9 @@ test "lua tiling zoom state" {
     defer lua.deinit();
     try runLuaTest(lua, "src/lua/tiling_test_zoom_state.lua");
 }
+
+test "lua tiling break pane to session" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_break_pane_to_session.lua");
+}
