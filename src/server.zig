@@ -3095,8 +3095,17 @@ const Server = struct {
         try tab_obj.put("root", .{ .object = pane_obj });
         try tab_obj.put("last_focused_id", .{ .integer = new_split_id });
 
-        // Append to tabs array
-        try tabs_val.array.append(.{ .object = tab_obj });
+        // Insert the new tab right of the focused tab, mirroring the Lua
+        // break_pane placement policy. The anchor is sourced from the JSON
+        // active_tab field (1-based). Missing key, explicit null, and
+        // wrong-type reads all normalize to 1 via the helper. Empty tabs
+        // array is handled explicitly (std.json.Array.insert at index > len
+        // panics, unlike Lua's forgiving table.insert). The target session's
+        // active_tab field is NOT modified here — it stays pointing at
+        // whatever tab the viewer had focused before the place fired; only
+        // the list shape changes.
+        const insert_idx = computeSessionFileInsertIndex(root.get("active_tab"), tabs_val.array.items.len);
+        try tabs_val.array.insert(insert_idx, .{ .object = tab_obj });
 
         // Update counters and validity
         try root.put("next_tab_id", .{ .integer = new_tab_id + 1 });
@@ -3110,6 +3119,38 @@ const Server = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(output);
+    }
+
+    /// Compute the 0-based insert index for a new tab in a session file's
+    /// `tabs` array, mirroring the Lua break_pane anchor + 1 rule:
+    ///   - empty tabs → index 0 (new tab becomes the only tab)
+    ///   - otherwise  → clamp(active_tab, 1..len) as the 1-based anchor,
+    ///                  converted to 0-based insert index (= clamped),
+    ///                  which puts the new tab right of the focused tab.
+    ///
+    /// active_tab_val is the result of `obj.get("active_tab")`: null when
+    /// missing, `.null` when explicitly JSON null, `.integer` when valid,
+    /// anything else is treated as an out-of-contract read. Missing / null
+    /// / wrong-type / zero / negative all normalize to 1.
+    fn computeSessionFileInsertIndex(active_tab_val: ?std.json.Value, tabs_len: usize) usize {
+        if (tabs_len == 0) return 0;
+
+        const active_tab: i64 = blk: {
+            if (active_tab_val) |v| {
+                if (v == .integer) break :blk v.integer;
+            }
+            // Missing key, explicit .null, or wrong-type → normalize to 1.
+            break :blk 1;
+        };
+
+        const len_i64: i64 = @intCast(tabs_len);
+        // max(1, min(len, active_tab or 1)) with explicit guard for
+        // zero/negative active_tab values (which route to 1).
+        const floored: i64 = if (active_tab < 1) 1 else active_tab;
+        const clamped: i64 = if (floored > len_i64) len_i64 else floored;
+        // Convert 1-based anchor to 0-based insert index; insertion at
+        // (anchor) in 0-based terms lands right of the 1-based anchor.
+        return @intCast(clamped);
     }
 
     /// Returns the tab id that already hosts pty_id (anywhere in its pane
@@ -4227,4 +4268,79 @@ test "Server.tabsContainPtyId detects pre-existing pty_id at any tree depth" {
     try testing.expectEqual(@as(?i64, 4), Server.tabsContainPtyId(tabs, 11));
     try testing.expectEqual(@as(?i64, 4), Server.tabsContainPtyId(tabs, 13));
     try testing.expectEqual(@as(?i64, null), Server.tabsContainPtyId(tabs, 99));
+}
+
+// ========================================================================
+// Detached-path placement policy tests (fn-32-break-pane-right-of-focus.1)
+// ========================================================================
+// appendTabToSessionFile now inserts right of the focused tab (the JSON
+// active_tab field) instead of appending to the end. The
+// computeSessionFileInsertIndex helper encodes the normalize-and-insert
+// rule: max(1, min(len, active_tab or 1)) with explicit empty-tabs → 0
+// branch, and missing / null / wrong-type active_tab reads all normalize
+// to 1. Unit-testing the helper directly is simpler and faster than
+// spinning up a Server + filesystem — the file-write portion of
+// appendTabToSessionFile is straightforward std.fs and not placement-
+// policy-relevant.
+
+test "placePtyInSessionFile active_tab=2 of 3 places new tab at insert index 2 (0-based)" {
+    const testing = std.testing;
+    const active_tab: std.json.Value = .{ .integer = 2 };
+    const insert_idx = Server.computeSessionFileInsertIndex(active_tab, 3);
+    // 1-based anchor 2 → 0-based insert index 2 (inserts BEFORE the 3rd
+    // existing item), which after insertion places the new tab at 1-based
+    // position 3 — right of the focused tab.
+    try testing.expectEqual(@as(usize, 2), insert_idx);
+}
+
+test "placePtyInSessionFile missing active_tab field normalizes to 1, insert index 1 (0-based)" {
+    const testing = std.testing;
+    const insert_idx = Server.computeSessionFileInsertIndex(null, 3);
+    // Missing key → active_tab = 1; new tab at 1-based position 2
+    // (0-based insert index 1).
+    try testing.expectEqual(@as(usize, 1), insert_idx);
+}
+
+test "placePtyInSessionFile active_tab=null normalizes to 1, insert index 1 (0-based)" {
+    const testing = std.testing;
+    const active_tab: std.json.Value = .null;
+    const insert_idx = Server.computeSessionFileInsertIndex(active_tab, 3);
+    try testing.expectEqual(@as(usize, 1), insert_idx);
+}
+
+test "placePtyInSessionFile empty tabs array places new tab at index 0 (only tab)" {
+    const testing = std.testing;
+    const active_tab: std.json.Value = .{ .integer = 2 };
+    const insert_idx = Server.computeSessionFileInsertIndex(active_tab, 0);
+    // Empty tabs array is a degenerate case — the anchor + 1 rule would
+    // overflow (std.json.Array.insert(1, ..) on an empty array panics
+    // with index out of bounds). The explicit empty branch returns 0 so
+    // the new tab becomes the only tab in the array.
+    try testing.expectEqual(@as(usize, 0), insert_idx);
+}
+
+test "placePtyInSessionFile active_tab=99 (overflow) clamps to len, insert at end" {
+    const testing = std.testing;
+    const active_tab: std.json.Value = .{ .integer = 99 };
+    const insert_idx = Server.computeSessionFileInsertIndex(active_tab, 3);
+    // Clamped to len (3); 1-based 3 → 0-based insert index 3, which lands
+    // at the end (equivalent to old append-for-overflow behavior).
+    try testing.expectEqual(@as(usize, 3), insert_idx);
+}
+
+test "placePtyInSessionFile wrong-type active_tab (string) normalizes to 1" {
+    const testing = std.testing;
+    const active_tab: std.json.Value = .{ .string = "2" };
+    const insert_idx = Server.computeSessionFileInsertIndex(active_tab, 3);
+    // Non-integer reads (string, bool, array, object, float) all route
+    // through the null-arm of the switch and normalize to 1.
+    try testing.expectEqual(@as(usize, 1), insert_idx);
+}
+
+test "placePtyInSessionFile active_tab=0 (zero) floors to 1, insert index 1 (0-based)" {
+    const testing = std.testing;
+    const active_tab: std.json.Value = .{ .integer = 0 };
+    const insert_idx = Server.computeSessionFileInsertIndex(active_tab, 3);
+    // Zero / negative active_tab values route to 1 via the floored guard.
+    try testing.expectEqual(@as(usize, 1), insert_idx);
 }
