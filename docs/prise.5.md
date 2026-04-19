@@ -261,6 +261,12 @@ ui.setup({
     of exiting. When no other sessions exist, prise exits normally. Default:
     **true**
 
+NOTE: when switching via **keep_attached**, the departing session's state file
+is removed before the switch; it is not saved to disk. Without this the save
+branch of the session-switch path would re-create the file in between the
+last pane's exit and the async pty_exited notification, leaving an empty
+phantom session that shows up in **list_sessions** and the session picker.
+
 Example:
 
 ```lua

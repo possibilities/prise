@@ -1095,6 +1095,16 @@ local function remove_pane_by_id(id)
             if config.keep_attached then
                 local sessions = prise.list_sessions() or {}
                 local current = prise.get_session_name()
+                -- Delete the departing session's saved state BEFORE the switch loop.
+                -- Placement-before-loop covers three cases: switch-success (survivor
+                -- client must not see the empty state on its next load), every
+                -- switch-fails case, and the fall-through to prise.exit() (the exit
+                -- callback's own deleteCurrentSession then becomes a safe no-op on
+                -- ENOENT, guaranteed by App.deleteSession's idempotent contract).
+                -- Without this, the Zig save branch in switchToSession re-creates the
+                -- file: surfaces.count() hasn't dropped yet because the async
+                -- pty_exited hasn't caught up, so the save thinks state is still live.
+                prise.delete_session(current)
                 for _, s in ipairs(sessions) do
                     if s ~= current then
                         if prise.switch_session(s) then

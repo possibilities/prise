@@ -665,6 +665,12 @@ pub const App = struct {
     current_session_name: ?[]const u8 = null,
     // Auto-save timer for debouncing
     autosave_timer: ?io.Task = null,
+    // Set when the current session is being deleted (keep_attached last-pane path):
+    // Lua calls prise.delete_session(current) before prise.switch_session, and the
+    // Zig side must not re-save the just-deleted file via switchToSession's save
+    // branch. Set inside deleteSession(name) when name matches current_session_name;
+    // cleared at the top of switchToSession after the save-decision is made.
+    session_ending: bool = false,
 
     pub const PendingColorQuery = struct {
         pty_id: u32,
@@ -2624,10 +2630,24 @@ pub const App = struct {
             }
         }
 
-        // Save current session first
-        if (self.current_session_name) |name| {
-            log.info("Saving current session '{s}' before switch", .{name});
-            try self.saveSession(name);
+        // Consume session_ending and decide whether to save atomically: if the
+        // current session is being torn down (keep_attached last-pane path), the
+        // Lua side has already called prise.delete_session on it, so saving here
+        // would re-create the phantom file. Clear the flag in the same check to
+        // keep its lifetime scoped to a single switch — set-and-consume in one
+        // operation, no lingering-true state. Non-keep_attached callers leave
+        // session_ending=false and get the normal save-then-switch behaviour.
+        const skip_save = self.session_ending;
+        self.session_ending = false;
+
+        // Save current session first (unless it's being deleted by the caller)
+        if (!skip_save) {
+            if (self.current_session_name) |name| {
+                log.info("Saving current session '{s}' before switch", .{name});
+                try self.saveSession(name);
+            }
+        } else if (self.current_session_name) |name| {
+            log.info("Skipping save of '{s}' before switch (session ending)", .{name});
         }
 
         // Build arguments for exec
@@ -2688,13 +2708,40 @@ pub const App = struct {
             return error.InvalidSessionName;
         }
 
+        // If we're deleting the current session, signal intent to the rest of
+        // the App: cancel any pending autosave (which would re-create the file
+        // on its next fire) and raise session_ending so switchToSession's save
+        // branch short-circuits. Mirrors the pty_exited autosave-cancel pattern.
+        const is_current = if (self.current_session_name) |current|
+            std.mem.eql(u8, current, session_name)
+        else
+            false;
+        if (is_current) {
+            if (self.autosave_timer) |*task| {
+                if (self.io_loop) |loop| task.cancel(loop) catch {};
+                self.autosave_timer = null;
+            }
+            self.session_ending = true;
+        }
+
         const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
         defer self.allocator.free(filename);
 
         var dir = try std.fs.openDirAbsolute(state_dir, .{});
         defer dir.close();
 
-        try dir.deleteFile(filename);
+        // Idempotent on ENOENT: repeated deletes are a success, not an error.
+        // The Lua keep_attached path and the exit callback both route through
+        // here (via prise.delete_session and deleteCurrentSession respectively),
+        // and one of them is expected to hit an already-gone file. Narrow the
+        // swallow to FileNotFound only — other errors (EACCES, etc.) still raise.
+        dir.deleteFile(filename) catch |err| switch (err) {
+            error.FileNotFound => {
+                log.info("Session file already gone (idempotent delete): {s}", .{filename});
+                return;
+            },
+            else => return err,
+        };
         log.info("Deleted session file: {s}", .{filename});
     }
 
