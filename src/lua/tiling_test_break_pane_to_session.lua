@@ -289,3 +289,74 @@ assert(#remove_calls == 0, "break_pane_to_session back-compat: remove NOT called
 local bcs = t.get_state()
 assert(#bcs.tabs == 2, "break_pane_to_session back-compat: same-session break creates new tab")
 assert(bcs.tabs[2].root.id == 2, "break_pane_to_session back-compat: moved pane in new tab")
+
+-- ========================================================================
+-- Right-of-focus placement policy (fn-32-break-pane-right-of-focus.1)
+-- ========================================================================
+-- Cross-session breaks must also land right-of-focus in the destination
+-- session's state.tabs — the anchor rule is shared with the same-session
+-- path. These tests exercise the cross-session insert and the empty-tabs
+-- degenerate case where the handler's (#state.tabs == 0) → 1 branch
+-- diverges from the anchor+1 rule.
+
+-- === right-of-focus: cross-session break into viewer with multiple tabs ===
+-- Viewer's destination session has 3 tabs with active_tab = 2. Break
+-- pane 42 from session "alpha" (not in viewer state). Anchor = 2,
+-- insert_idx = 3. New tab at index 3; viewer's active_tab unchanged at 2.
+
+reset_captures()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+        { id = 2, root = mock_pane(501), last_focused_id = 501 },
+        { id = 3, root = mock_pane(502), last_focused_id = 502 },
+    },
+    active_tab = 2,
+    focused_id = 501,
+    next_tab_id = 4,
+})
+local multi_tab_ret = tiling.update({
+    type = "break_pane",
+    data = {
+        pty_id = 42,
+        source_session = "alpha",
+        focus = false,
+    },
+})
+assert(multi_tab_ret == true, "right-of-focus cross-session: returns true on success")
+local mhs = t.get_state()
+assert(#mhs.tabs == 4, "right-of-focus cross-session: tab count is 4, got " .. tostring(#mhs.tabs))
+assert(mhs.tabs[3].root.pty_id == 42, "right-of-focus cross-session: new tab at index 3 hosts broken pane (pty_id 42)")
+assert(mhs.active_tab == 2, "right-of-focus cross-session: viewer active_tab unchanged, got " .. tostring(mhs.active_tab))
+-- Verify the pre-existing tabs retained their identities in expected
+-- positions: tabs 1 and 2 unchanged; tab 3 (originally pane 502) pushed
+-- to index 4.
+assert(mhs.tabs[1].id == 1, "right-of-focus cross-session: tab 1 unchanged")
+assert(mhs.tabs[2].id == 2, "right-of-focus cross-session: tab 2 unchanged")
+assert(mhs.tabs[4].id == 3, "right-of-focus cross-session: former tab 3 pushed to index 4")
+
+-- === empty-tabs degenerate: cross-session break into empty viewer ===
+-- #state.tabs = 0 (no tabs — viewer just attached to an empty destination
+-- session). Cross-session break with the normalize formula would give
+-- anchor+1 = 2, but the handler's (#state.tabs == 0) → 1 branch routes
+-- the insert to index 1 so the new tab becomes the only tab.
+
+reset_captures()
+t.set_state({
+    tabs = {},
+    active_tab = 1,
+    focused_id = nil,
+    next_tab_id = 1,
+})
+local empty_ret = tiling.update({
+    type = "break_pane",
+    data = {
+        pty_id = 77,
+        source_session = "other",
+        focus = false,
+    },
+})
+assert(empty_ret == true, "empty-tabs: returns true on success")
+local ehs = t.get_state()
+assert(#ehs.tabs == 1, "empty-tabs: new tab lands as only tab, got " .. tostring(#ehs.tabs))
+assert(ehs.tabs[1].root.pty_id == 77, "empty-tabs: new tab hosts the broken pane")
