@@ -3247,6 +3247,19 @@ function M.update(event)
         -- source tab is the currently active tab AND the caller did not opt
         -- out via data.focus = false; otherwise the operation is silent with
         -- no focus steal.
+        --
+        -- Placement policy: the new tab is inserted immediately to the RIGHT
+        -- of the focused tab (state.active_tab), not appended to the end.
+        -- The anchor is normalized via max(1, min(#tabs, active_tab or 1))
+        -- with an explicit empty-tabs → index 1 branch. Anchor is CAPTURED AT
+        -- HANDLER ENTRY (before any mutations) and decremented by 1 if a
+        -- subsequent table.remove fires at an index <= anchor, so that
+        -- "right of originally-focused tab" semantics survive intra-handler
+        -- tree mutations.
+        --
+        -- keep in sync with partner handler on feat/break-pane-to-session
+        -- (merged tiling.lua has two break_pane handlers; both must share
+        -- this placement policy).
         local pty_id = event.data and event.data.pty_id
         if type(pty_id) ~= "number" then
             return
@@ -3284,6 +3297,13 @@ function M.update(event)
 
         local was_active = (src_tab_idx == state.active_tab)
 
+        -- Capture the placement anchor BEFORE any mutation. Normalize
+        -- state.active_tab through max(1, min(#tabs, active_tab or 1)) so
+        -- nil / 0 / overflow all route to a valid index. This must happen
+        -- before table.remove below so the decrement-on-left-removal rule
+        -- has something deterministic to fix up (see anchor_adjust below).
+        local anchor = math.max(1, math.min(#state.tabs, state.active_tab or 1))
+
         -- Clear any zoom state referencing the moved pane so it doesn't
         -- follow into the new tab with stale bookkeeping.
         if state.zoomed_pane_id == pty_id then
@@ -3303,10 +3323,24 @@ function M.update(event)
 
         -- Defensive: if the tree collapsed to nothing (should not happen —
         -- the solo-pane guard returns above), close auxiliary panes and
-        -- remove the emptied tab rather than leaving it headless.
+        -- remove the emptied tab rather than leaving it headless. Under
+        -- the placement policy this branch is unreachable with the solo-
+        -- pane guard active; preserving historical behavior (drop the
+        -- broken pane). If future guard changes make this branch live,
+        -- the captured anchor must be decremented here to keep placement
+        -- consistent: src_tab_idx <= anchor by construction in this
+        -- branch (the removed tab was the pane's host and was <= active).
         if not new_root and src_tab_idx then
             close_auxiliary_panes(src_tab)
             table.remove(state.tabs, src_tab_idx)
+            -- Decrement-on-left-removal: apply the same rule as the main
+            -- path so the anchor keeps pointing at the same logical tab
+            -- after the source collapse. Noted for future callers that
+            -- reach this branch; the early return below means placement
+            -- doesn't fire here today.
+            if src_tab_idx <= anchor then
+                anchor = math.max(0, anchor - 1)
+            end
             if was_active then
                 -- Keep state.active_tab valid even when follow_focus is
                 -- false — the active tab was just removed, so the index
@@ -3356,20 +3390,28 @@ function M.update(event)
             root = src_leaf,
             last_focused_id = src_leaf.id,
         }
-        table.insert(state.tabs, new_tab)
+        -- Placement: insert at anchor + 1 (right of the focused tab). When
+        -- state.tabs is empty (no-op in practice under current guards, but
+        -- encoded for safety), the new tab becomes the only tab at index 1.
+        local insert_idx = (#state.tabs == 0) and 1 or (anchor + 1)
+        table.insert(state.tabs, insert_idx, new_tab)
 
         if was_active and follow_focus then
-            -- set_active_tab_index handles zoom save/restore on the old tab,
-            -- picks the new tab's last_focused_id (which we just set to the
-            -- moved pane), and fires update_pty_focus.
-            set_active_tab_index(#state.tabs)
+            -- Use the captured (pre-mutation) anchor, not #state.tabs. The
+            -- new tab lives at insert_idx; set_active_tab_index handles
+            -- zoom save/restore on the old tab, picks the new tab's
+            -- last_focused_id, and fires update_pty_focus.
+            set_active_tab_index(insert_idx)
         end
         -- When the source tab was inactive OR the caller opted out of focus-
-        -- follow: state.active_tab is unchanged (appending a tab doesn't
-        -- shift existing indices) and state.focused_id still refers to a
-        -- pane in the still-active tab — in the inactive case, not the moved
-        -- pane by invariant; in the opt-out case, the focused pane is a
-        -- sibling of the moved pane in the (still-active) source tab. No
+        -- follow: state.active_tab is preserved. Insert at anchor + 1 always
+        -- lands to the RIGHT of the active tab (insert_idx = active_tab + 1
+        -- after normalization), so inserting doesn't shift the active tab's
+        -- index — it stays at the same position in state.tabs and still
+        -- resolves to the same logical tab. state.focused_id still refers
+        -- to a pane in the still-active tab — in the inactive case, not the
+        -- moved pane by invariant; in the opt-out case, the focused pane is
+        -- a sibling of the moved pane in the (still-active) source tab. No
         -- focus mutation needed either way.
 
         prise.save()
