@@ -232,9 +232,22 @@ local POWERLINE_SYMBOLS = {
 ---@field pane_count number Number of panes in this tab
 ---@field is_zoomed boolean True if this tab has a zoomed pane
 
+---Viewport context passed to custom render functions
+---@class TabRenderContext
+---@field scroll_offset number Cells from the left edge of the full strip that the visible slice starts at
+
 ---Custom render function for tab bar
 ---Must return an array of segments compatible with prise.Text()
----@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme): table[]
+---When viewport scrolling is active, `tabs` holds only the visible slice and
+---`ctx.scroll_offset` reports where that slice starts in the full strip
+---(cells from left, integer, 0 when no scrolling is in effect).
+---@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme, ctx?: TabRenderContext): table[]
+
+---Measure function for tab bar viewport fit
+---Must return the integer cell-width the renderer will draw for a single tab.
+---Called once per tab per frame when viewport scrolling is active; missing when
+---no custom `render` is set, or when the renderer opts out of scrolling.
+---@alias TabMeasureFunction fun(tab: TabInfo): integer
 
 ---Optional function to format tab titles for display
 ---@alias TabFormatFunction fun(title: string, tab_index: number): string
@@ -242,6 +255,7 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseTabBarConfig
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
 ---@field render? TabRenderFunction Custom tab bar renderer (overrides default design)
+---@field measure? TabMeasureFunction Cell-width oracle for viewport scrolling (custom renderer only)
 ---@field format_title? TabFormatFunction Optional function to format tab titles (default: no formatting)
 
 ---Keybinds are a map from key_string to action name
@@ -423,9 +437,19 @@ local state = {
         rename_target = nil, -- The session being renamed
     },
     -- Tab bar hit regions: array of {start_x, end_x, tab_index}
+    -- Recorded in on-screen coordinates (0..screen_cols) AFTER any viewport
+    -- shift, so the mouse consumer at `d.x < 1` compares directly.
     tab_regions = {},
     -- Tab close button regions: array of {start_x, end_x, tab_index}
     tab_close_regions = {},
+    -- Tab bar viewport offset in cells from the left edge of the full strip.
+    -- Custom renderer only; `build_tab_bar_default` always shrinks-to-fit.
+    -- Edge-triggered scroll: updated each render ONLY when the active tab
+    -- would clip; remains unchanged when active stays inside the viewport.
+    -- Never derived from "first visible tab index" — storing a tab-index
+    -- anchor across frames silently breaks on tab insertion/removal. Cells
+    -- from left is recomputed per frame from current widths + active.
+    tab_bar_scroll_offset = 0,
     -- Currently hovered tab index (nil if none)
     hovered_tab = nil,
     -- Currently hovered close button tab index (nil if none)
@@ -4009,23 +4033,214 @@ local function build_custom_tab_infos()
     return tab_infos
 end
 
----Build tab bar with custom renderer
----Calculates actual tab positions from rendered segments to ensure hover detection works correctly
+---Edge-triggered viewport clamp for the custom tab bar.
+---Pure function: takes current widths + active index + viewport width + current
+---offset, returns the new offset and the inclusive 1-based range of tabs whose
+---`[start, end]` overlaps the visible strip. Extracted so unit tests can cover
+---clip-right, clip-left, within-viewport, wrap-to-zero, and single-tab cases
+---without building a full tiling state.
+---
+---Contract:
+---  * `tab_widths[i] >= 0` (measure is expected to return non-negative cells)
+---  * `active_idx` is 1-based into `tab_widths`; when out of range, caller is
+---    expected to clamp `scroll_offset` to 0 and pass 1.
+---  * `screen_cols >= 1` (caller clamps)
+---  * `current_offset` is cells-from-left; negative values are clamped to 0.
+---
+---Returned offsets are integer cells; returned indices are 1-based inclusive.
+---@param tab_widths integer[]
+---@param active_idx integer
+---@param screen_cols integer
+---@param current_offset integer
+---@return integer new_offset
+---@return integer visible_start
+---@return integer visible_end
+local function compute_tab_viewport(tab_widths, active_idx, screen_cols, current_offset)
+    local n = #tab_widths
+    if n == 0 then
+        return 0, 1, 0
+    end
+
+    -- Cumulative [start, end] per tab.
+    local starts = {}
+    local ends = {}
+    local cursor = 0
+    for i = 1, n do
+        local w = tab_widths[i] or 0
+        if w < 0 then
+            w = 0
+        end
+        starts[i] = cursor
+        cursor = cursor + w
+        ends[i] = cursor
+    end
+    local total = cursor
+
+    -- Defensive: screen can't be non-positive.
+    local cols = screen_cols
+    if cols < 1 then
+        cols = 1
+    end
+
+    -- No-overflow fast path: everything fits, offset snaps to 0. Keeps the
+    -- "viewport at origin" invariant tight so tab insertion/removal can't
+    -- leave a stale non-zero offset.
+    if total <= cols then
+        return 0, 1, n
+    end
+
+    -- Normalize offset: negatives clamped, never past the tail.
+    local offset = current_offset or 0
+    if offset < 0 then
+        offset = 0
+    end
+    local max_offset = total - cols
+    if offset > max_offset then
+        offset = max_offset
+    end
+
+    -- Clamp active index defensively; caller should have already ensured it's
+    -- valid, but a mid-frame removal race could land us here with a stale
+    -- value. Falling back to 1 + current offset is harmless — the viewport
+    -- still scrolls consistently with what's on screen.
+    local a = active_idx
+    if type(a) ~= "number" or a < 1 or a > n then
+        a = 1
+    end
+
+    -- Edge-triggered scroll: only shift when the active tab would clip.
+    -- Right clip: push offset right so active.end sits exactly at cols.
+    -- Left clip: snap offset to active.start.
+    -- Otherwise leave offset untouched (no jitter on focus inside viewport).
+    if ends[a] > offset + cols then
+        offset = ends[a] - cols
+    elseif starts[a] < offset then
+        offset = starts[a]
+    end
+
+    -- Final clamp to [0, max_offset] after the edge-triggered adjustment.
+    if offset < 0 then
+        offset = 0
+    end
+    if offset > max_offset then
+        offset = max_offset
+    end
+
+    -- Visible range: any tab whose [start, end] interval overlaps
+    -- [offset, offset + cols]. Using half-open intervals consistently here
+    -- and at the mouse region site.
+    local visible_start = nil
+    local visible_end = nil
+    for i = 1, n do
+        if ends[i] > offset and starts[i] < offset + cols then
+            if not visible_start then
+                visible_start = i
+            end
+            visible_end = i
+        end
+    end
+
+    -- Theoretical impossibility under total > cols and active in-bounds, but
+    -- keep a safe fallback so the render path never sees empty visible range
+    -- while total > 0.
+    if not visible_start then
+        visible_start = a
+        visible_end = a
+    end
+
+    return offset, visible_start, visible_end
+end
+
+---Build tab bar with custom renderer.
+---Pre-slice architecture: core measures each tab via `config.tab_bar.measure`,
+---computes the edge-triggered viewport offset, and hands the renderer only the
+---visible subset plus a context carrying `scroll_offset`. Click regions are
+---recorded in on-screen coordinates (post-offset) so the mouse consumer at
+---`d.y < 1` compares `d.x` directly — no region-side offset math required.
+---
+---Degradation when `measure` is missing: log warn + render full tab list with
+---offset=0 (no scrolling). Keeps pre-viewport custom renderers working without
+---a silent behavior change, but surfaces the gap in `prise.log`.
 ---@return table
 local function build_tab_bar_custom()
     local tab_infos = build_custom_tab_infos()
 
-    -- Enhanced custom renderer wrapper that tracks tab boundaries
-    local x_pos = 0
-
-    -- First, render segments and calculate their actual widths
-    local original_segments = config.tab_bar.render(tab_infos, state.screen_cols, THEME)
-
-    -- Build click regions from rendered segments
+    -- Build click regions from rendered segments.
     state.tab_regions = {}
     state.tab_close_regions = {}
 
-    -- Calculate actual segment positions
+    local measure = config.tab_bar.measure
+    local tab_count = #tab_infos
+
+    -- Degraded path: no measure callback, or only one tab (nothing to scroll).
+    -- Pass all tabs and a zero offset. The existing segment-mapping heuristic
+    -- is preserved for renderers that haven't been updated.
+    local has_measure = type(measure) == "function"
+    if not has_measure then
+        prise.log.warn(
+            "tab_bar.measure is not configured; viewport scrolling disabled. "
+                .. "Add `measure = function(tab) return <cells> end` to tab_bar config."
+        )
+    end
+
+    local visible_start, visible_end, scroll_offset
+    if has_measure and tab_count > 1 then
+        local tab_widths = {}
+        for i = 1, tab_count do
+            local ok, width = pcall(measure, tab_infos[i])
+            if ok and type(width) == "number" and width >= 0 then
+                tab_widths[i] = math.floor(width)
+            else
+                -- Measurement failure is a real problem but we keep rendering
+                -- rather than blank the strip. Width 0 means this tab never
+                -- clips the viewport; user sees missing tab and a warn line.
+                tab_widths[i] = 0
+                prise.log.warn(
+                    "tab_bar.measure returned invalid width for tab "
+                        .. tostring(i)
+                        .. " (got "
+                        .. tostring(width)
+                        .. ") — treating as 0 cells"
+                )
+            end
+        end
+
+        -- Clamp-safety: if state.active_tab no longer resolves (race during
+        -- tab removal), reset scroll_offset to 0. Same idiom as set_state.
+        local active_idx = state.active_tab
+        if type(active_idx) ~= "number" or active_idx < 1 or active_idx > tab_count then
+            state.tab_bar_scroll_offset = 0
+            active_idx = 1
+        end
+
+        scroll_offset, visible_start, visible_end =
+            compute_tab_viewport(tab_widths, active_idx, state.screen_cols, state.tab_bar_scroll_offset or 0)
+        state.tab_bar_scroll_offset = scroll_offset
+    else
+        scroll_offset = 0
+        state.tab_bar_scroll_offset = 0
+        visible_start = 1
+        visible_end = tab_count
+    end
+
+    -- Slice the visible infos. visible_end may be 0 when tab_count is 0 which
+    -- the outer build_tab_bar already short-circuits against, but keeping the
+    -- loop defensive doesn't hurt.
+    local visible_infos = {}
+    for i = visible_start, visible_end do
+        table.insert(visible_infos, tab_infos[i])
+    end
+
+    -- Call the custom renderer with the visible slice + viewport context. The
+    -- fourth argument is optional and older renderers that ignore it continue
+    -- to work — they just won't know the strip has been scrolled.
+    local original_segments =
+        config.tab_bar.render(visible_infos, state.screen_cols, THEME, { scroll_offset = scroll_offset })
+
+    -- Build segment positions in on-screen coordinates. The segments the
+    -- renderer produced already represent the visible slice, so x_pos starts
+    -- at 0 (the left edge of the strip), NOT at scroll_offset.
+    local x_pos = 0
     local segment_positions = {}
     for _, seg in ipairs(original_segments) do
         local width = prise.gwidth(seg.text)
@@ -4036,53 +4251,51 @@ local function build_tab_bar_custom()
         x_pos = x_pos + width
     end
 
-    -- Map segments to tabs
-    -- Common pattern: custom renderers output alternating tab/separator segments
-    -- Try to detect this pattern and map accordingly
-    local tab_count = #tab_infos
+    -- Map segments back to tabs. Because we pre-sliced, segments correspond
+    -- to tabs `visible_start`..`visible_end` in order. The existing
+    -- alternating / proportional heuristic is unchanged — it just indexes
+    -- into the visible slice. Tab indices written to `tab_regions` are the
+    -- original absolute indices so click dispatch hits the right tab.
+    local sliced_count = #visible_infos
     local segment_count = #original_segments
 
-    if segment_count >= tab_count then
-        -- Assume segments are ordered: tab1, sep, tab2, sep, ..., tabN
-        -- Or just: tab1, tab2, ..., tabN if no separators
-        local segments_per_tab = segment_count / tab_count
+    if sliced_count > 0 and segment_count >= sliced_count then
+        local segments_per_tab = segment_count / sliced_count
         local is_alternating = (segments_per_tab >= 1.5 and segments_per_tab <= 2.5)
 
         if is_alternating then
             -- Likely pattern: tab, separator, tab, separator, ...
-            for tab_idx = 1, tab_count do
-                local seg_idx = (tab_idx - 1) * 2 + 1
+            for slot = 1, sliced_count do
+                local seg_idx = (slot - 1) * 2 + 1
                 if seg_idx <= segment_count then
                     local tab_start = segment_positions[seg_idx].start_x
                     -- Include separator in the clickable region if it exists
                     local sep_seg_idx = seg_idx + 1
                     local tab_end
-                    if sep_seg_idx <= segment_count and tab_idx < tab_count then
-                        -- Include separator
+                    if sep_seg_idx <= segment_count and slot < sliced_count then
                         tab_end = segment_positions[sep_seg_idx].end_x
                     else
-                        -- Last tab, no separator
                         tab_end = segment_positions[seg_idx].end_x
                     end
 
                     table.insert(state.tab_regions, {
                         start_x = tab_start,
                         end_x = tab_end,
-                        tab_index = tab_idx,
+                        tab_index = visible_start + slot - 1,
                     })
                 end
             end
         else
-            -- Fallback: divide segments proportionally
-            for tab_idx = 1, tab_count do
-                local first_seg = math.floor((tab_idx - 1) * segment_count / tab_count) + 1
-                local last_seg = math.floor(tab_idx * segment_count / tab_count)
+            -- Fallback: divide segments proportionally across the visible slice.
+            for slot = 1, sliced_count do
+                local first_seg = math.floor((slot - 1) * segment_count / sliced_count) + 1
+                local last_seg = math.floor(slot * segment_count / sliced_count)
 
                 if first_seg <= segment_count then
                     table.insert(state.tab_regions, {
                         start_x = segment_positions[first_seg].start_x,
                         end_x = segment_positions[math.min(last_seg, segment_count)].end_x,
-                        tab_index = tab_idx,
+                        tab_index = visible_start + slot - 1,
                     })
                 end
             end
@@ -4098,6 +4311,7 @@ local function build_tab_bar()
     if not config.tab_bar.show_single_tab and #state.tabs <= 1 then
         state.tab_regions = {}
         state.tab_close_regions = {}
+        state.tab_bar_scroll_offset = 0
         return nil
     end
 
@@ -4485,6 +4699,7 @@ M._test = {
     close_tab = close_tab,
     remove_pane_by_id = remove_pane_by_id,
     set_active_tab_index = set_active_tab_index,
+    compute_tab_viewport = compute_tab_viewport,
     set_state = function(test_state)
         state.tabs = test_state.tabs or {}
         state.active_tab = test_state.active_tab or 1
@@ -4496,6 +4711,7 @@ M._test = {
         state.hovered_close_tab = nil
         state.tab_regions = {}
         state.tab_close_regions = {}
+        state.tab_bar_scroll_offset = 0
         state.pending_split = nil
         state.next_split_id = test_state.next_split_id or 1
     end,

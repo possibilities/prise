@@ -190,3 +190,85 @@ assert(#item == 20, "format_palette_item: correct width")
 item = t.format_palette_item("Very Long Command Name", "C-x", 10)
 -- Width is too small, should use minimum padding of 2
 assert(item == "Very Long Command Name  C-x", "format_palette_item: minimum padding")
+
+-- === compute_tab_viewport ===
+-- Edge-triggered viewport clamp for the custom tab bar. Pure function: takes
+-- tab widths + active index + screen cols + current offset; returns the new
+-- offset and the 1-based inclusive visible range. No tiling state required.
+
+-- Test: no overflow — offset snaps to 0, all tabs visible.
+local off, vs, ve = t.compute_tab_viewport({ 10, 10, 10 }, 2, 40, 15)
+assert(off == 0, "compute_tab_viewport: no overflow → offset 0")
+assert(vs == 1 and ve == 3, "compute_tab_viewport: no overflow → all visible")
+
+-- Test: active within viewport — offset stays put (edge-triggered).
+-- Tabs: [0,10][10,20][20,30][30,40]; screen=20; active=2 at [10,20]; offset=5.
+-- Active [10,20] fits entirely inside viewport [5,25]. Neither clip-right
+-- (20 > 25? no) nor clip-left (10 < 5? no) fires, so offset must NOT change.
+off, vs, ve = t.compute_tab_viewport({ 10, 10, 10, 10 }, 2, 20, 5)
+assert(off == 5, "compute_tab_viewport: within viewport → offset unchanged")
+-- Visible range: tabs overlapping [5,25] → tab 1 (0..10, overlaps 5..10),
+-- tab 2 (10..20 inside), tab 3 (20..30, overlaps 20..25).
+assert(vs == 1 and ve == 3, "compute_tab_viewport: within viewport → visible range 1..3")
+
+-- Test: active clips right — offset shifts so active.end sits at cols.
+-- Tabs: [0,10][10,20][20,30][30,40]; screen=20; active=4 at [30,40]; offset=0.
+-- Active.end (40) > offset (0) + cols (20) → offset becomes 40-20 = 20.
+off, vs, ve = t.compute_tab_viewport({ 10, 10, 10, 10 }, 4, 20, 0)
+assert(off == 20, "compute_tab_viewport: clip right → offset=active.end-cols")
+assert(vs == 3 and ve == 4, "compute_tab_viewport: clip right → visible 3..4")
+
+-- Test: active clips left — offset snaps to active.start.
+-- Tabs: [0,10][10,20][20,30][30,40]; screen=20; active=1 at [0,10]; offset=15.
+-- Active.start (0) < offset (15) → offset becomes 0.
+off, vs, ve = t.compute_tab_viewport({ 10, 10, 10, 10 }, 1, 20, 15)
+assert(off == 0, "compute_tab_viewport: clip left → offset=active.start")
+assert(vs == 1 and ve == 2, "compute_tab_viewport: clip left → visible 1..2")
+
+-- Test: wrap last→first — clip-left logic pulls offset back to 0 naturally.
+-- Tabs: [0,10][10,20][20,30][30,40]; screen=20; previously at tab 4 (offset=20).
+-- User hits next_tab, wraps to active=1. active.start (0) < offset (20) → offset=0.
+-- No special-case needed — the standard clip-left check handles it.
+off, vs, ve = t.compute_tab_viewport({ 10, 10, 10, 10 }, 1, 20, 20)
+assert(off == 0, "compute_tab_viewport: wrap last→first → offset snaps to 0")
+assert(vs == 1 and ve == 2, "compute_tab_viewport: wrap last→first → visible starts at 1")
+
+-- Test: single-tab — no-op, returns offset 0 and the one visible tab.
+off, vs, ve = t.compute_tab_viewport({ 10 }, 1, 20, 0)
+assert(off == 0, "compute_tab_viewport: single tab → offset 0")
+assert(vs == 1 and ve == 1, "compute_tab_viewport: single tab → visible 1..1")
+
+-- Test: single-tab, width exceeds screen — still no crash, offset 0.
+-- Degenerate case: one tab wider than the strip. Can happen under nerdfont
+-- miscounting. Correct behavior is "show what fits from the left" rather
+-- than blank. The simple-slice path handles this by returning visible=1..1
+-- and offset=0 via the total<=cols fast path (10>20 is false, so we fall
+-- through; active [0,50] clips right, offset=50-20=30; but then max_offset
+-- is 50-20=30, so offset stays 30; visible = tab whose [0,50] overlaps
+-- [30,50] = tab 1).
+off, vs, ve = t.compute_tab_viewport({ 50 }, 1, 20, 0)
+assert(off == 30, "compute_tab_viewport: oversize single → offset at max")
+assert(vs == 1 and ve == 1, "compute_tab_viewport: oversize single → still visible")
+
+-- Test: zero-width tabs don't shift the viewport.
+-- Tabs: [0,0][0,10][10,20][20,30]; screen=15; active=3 at [10,20]; offset=0.
+-- Active.end (20) > offset (0) + cols (15) → offset becomes 20-15 = 5.
+off, vs, ve = t.compute_tab_viewport({ 0, 10, 10, 10 }, 3, 15, 0)
+assert(off == 5, "compute_tab_viewport: zero-width prefix → offset respects real widths")
+
+-- Test: stale active index → caller-visible reset; function clamps to 1
+-- so it doesn't crash, offset still normalized.
+off, vs, ve = t.compute_tab_viewport({ 10, 10, 10 }, 99, 15, 7)
+-- total=30 > cols=15. With active=1 (clamped), active.start=0 < offset=7 → offset snaps to 0.
+assert(off == 0, "compute_tab_viewport: stale active → clamped and offset normalized")
+assert(vs == 1 and ve == 2, "compute_tab_viewport: stale active → visible from left")
+
+-- Test: negative input offset is clamped.
+off, vs, ve = t.compute_tab_viewport({ 10, 10, 10, 10 }, 2, 20, -99)
+-- total=40 > cols=20. Active=2 at [10,20], within [0,20], offset stays 0.
+assert(off == 0, "compute_tab_viewport: negative offset → clamped to 0")
+
+-- Test: empty tab list.
+off, vs, ve = t.compute_tab_viewport({}, 1, 20, 5)
+assert(off == 0, "compute_tab_viewport: empty → offset 0")
+assert(vs == 1 and ve == 0, "compute_tab_viewport: empty → empty visible range")

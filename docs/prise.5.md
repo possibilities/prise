@@ -161,6 +161,31 @@ The **tab_bar** table configures the tab bar.
 **show_single_tab**
 :   Show the tab bar even with only one tab. Default: **false**
 
+**render**
+:   Optional custom tab bar renderer. Overrides the default design.
+    Signature: `function(tabs, screen_width, theme, ctx) -> segments`.
+    When viewport scrolling is active, `tabs` holds only the visible slice and
+    `ctx.scroll_offset` reports where that slice starts in the full strip
+    (cells from left, integer, **0** when no scrolling is in effect). The
+    renderer should emit segments sized to `screen_width`; core maps them
+    back to the sliced tabs' original indices for click regions.
+
+**measure**
+:   Required when a custom **render** is set and the tab strip may overflow.
+    Signature: `function(tab) -> cells` — returns the integer cell-width the
+    renderer will draw for the given tab. Core calls this once per tab per
+    frame to compute the edge-triggered viewport: the active tab is always
+    visible; the strip shifts only when it would clip. Width math must use
+    `prise.gwidth`; `#str` miscounts wide graphemes. Returning `0` marks the
+    tab as zero-width (the viewport skips over it). If **measure** is absent
+    when **render** is set, viewport scrolling is disabled and a warn is
+    logged — existing renderers keep working but long tab lists silently
+    overflow the strip.
+
+**format_title**
+:   Optional `function(title, tab_index) -> string` applied to auto-derived
+    tab titles (not explicit renamed titles). Default: no formatting.
+
 # LAYOUTS
 
 The **layouts** table defines named layout presets for tabs and panes.
