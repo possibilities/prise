@@ -192,7 +192,10 @@ assert(remove_calls[1].session_name == "alpha", "break_pane_to_session happy: re
 assert(remove_calls[1].pty_id == 42, "break_pane_to_session happy: remove gets correct pty_id")
 -- fn-45 matrix-wins: place targets the SOURCE session, not the viewer's.
 assert(#place_calls == 1, "break_pane_to_session happy: place_pty_in_session called exactly once")
-assert(place_calls[1].session_name == "alpha", "break_pane_to_session happy: place targets source_session (matrix-wins)")
+assert(
+    place_calls[1].session_name == "alpha",
+    "break_pane_to_session happy: place targets source_session (matrix-wins)"
+)
 assert(place_calls[1].pty_id == 42, "break_pane_to_session happy: place gets correct pty_id")
 assert(place_calls[1].cwd == "/Users/mike/code/alpha", "break_pane_to_session happy: place gets cwd")
 -- Viewer's state.tabs is left untouched — no in-memory mutation, no save.
