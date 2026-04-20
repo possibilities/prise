@@ -6846,16 +6846,41 @@ local function build_floating()
     return widgets
 end
 
-function M.view()
-    local root = get_active_root()
-    if not root then
-        return prise.Column({
-            cross_axis_align = "stretch",
-            children = { prise.Text("Waiting for terminal...") },
-        })
+---Build the transition shell rendered between set_tab_shell and set_state.
+---Tab bar is forced visible regardless of show_single_tab so the session-switch
+---flash is contained to the content area only — chrome stays painted throughout.
+---@return table
+local function build_transition_shell()
+    -- Bypass the show_single_tab gate by calling the renderers directly.
+    local tab_bar
+    if config.tab_bar.render then
+        tab_bar = prise.Text(build_tab_bar_custom())
+    else
+        tab_bar = prise.Text(build_tab_bar_default())
     end
 
-    -- Start clock timer for status bar updates
+    local empty_pane = prise.Column({
+        cross_axis_align = "stretch",
+        children = {},
+    })
+    local status_bar = config.status_bar.enabled and build_status_bar() or nil
+
+    local children = {}
+    if tab_bar then
+        table.insert(children, tab_bar)
+    end
+    table.insert(children, empty_pane)
+    if status_bar then
+        table.insert(children, status_bar)
+    end
+
+    return prise.Column({ cross_axis_align = "stretch", children = children })
+end
+
+---Build the main render tree for the live (roots populated) case.
+---@param root Node
+---@return table
+local function build_main_ui(root)
     if config.status_bar.enabled then
         schedule_clock_timer()
     end
@@ -6894,6 +6919,7 @@ function M.view()
                 focus = not overlay_visible,
             })
 
+            local terminal = prise.Terminal({ pty = pane.pty, focus = not overlay_visible })
             if config.borders.enabled and config.borders.show_single_pane then
                 content = prise.Box({
                     border = config.borders.style,
@@ -6912,7 +6938,6 @@ function M.view()
     end
 
     local status_bar = config.status_bar.enabled and build_status_bar() or nil
-
     local main_children = {}
     if tab_bar then
         table.insert(main_children, tab_bar)
@@ -6922,11 +6947,7 @@ function M.view()
         table.insert(main_children, status_bar)
     end
 
-    local main_ui = prise.Column({
-        cross_axis_align = "stretch",
-        children = main_children,
-    })
-
+    local main_ui = prise.Column({ cross_axis_align = "stretch", children = main_children })
     -- Build overlay stack: floating pane below modals, modals on top
     local overlay_children = { main_ui }
     if floating then
@@ -6935,18 +6956,30 @@ function M.view()
     local modal = palette or rename or rename_tab or swap_with_index or session_picker or layout_picker
     if modal then
         table.insert(overlay_children, modal)
-        return prise.Stack({
-            children = overlay_children,
-        })
+        return prise.Stack({ children = overlay_children })
     end
 
     if floating then
-        return prise.Stack({
-            children = overlay_children,
+        return prise.Stack({ children = overlay_children })
+    end
+    return main_ui
+end
+
+function M.view()
+    -- Three-way dispatch: no session / transition window / live render.
+    if #state.tabs == 0 then
+        return prise.Column({
+            cross_axis_align = "stretch",
+            children = { prise.Text("Waiting for terminal...") },
         })
     end
 
-    return main_ui
+    local root = get_active_root()
+    if root == nil then
+        return build_transition_shell()
+    end
+
+    return build_main_ui(root)
 end
 
 ---@param cwd_lookup? fun(pty_id: number): string?
