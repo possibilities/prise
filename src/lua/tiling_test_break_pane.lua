@@ -577,7 +577,10 @@ assert(#s.tabs == 4, "right-of-focus inactive-left: tab count is 4, got " .. tos
 assert(s.tabs[3].root.id == 12, "right-of-focus inactive-left: new tab at index 3 hosts moved pane")
 assert(s.active_tab == 2, "right-of-focus inactive-left: active_tab unchanged, got " .. tostring(s.active_tab))
 assert(s.tabs[2].id == 2, "right-of-focus inactive-left: active tab still at index 2 (pointed at same logical tab)")
-assert(s.tabs[1].id == 1 and s.tabs[1].root.type == "pane", "right-of-focus inactive-left: source tab collapsed to single pane at index 1")
+assert(
+    s.tabs[1].id == 1 and s.tabs[1].root.type == "pane",
+    "right-of-focus inactive-left: source tab collapsed to single pane at index 1"
+)
 
 -- === right-of-focus: was_active AND follow_focus uses captured anchor ===
 -- 3 tabs, active_tab = 2, break pane 22 from active tab with default
@@ -606,8 +609,14 @@ t.set_state({
 })
 tiling.update({ type = "break_pane", data = { pty_id = 22 } })
 s = t.get_state()
-assert(s.active_tab == 3, "right-of-focus follow-focus: active_tab set to insert_idx (3), got " .. tostring(s.active_tab))
-assert(s.focused_id == 22, "right-of-focus follow-focus: focused pane is the moved pane, got " .. tostring(s.focused_id))
+assert(
+    s.active_tab == 3,
+    "right-of-focus follow-focus: active_tab set to insert_idx (3), got " .. tostring(s.active_tab)
+)
+assert(
+    s.focused_id == 22,
+    "right-of-focus follow-focus: focused pane is the moved pane, got " .. tostring(s.focused_id)
+)
 assert(s.tabs[3].root.id == 22, "right-of-focus follow-focus: new tab at index 3")
 
 -- === normalize: state.active_tab = nil → anchor = 1, new tab at index 2 ===
