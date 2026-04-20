@@ -6,9 +6,7 @@
 ---   3. #state.tabs > 0, active root nil, show_single_tab=false  → tab bar still present
 ---   4. After set_state (roots populated)  → main render path (Terminal widget present)
 local helpers = require("test_helpers")
-local mock_pane = helpers.mock_pane
 local mock_pty = helpers.mock_pty
-local mock_tab = helpers.mock_tab
 helpers.setup_prise_mock()
 
 local tiling = require("tiling")
