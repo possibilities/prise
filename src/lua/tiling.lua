@@ -180,7 +180,7 @@ local utils = require("utils")
 
 ---@class BreakPaneEvent
 ---@field type "break_pane"
----@field data { pty_id: number, focus?: boolean }
+---@field data { pty_id: number, focus?: boolean, source_session?: string, cwd?: string, tab_title?: string }
 
 ---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|BreakPaneEvent
 
@@ -3248,6 +3248,14 @@ function M.update(event)
         -- out via data.focus = false; otherwise the operation is silent with
         -- no focus steal.
         --
+        -- Cross-session extension (fn-45): when event.data.source_session is
+        -- provided and the pane is not found in state.tabs (viewer is on a
+        -- different session), the destination is the SOURCE session itself —
+        -- the new tab lands in the source session's saved JSON via the
+        -- file-based pair (prise.remove_pty_from_session +
+        -- prise.place_pty_in_session). The viewer's session.tabs is NOT
+        -- mutated. Matrix-wins per fn-45.
+        --
         -- Placement policy: the new tab is inserted immediately to the RIGHT
         -- of the focused tab (state.active_tab), not appended to the end.
         -- The anchor is normalized via max(1, min(#tabs, active_tab or 1))
@@ -3262,7 +3270,7 @@ function M.update(event)
         -- this placement policy).
         local pty_id = event.data and event.data.pty_id
         if type(pty_id) ~= "number" then
-            return
+            return false
         end
 
         -- Opt-out focus-follow. Default true preserves historical behavior;
@@ -3274,7 +3282,75 @@ function M.update(event)
 
         local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
         if not src_tab then
-            return
+            -- fn-45 cross-session arm: when source_session is provided, both
+            -- remove and place target the SOURCE session — the new tab lands
+            -- in source's JSON, not in the viewer's state.tabs. Viewer's
+            -- session is left untouched.
+            local source_session = event.data and event.data.source_session
+            prise.log.info(
+                "break_pane: cross-session entry pty="
+                    .. tostring(pty_id)
+                    .. " source="
+                    .. tostring(source_session)
+                    .. " viewer="
+                    .. tostring(prise.get_session_name())
+            )
+            if type(source_session) == "string" and source_session ~= "" then
+                local cwd = event.data and event.data.cwd
+                if type(cwd) ~= "string" or cwd == "" then
+                    prise.log.warn(
+                        "break_pane: cross-session missing cwd for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " — cannot place into source session"
+                    )
+                    return false
+                end
+                local tab_title = event.data and event.data.tab_title
+                prise.log.info(
+                    "break_pane: cross-session pre-remove pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                )
+                local removed = prise.remove_pty_from_session(source_session, pty_id)
+                if not removed then
+                    prise.log.warn(
+                        "break_pane: cross-session remove failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                    )
+                    return false
+                end
+                prise.log.info(
+                    "break_pane: cross-session post-remove pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                        .. " — placing into source"
+                )
+                local placed = prise.place_pty_in_session(source_session, pty_id, cwd, tab_title)
+                if not placed then
+                    prise.log.warn(
+                        "break_pane: cross-session place failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " (orphaned after remove)"
+                    )
+                    return false
+                end
+                prise.log.info(
+                    "break_pane: cross-session done pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                )
+                return true
+            end
+            return false
         end
 
         -- Require the pane to live in the tileable tree (not a floating or
