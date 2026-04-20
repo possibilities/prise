@@ -165,8 +165,8 @@ end
 -- === break_pane_to_session happy path: viewer on unrelated session ===
 -- Pane 42 lives in session "alpha" (not in viewer's state.tabs).
 -- Viewer is on "viewer" (unrelated to both source and destination).
--- remove_pty_from_session("alpha", 42) and an in-memory tab insertion should
--- both fire; returns true.
+-- Per fn-45 matrix-wins semantics: both remove AND place target the SOURCE
+-- session ("alpha"). Viewer's state.tabs is NOT mutated.
 
 reset_captures()
 t.set_state({
@@ -182,6 +182,7 @@ local happy_ret = tiling.update({
     data = {
         pty_id = 42, -- not in viewer state
         source_session = "alpha",
+        cwd = "/Users/mike/code/alpha",
         focus = false,
     },
 })
@@ -189,16 +190,18 @@ assert(happy_ret == true, "break_pane_to_session happy: returns true on success"
 assert(#remove_calls == 1, "break_pane_to_session happy: remove_pty_from_session called exactly once")
 assert(remove_calls[1].session_name == "alpha", "break_pane_to_session happy: remove targets source_session")
 assert(remove_calls[1].pty_id == 42, "break_pane_to_session happy: remove gets correct pty_id")
--- Viewer is on the current session ("viewer") which is where the break lands;
--- the handler inserts the new tab in-memory instead of calling place_pty_in_session.
+-- fn-45 matrix-wins: place targets the SOURCE session, not the viewer's.
+assert(#place_calls == 1, "break_pane_to_session happy: place_pty_in_session called exactly once")
+assert(place_calls[1].session_name == "alpha", "break_pane_to_session happy: place targets source_session (matrix-wins)")
+assert(place_calls[1].pty_id == 42, "break_pane_to_session happy: place gets correct pty_id")
+assert(place_calls[1].cwd == "/Users/mike/code/alpha", "break_pane_to_session happy: place gets cwd")
+-- Viewer's state.tabs is left untouched — no in-memory mutation, no save.
 local hs = t.get_state()
-assert(#hs.tabs == 2, "break_pane_to_session happy: new tab inserted into viewer state")
-assert(hs.tabs[2].last_focused_id == 42, "break_pane_to_session happy: new tab last_focused_id is broken pane")
-assert(save_calls >= 1, "break_pane_to_session happy: prise.save() called")
--- Viewer tab count and contents for pre-existing tab are unchanged.
+assert(#hs.tabs == 1, "break_pane_to_session happy: viewer state.tabs unchanged (matrix-wins)")
 assert(hs.tabs[1].root.id == 500, "break_pane_to_session happy: original viewer tab untouched")
+assert(save_calls == 0, "break_pane_to_session happy: viewer's prise.save() NOT called (no viewer mutation)")
 
--- === break_pane_to_session: remove_return=false bail — no in-memory mutation ===
+-- === break_pane_to_session: remove_return=false bail — no place call ===
 
 reset_captures()
 remove_return = false
@@ -215,11 +218,13 @@ local remove_fail_ret = tiling.update({
     data = {
         pty_id = 42,
         source_session = "alpha",
+        cwd = "/Users/mike/code/alpha",
         focus = false,
     },
 })
 assert(remove_fail_ret == false, "break_pane_to_session remove-fail: returns false when remove fails")
 assert(#remove_calls == 1, "break_pane_to_session remove-fail: remove was attempted")
+assert(#place_calls == 0, "break_pane_to_session remove-fail: place NOT called when remove fails")
 -- Viewer state must not be mutated after a failed remove.
 local rfs = t.get_state()
 assert(#rfs.tabs == 1, "break_pane_to_session remove-fail: no new tab inserted after failed remove")
@@ -230,6 +235,71 @@ assert(
 )
 assert(warn_calls[1]:find("pty=42", 1, true), "break_pane_to_session remove-fail: warn mentions pty id")
 assert(warn_calls[1]:find("source=alpha", 1, true), "break_pane_to_session remove-fail: warn mentions source session")
+
+-- === break_pane_to_session: place_return=false orphan — warn but no rollback ===
+
+reset_captures()
+place_return = false
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local place_fail_ret = tiling.update({
+    type = "break_pane",
+    data = {
+        pty_id = 42,
+        source_session = "alpha",
+        cwd = "/Users/mike/code/alpha",
+        focus = false,
+    },
+})
+assert(place_fail_ret == false, "break_pane_to_session place-fail: returns false when place fails")
+assert(#remove_calls == 1, "break_pane_to_session place-fail: remove was called")
+assert(#place_calls == 1, "break_pane_to_session place-fail: place was attempted")
+local pfs = t.get_state()
+assert(#pfs.tabs == 1, "break_pane_to_session place-fail: viewer state unchanged after orphan")
+assert(#warn_calls == 1, "break_pane_to_session place-fail: one warn logged")
+assert(
+    warn_calls[1]:find("cross-session place failed", 1, true),
+    "break_pane_to_session place-fail: warn mentions cross-session place"
+)
+assert(
+    warn_calls[1]:find("orphaned after remove", 1, true),
+    "break_pane_to_session place-fail: warn mentions orphan condition"
+)
+
+-- === break_pane_to_session: missing cwd — fail visibly without remove ===
+
+reset_captures()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local no_cwd_ret = tiling.update({
+    type = "break_pane",
+    data = {
+        pty_id = 42,
+        source_session = "alpha",
+        -- cwd intentionally omitted
+        focus = false,
+    },
+})
+assert(no_cwd_ret == false, "break_pane_to_session no-cwd: returns false when cwd missing")
+assert(#remove_calls == 0, "break_pane_to_session no-cwd: remove NOT called when cwd missing (avoid orphan)")
+assert(#place_calls == 0, "break_pane_to_session no-cwd: place NOT called when cwd missing")
+assert(#warn_calls == 1, "break_pane_to_session no-cwd: warn logged")
+assert(
+    warn_calls[1]:find("missing cwd", 1, true),
+    "break_pane_to_session no-cwd: warn mentions missing cwd"
+)
 
 -- === break_pane_to_session: back-compat — absent source_session falls through ===
 -- When source_session is not provided and the pane is not in viewer state,
@@ -291,18 +361,16 @@ assert(#bcs.tabs == 2, "break_pane_to_session back-compat: same-session break cr
 assert(bcs.tabs[2].root.id == 2, "break_pane_to_session back-compat: moved pane in new tab")
 
 -- ========================================================================
--- Right-of-focus placement policy (fn-32-break-pane-right-of-focus.1)
+-- Viewer isolation invariant (fn-45-fix-b5-cross-session-break.1)
 -- ========================================================================
--- Cross-session breaks must also land right-of-focus in the destination
--- session's state.tabs — the anchor rule is shared with the same-session
--- path. These tests exercise the cross-session insert and the empty-tabs
--- degenerate case where the handler's (#state.tabs == 0) → 1 branch
--- diverges from the anchor+1 rule.
+-- Cross-session breaks land in the SOURCE session's JSON via the file-based
+-- pair (remove_pty_from_session + place_pty_in_session). The viewer's
+-- state.tabs and active_tab MUST remain untouched regardless of the viewer's
+-- pre-break tab layout. These tests pin that invariant for the
+-- multi-tab-viewer and empty-viewer cases that previously asserted
+-- in-memory placement into the viewer's session.
 
--- === right-of-focus: cross-session break into viewer with multiple tabs ===
--- Viewer's destination session has 3 tabs with active_tab = 2. Break
--- pane 42 from session "alpha" (not in viewer state). Anchor = 2,
--- insert_idx = 3. New tab at index 3; viewer's active_tab unchanged at 2.
+-- === viewer isolation: cross-session break with multi-tab viewer ===
 
 reset_captures()
 t.set_state({
@@ -320,26 +388,23 @@ local multi_tab_ret = tiling.update({
     data = {
         pty_id = 42,
         source_session = "alpha",
+        cwd = "/Users/mike/code/alpha",
         focus = false,
     },
 })
-assert(multi_tab_ret == true, "right-of-focus cross-session: returns true on success")
+assert(multi_tab_ret == true, "viewer-isolation multi-tab: returns true on success")
+assert(#place_calls == 1, "viewer-isolation multi-tab: place called once")
+assert(place_calls[1].session_name == "alpha", "viewer-isolation multi-tab: place targets source 'alpha', not viewer")
 local mhs = t.get_state()
-assert(#mhs.tabs == 4, "right-of-focus cross-session: tab count is 4, got " .. tostring(#mhs.tabs))
-assert(mhs.tabs[3].root.pty_id == 42, "right-of-focus cross-session: new tab at index 3 hosts broken pane (pty_id 42)")
-assert(mhs.active_tab == 2, "right-of-focus cross-session: viewer active_tab unchanged, got " .. tostring(mhs.active_tab))
--- Verify the pre-existing tabs retained their identities in expected
--- positions: tabs 1 and 2 unchanged; tab 3 (originally pane 502) pushed
--- to index 4.
-assert(mhs.tabs[1].id == 1, "right-of-focus cross-session: tab 1 unchanged")
-assert(mhs.tabs[2].id == 2, "right-of-focus cross-session: tab 2 unchanged")
-assert(mhs.tabs[4].id == 3, "right-of-focus cross-session: former tab 3 pushed to index 4")
+-- Viewer's tabs are NOT touched: same count, same identities, same active_tab.
+assert(#mhs.tabs == 3, "viewer-isolation multi-tab: viewer tab count unchanged (3)")
+assert(mhs.active_tab == 2, "viewer-isolation multi-tab: viewer active_tab unchanged (2)")
+assert(mhs.tabs[1].id == 1, "viewer-isolation multi-tab: tab 1 unchanged")
+assert(mhs.tabs[2].id == 2, "viewer-isolation multi-tab: tab 2 unchanged")
+assert(mhs.tabs[3].id == 3, "viewer-isolation multi-tab: tab 3 unchanged (NOT pushed)")
+assert(save_calls == 0, "viewer-isolation multi-tab: viewer save NOT called")
 
--- === empty-tabs degenerate: cross-session break into empty viewer ===
--- #state.tabs = 0 (no tabs — viewer just attached to an empty destination
--- session). Cross-session break with the normalize formula would give
--- anchor+1 = 2, but the handler's (#state.tabs == 0) → 1 branch routes
--- the insert to index 1 so the new tab becomes the only tab.
+-- === viewer isolation: cross-session break with empty viewer ===
 
 reset_captures()
 t.set_state({
@@ -353,10 +418,14 @@ local empty_ret = tiling.update({
     data = {
         pty_id = 77,
         source_session = "other",
+        cwd = "/Users/mike/code/other",
         focus = false,
     },
 })
-assert(empty_ret == true, "empty-tabs: returns true on success")
+assert(empty_ret == true, "viewer-isolation empty: returns true on success")
+assert(#place_calls == 1, "viewer-isolation empty: place called once")
+assert(place_calls[1].session_name == "other", "viewer-isolation empty: place targets source 'other'")
 local ehs = t.get_state()
-assert(#ehs.tabs == 1, "empty-tabs: new tab lands as only tab, got " .. tostring(#ehs.tabs))
-assert(ehs.tabs[1].root.pty_id == 77, "empty-tabs: new tab hosts the broken pane")
+-- Viewer remains empty — no inadvertent tab insertion into the viewer.
+assert(#ehs.tabs == 0, "viewer-isolation empty: viewer state.tabs remains empty")
+assert(save_calls == 0, "viewer-isolation empty: viewer save NOT called")

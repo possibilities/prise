@@ -180,7 +180,7 @@ local utils = require("utils")
 
 ---@class BreakPaneEvent
 ---@field type "break_pane"
----@field data { pty_id: number, focus?: boolean, source_session?: string }
+---@field data { pty_id: number, focus?: boolean, source_session?: string, cwd?: string, tab_title?: string }
 
 ---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|BreakPaneEvent
 
@@ -3407,23 +3407,25 @@ function M.update(event)
         --
         -- Cross-session extension: when event.data.source_session is provided
         -- and the pane is not found in state.tabs (viewer is on a different
-        -- session), remove from source via prise.remove_pty_from_session and
-        -- place into the current session's new tab via prise.place_pty_in_session
-        -- or in-memory mutation (if viewer is already on destination). Mirrors
-        -- the three viewer-position cases from move_pane_to_session.
+        -- session), the destination is the SOURCE session itself — the new
+        -- tab lands in the source session's saved JSON via the file-based
+        -- pair (prise.remove_pty_from_session + prise.place_pty_in_session).
+        -- The viewer's session.tabs is NOT mutated. Matrix-wins per fn-45.
         --
         -- Returns true on success, false on partial failure (remove succeeded
         -- but place failed — pane orphaned). No rollback — log warn and return
         -- false, mirroring the move primitive's stance.
         --
-        -- Placement policy: the new tab is inserted immediately to the RIGHT
-        -- of the focused tab (state.active_tab), not appended to the end.
-        -- The anchor is normalized via max(1, min(#tabs, active_tab or 1))
-        -- with an explicit empty-tabs → index 1 branch. Anchor is CAPTURED AT
-        -- HANDLER ENTRY (before any mutations) and decremented by 1 if a
-        -- subsequent table.remove fires at an index <= anchor, so that
-        -- "right of originally-focused tab" semantics survive intra-handler
-        -- tree mutations.
+        -- Placement policy (same-session branch below): the new tab is
+        -- inserted immediately to the RIGHT of the focused tab
+        -- (state.active_tab), not appended to the end. Anchor is normalized
+        -- via max(1, min(#tabs, active_tab or 1)) with an explicit empty-tabs
+        -- → index 1 branch.
+        --
+        -- For the cross-session arm: placement is server-side via
+        -- appendTabToSessionFile, which appends at the end of source's tabs[].
+        -- For B5's setup (1 tab, active_tab=1) this matches the matrix's
+        -- normalize(active_tab)+1 expectation.
         --
         -- keep in sync with partner handler on feat/break-pane (merged
         -- tiling.lua has two break_pane handlers; both must share this
@@ -3442,8 +3444,8 @@ function M.update(event)
 
         -- Capture the placement anchor BEFORE any mutation. Normalize
         -- state.active_tab through max(1, min(#tabs, active_tab or 1)) so
-        -- nil / 0 / overflow all route to a valid index. Applied to both
-        -- the cross-session and same-session branches below.
+        -- nil / 0 / overflow all route to a valid index. Applied to the
+        -- same-session branch below.
         local anchor = math.max(1, math.min(#state.tabs, state.active_tab or 1))
         -- Insertion index: empty-tabs degenerate case lands at 1, otherwise
         -- right of the anchor.
@@ -3454,14 +3456,43 @@ function M.update(event)
         local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
         if not src_tab then
             -- Cross-session break: the pane lives in another session's saved
-            -- JSON. When source_session is provided handle remove + place.
-            -- Remove is always file-based (viewer not on source by this
-            -- branch's precondition). For the place half: if the viewer is
-            -- on the destination session (current session), mutate state.tabs
-            -- in-memory to sidestep the autosave race; otherwise use the
-            -- file-based path.
+            -- JSON. When source_session is provided, both remove and place
+            -- target the SOURCE session — the new tab lands in source's JSON,
+            -- NOT in the viewer's state.tabs. Viewer's session is left
+            -- untouched (mtime not advanced, state.tabs not mutated,
+            -- active_tab unchanged).
             local source_session = event.data and event.data.source_session
+            prise.log.info(
+                "break_pane: cross-session entry pty="
+                    .. tostring(pty_id)
+                    .. " source="
+                    .. tostring(source_session)
+                    .. " viewer="
+                    .. tostring(prise.get_session_name())
+            )
             if type(source_session) == "string" and source_session ~= "" then
+                -- cwd is required by prise.place_pty_in_session and is plumbed
+                -- through the manage_pane intent from arthack init.lua
+                -- (params.cwd → break_pane data.cwd). When absent, we cannot
+                -- perform the cross-session place — fail visibly.
+                local cwd = event.data and event.data.cwd
+                if type(cwd) ~= "string" or cwd == "" then
+                    prise.log.warn(
+                        "break_pane: cross-session missing cwd for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " — cannot place into source session"
+                    )
+                    return false
+                end
+                local tab_title = event.data and event.data.tab_title
+                prise.log.info(
+                    "break_pane: cross-session pre-remove pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                )
                 local removed = prise.remove_pty_from_session(source_session, pty_id)
                 if not removed then
                     prise.log.warn(
@@ -3472,26 +3503,35 @@ function M.update(event)
                     )
                     return false
                 end
-                -- Destination is always the current session — break always
-                -- places into a fresh tab in the viewer's active session.
-                local current = prise.get_session_name()
-                -- Allocate a new tab in-memory; the pending autosave will
-                -- serialize it. Pass focus = false defensively: viewer is
-                -- not on the source session, so there's no focus to follow.
-                local tab_id = state.next_tab_id
-                state.next_tab_id = tab_id + 1
-                ---@type Tab
-                local new_tab = {
-                    id = tab_id,
-                    root = { type = "pane", pty_id = pty_id },
-                    last_focused_id = pty_id,
-                }
-                -- Placement: insert at anchor + 1 (right of focused tab).
-                -- When state.tabs is empty (viewer just attached to empty
-                -- destination session), the new tab becomes the only tab.
-                table.insert(state.tabs, placement_index(), new_tab)
-                prise.save()
-                prise.request_frame()
+                prise.log.info(
+                    "break_pane: cross-session post-remove pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                        .. " — placing into source"
+                )
+                -- Place into the SOURCE session's JSON file (matrix-wins:
+                -- C_new lands in alpha, not in the viewer's session). The
+                -- file-based path appends at the end of source's tabs[]
+                -- (server-side appendTabToSessionFile).
+                local placed = prise.place_pty_in_session(source_session, pty_id, cwd, tab_title)
+                if not placed then
+                    prise.log.warn(
+                        "break_pane: cross-session place failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " (orphaned after remove)"
+                    )
+                    return false
+                end
+                prise.log.info(
+                    "break_pane: cross-session done pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                )
+                -- Viewer's session is untouched — no save, no request_frame.
                 return true
             end
             return false
