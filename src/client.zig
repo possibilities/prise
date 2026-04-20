@@ -1793,7 +1793,11 @@ pub const App = struct {
     }
 
     fn cancelSessionSwitch(self: *App, reason: []const u8) void {
-        _ = reason;
+        // Forward-only policy: log loudly, clear the in-progress flag and
+        // prepared plan via finishSessionSwitch, but do NOT revert state.tabs.
+        // The tab bar stays on whatever set_tab_shell last painted — callers
+        // see the failure in the log and decide whether to retry.
+        log.err("Session switch cancelled: {s}", .{reason});
         self.finishSessionSwitch();
     }
 
@@ -1901,13 +1905,26 @@ pub const App = struct {
             self.allocator.free(self.split_handles);
             self.split_handles = &.{};
         }
-
-        try self.ui.clearState();
     }
 
     fn beginSessionSwitchAttach(self: *App) !void {
-        _ = self.preparedRestoreSessionName() orelse return error.NoPreparedRestorePlan;
+        const plan = self.prepared_restore_plan orelse return error.NoPreparedRestorePlan;
+        // Capture session_json as a local slice BEFORE resetActiveSessionState
+        // to guard against a re-entrant event that could free the plan while
+        // reset is running. The slice remains valid as long as the plan lives
+        // (see clearPreparedRestorePlan); beginSessionSwitchAttach never frees
+        // the plan on the success path.
+        const local_session_json = plan.session_json;
         try self.resetActiveSessionState();
+        // Paint the incoming tab bar in a single frame — no empty-row flash.
+        // set_tab_shell only writes tab metadata (ids, titles, active_tab,
+        // scroll_offset); full pty binding happens later in
+        // completePreparedSessionRestore via setStateFromJson.
+        try self.ui.setTabShell(local_session_json);
+        // Keep scheduleRender: set_tab_shell does NOT internally call
+        // prise.request_frame, so Zig must still trigger the render. If
+        // set_tab_shell ever gains internal scheduling, this becomes
+        // redundant and can be dropped.
         try self.scheduleRender();
         try self.applyPreparedSessionRestore();
     }
