@@ -1005,10 +1005,7 @@ assert(place_fail_ret.reason == "cross_session_place_failed",
 assert(#remove_calls == 1, "place-fail: remove was called")
 assert(#place_calls == 1, "place-fail: place was attempted after remove success")
 assert(#warn_calls == 1, "place-fail: one warning logged")
-assert(
-    warn_calls[1]:find("cross-session place failed", 1, true),
-    "place-fail: warning mentions cross-session place"
-)
+assert(warn_calls[1]:find("cross-session place failed", 1, true), "place-fail: warning mentions cross-session place")
 assert(warn_calls[1]:find("orphaned after remove", 1, true), "place-fail: warning notes orphan state")
 
 -- === Cross-session back-compat: absent source_session keeps old no-op behavior ===
