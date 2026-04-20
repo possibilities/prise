@@ -4522,6 +4522,94 @@ function M.get_state(cwd_lookup)
     }
 end
 
+---Paint tab-bar metadata (ids, titles, active tab, scroll offset) without any
+---pty binding. Used at session-switch derivation time so the tab bar can swap
+---old->new in a single frame without going through `deserialize_node` (which
+---would drop every tab when the incoming ptys aren't attached yet). A
+---follow-up `M.set_state(plan_json, live_lookup)` after `attach_pty` completes
+---rebinds live pty refs.
+---
+---Contract: writes ONLY tab-level metadata. Every tab.root is nil on exit;
+---no pane/split structure is created. Does NOT call `deserialize_node`.
+---@param saved? table
+function M.set_tab_shell(saved)
+    -- Clear outgoing session-scoped visual state so the tab bar swap doesn't
+    -- bleed palette / zoom / focus from the previous session. Inlined
+    -- (branch-local) rather than calling `reset_session_state` because this
+    -- branch is based on `main` where that helper does not yet exist; when
+    -- merged into arthack-prod the set is a subset of what `reset_session_state`
+    -- already clears, so behaviour is consistent.
+    state.tabs = {}
+    state.active_tab = 1
+    state.next_tab_id = 1
+    state.focused_id = nil
+    state.zoomed_pane_id = nil
+    state.pending_command = false
+    state.pending_split = nil
+    state.pending_new_tab = false
+    state.palette.visible = false
+    if state.palette.input then
+        state.palette.input:clear()
+    end
+    state.rename.visible = false
+    if state.rename.input then
+        state.rename.input:clear()
+    end
+    state.rename_tab.visible = false
+    if state.rename_tab.input then
+        state.rename_tab.input:clear()
+    end
+    state.swap_with_index = nil
+    state.session_picker.visible = false
+    state.layout_picker.visible = false
+    state.tab_regions = {}
+    state.tab_close_regions = {}
+    state.hovered_tab = nil
+    state.hovered_close_tab = nil
+    -- `state.tab_bar_scroll_offset` is fn-55's field; writing when the key
+    -- doesn't pre-exist is harmless in Lua, so always zero it for a clean
+    -- viewport on swap. When fn-55 is merged this matches its reset idiom.
+    state.tab_bar_scroll_offset = 0
+
+    if not saved then
+        prise.request_frame()
+        return
+    end
+
+    -- Iterate the top-level tabs array; for each tab create a shell with
+    -- root = nil. No pty binding, no pane/split structure.
+    for _, tab_data in ipairs(saved.tabs or {}) do
+        table.insert(state.tabs, {
+            id = tab_data.id,
+            title = tab_data.title,
+            root = nil,
+            last_focused_id = tab_data.last_focused_id,
+        })
+    end
+
+    state.active_tab = saved.active_tab or 1
+    -- Restore next_tab_id from JSON (inlined clear above zeroed it to 1);
+    -- without this, future tab creation would collide with existing ids.
+    state.next_tab_id = saved.next_tab_id or (#state.tabs + 1)
+
+    -- tab_bar_scroll_offset is runtime-only in fn-55 (not in get_state's
+    -- serialized shape), so the JSON won't carry it. Read defensively in case
+    -- a future fn-55 revision starts persisting it.
+    if saved.tab_bar_scroll_offset ~= nil then
+        state.tab_bar_scroll_offset = saved.tab_bar_scroll_offset
+    end
+
+    -- Clamp active_tab into range (empty-tabs case lands on 1, fine).
+    if state.active_tab > #state.tabs then
+        state.active_tab = #state.tabs
+    end
+    if state.active_tab < 1 and #state.tabs > 0 then
+        state.active_tab = 1
+    end
+
+    prise.request_frame()
+end
+
 ---@param saved? table
 ---@param pty_lookup fun(id: number): Pty?
 function M.set_state(saved, pty_lookup)
