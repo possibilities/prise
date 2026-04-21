@@ -236,12 +236,17 @@ local POWERLINE_SYMBOLS = {
 ---@class TabRenderContext
 ---@field scroll_offset number Cells from the left edge of the full strip that the visible slice starts at
 
+---Structured tab bar layout returned by custom render functions
+---@class TabBarLayout
+---@field prefix table[]   -- styled segments drawn at left edge, never clipped
+---@field tabs table[]     -- [{ tab_index = N, segments = {...} }, ...]
+---@field suffix table[]   -- styled segments drawn at right edge (may be empty)
+
 ---Custom render function for tab bar
----Must return an array of segments compatible with prise.Text()
----When viewport scrolling is active, `tabs` holds only the visible slice and
----`ctx.scroll_offset` reports where that slice starts in the full strip
----(cells from left, integer, 0 when no scrolling is in effect).
----@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme, ctx?: TabRenderContext): table[]
+---Must return a TabBarLayout with prefix/tabs/suffix slots. The core composes
+---the final strip from these three slots and applies centered-focus windowing
+---plus cell-precise edge clipping to the tabs slot.
+---@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme, ctx?: TabRenderContext): TabBarLayout
 
 ---Measure function for tab bar viewport fit
 ---Must return the integer cell-width the renderer will draw for a single tab.
@@ -256,6 +261,8 @@ local POWERLINE_SYMBOLS = {
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
 ---@field render? TabRenderFunction Custom tab bar renderer (overrides default design)
 ---@field measure? TabMeasureFunction Cell-width oracle for viewport scrolling (custom renderer only)
+---@field gutter_left? string|table Glyph shown at the left edge when tabs are hidden off-screen (default: "<")
+---@field gutter_right? string|table Glyph shown at the right edge when tabs are hidden off-screen (default: ">")
 ---@field format_title? TabFormatFunction Optional function to format tab titles (default: no formatting)
 
 ---Keybinds are a map from key_string to action name
@@ -333,6 +340,8 @@ local config = {
     tab_bar = {
         show_single_tab = false,
         render = nil, -- Use default built-in design
+        gutter_left = "<", -- Glyph shown when tabs are hidden off the left edge
+        gutter_right = ">", -- Glyph shown when tabs are hidden off the right edge
         format_title = nil, -- Use titles as-is
     },
     floating = {
