@@ -749,6 +749,297 @@ do
     t.reset_tab_bar_render_warned()
 end
 
+-- === renderer-owned gutters (fn-79) ===
+-- Renderer returns optional symmetric `gutter_left`/`gutter_right` segment
+-- fields. Core still owns show/hide via overflow; renderer proposes glyphs.
+
+-- Test: renderer-owned gutters spliced verbatim when both sides overflow.
+-- Installs a fake renderer returning single-segment gutters; asserts click-
+-- region origin shifts by the measured gutter widths.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(10)
+    t.set_state({
+        tabs = {
+            { root = mock_pane(1), title = "a" },
+            { root = mock_pane(2), title = "b" },
+            { root = mock_pane(3), title = "c" },
+        },
+        active_tab = 2,
+    })
+    t.set_tab_bar_render(function(_tabs, _cols, _theme, _ctx, _opts)
+        return {
+            prefix = {},
+            tabs = {
+                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
+            },
+            suffix = {},
+            gutter_left = { text = "L", style = { fg = "#ff0000" } },
+            gutter_right = { text = "R", style = { fg = "#00ff00" } },
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    local out = t.build_tab_bar_custom()
+    assert(#warns == 0, "renderer-owned gutters: no warn")
+    -- screen_cols=10; total tabs=12 (4+4+4); budget=10; active=2 centers BBBB,
+    -- gutters on both sides → both overflow so both gutters visible.
+    -- Find L/R gutters in output.
+    local has_l, has_r = false, false
+    for _, seg in ipairs(out) do
+        if seg.text == "L" and seg.style and seg.style.fg == "#ff0000" then
+            has_l = true
+        end
+        if seg.text == "R" and seg.style and seg.style.fg == "#00ff00" then
+            has_r = true
+        end
+    end
+    assert(has_l, "renderer-owned gutters: L verbatim with style")
+    assert(has_r, "renderer-owned gutters: R verbatim with style")
+    -- Click-region origin shifts by gutter_l_w=1: first region start_x == 1.
+    local st = t.get_state()
+    assert(#st.tab_regions >= 1, "renderer-owned gutters: click regions populated")
+    assert(st.tab_regions[1].start_x == 1, "renderer-owned gutters: origin shifted by left gutter width")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
+    t.reset_tab_bar_render_warned()
+end
+
+-- Test: renderer-owned gutter list form (multi-segment) spliced in order.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(10)
+    t.set_state({
+        tabs = {
+            { root = mock_pane(1), title = "a" },
+            { root = mock_pane(2), title = "b" },
+            { root = mock_pane(3), title = "c" },
+        },
+        active_tab = 2,
+    })
+    t.set_tab_bar_render(function()
+        return {
+            prefix = {},
+            tabs = {
+                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
+            },
+            suffix = {},
+            gutter_left = { { text = "<", style = {} }, { text = " ", style = {} } },
+            gutter_right = { { text = " ", style = {} }, { text = ">", style = {} } },
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    local out = t.build_tab_bar_custom()
+    assert(#warns == 0, "renderer-owned gutter list: no warn")
+    -- Verify both halves of each 2-seg gutter make it through.
+    local left_glyph, left_space, right_space, right_glyph = false, false, false, false
+    for i, seg in ipairs(out) do
+        if seg.text == "<" then
+            left_glyph = true
+            assert(out[i + 1] and out[i + 1].text == " ", "list gutter: left spacer follows glyph")
+        end
+        if seg.text == ">" then
+            right_glyph = true
+            assert(out[i - 1] and out[i - 1].text == " ", "list gutter: right spacer precedes glyph")
+        end
+    end
+    assert(left_glyph, "renderer-owned gutter list: left glyph present")
+    assert(right_glyph, "renderer-owned gutter list: right glyph present")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
+    t.reset_tab_bar_render_warned()
+end
+
+-- Test: renderer returns neither gutter → falls back to static config glyph.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(10)
+    t.set_tab_bar_gutters("<", ">")
+    t.set_state({
+        tabs = {
+            { root = mock_pane(1), title = "a" },
+            { root = mock_pane(2), title = "b" },
+            { root = mock_pane(3), title = "c" },
+        },
+        active_tab = 2,
+    })
+    t.set_tab_bar_render(function()
+        return {
+            prefix = {},
+            tabs = {
+                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
+            },
+            suffix = {},
+            -- no gutter_left / gutter_right → core falls back to config glyphs.
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    local out = t.build_tab_bar_custom()
+    assert(#warns == 0, "fallback gutter: no warn")
+    local has_default_left, has_default_right = false, false
+    for _, seg in ipairs(out) do
+        if seg.text == "<" then
+            has_default_left = true
+        end
+        if seg.text == ">" then
+            has_default_right = true
+        end
+    end
+    assert(has_default_left, "fallback gutter: default '<' from config")
+    assert(has_default_right, "fallback gutter: default '>' from config")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
+    t.reset_tab_bar_render_warned()
+end
+
+-- Test: asymmetric gutter (only left set) → validator rejects → whole-bar kill.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(80)
+    t.set_state({
+        tabs = { { root = mock_pane(1), title = "a" }, { root = mock_pane(2), title = "b" } },
+        active_tab = 1,
+    })
+    t.set_tab_bar_render(function()
+        return {
+            prefix = {},
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            suffix = {},
+            gutter_left = { text = "L", style = {} },
+            -- gutter_right deliberately absent → asymmetric → malformed.
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    local out = t.build_tab_bar_custom()
+    assert(#out == 0, "asymmetric gutter: empty strip on whole-bar kill")
+    assert(#warns == 1, "asymmetric gutter: warn once")
+    assert(warns[1]:find("both be set or both absent"), "asymmetric gutter: warn names the rule")
+    local st = t.get_state()
+    assert(st.tab_bar_render_warned == true, "asymmetric gutter: latch flipped true")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
+    t.reset_tab_bar_render_warned()
+end
+
+-- Test: non-table segment (gutter_left = 42) → validator rejects → whole-bar kill.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(80)
+    t.set_state({
+        tabs = { { root = mock_pane(1), title = "a" }, { root = mock_pane(2), title = "b" } },
+        active_tab = 1,
+    })
+    t.set_tab_bar_render(function()
+        return {
+            prefix = {},
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            suffix = {},
+            gutter_left = 42,
+            gutter_right = { text = "R", style = {} },
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    local out = t.build_tab_bar_custom()
+    assert(#out == 0, "non-table gutter: empty strip")
+    assert(#warns == 1, "non-table gutter: warn once")
+    assert(warns[1]:find("gutter_left"), "non-table gutter: warn names the field")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
+    t.reset_tab_bar_render_warned()
+end
+
+-- Test: segment with non-string `text` (gutter_left = {text={}, style={}}) →
+-- validator rejects → whole-bar kill.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(80)
+    t.set_state({
+        tabs = { { root = mock_pane(1), title = "a" }, { root = mock_pane(2), title = "b" } },
+        active_tab = 1,
+    })
+    t.set_tab_bar_render(function()
+        return {
+            prefix = {},
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            suffix = {},
+            gutter_left = { text = {}, style = {} },
+            gutter_right = { text = "R", style = {} },
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    local out = t.build_tab_bar_custom()
+    assert(#out == 0, "non-string text: empty strip")
+    assert(#warns == 1, "non-string text: warn once")
+    assert(warns[1]:find("gutter_left"), "non-string text: warn names field")
+    assert(warns[1]:find("text"), "non-string text: warn names 'text' problem")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
+    t.reset_tab_bar_render_warned()
+end
+
+-- Test: `opts` 5th arg is passed to the renderer with gutter glyph strings.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(40)
+    t.set_tab_bar_gutters("LL", "RR")
+    t.set_state({
+        tabs = { { root = mock_pane(1), title = "a" }, { root = mock_pane(2), title = "b" } },
+        active_tab = 1,
+    })
+    local captured_opts = nil
+    t.set_tab_bar_render(function(_tabs, _cols, _theme, _ctx, opts)
+        captured_opts = opts
+        return {
+            prefix = {},
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            suffix = {},
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    t.build_tab_bar_custom()
+    assert(captured_opts ~= nil, "opts arg: present")
+    assert(captured_opts.gutter_left == "LL", "opts arg: gutter_left forwarded")
+    assert(captured_opts.gutter_right == "RR", "opts arg: gutter_right forwarded")
+    assert(#warns == 0, "opts arg: no warn")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
+    t.set_tab_bar_gutters("<", ">")
+    t.reset_tab_bar_render_warned()
+end
+
 -- Cleanup: leave renderer config nil + warn latch reset for any tests that follow.
 t.set_tab_bar_render(nil)
 t.reset_tab_bar_render_warned()

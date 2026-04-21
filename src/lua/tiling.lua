@@ -241,12 +241,24 @@ local POWERLINE_SYMBOLS = {
 ---@field prefix table[]   -- styled segments drawn at left edge, never clipped
 ---@field tabs table[]     -- [{ tab_index = N, segments = {...} }, ...]
 ---@field suffix table[]   -- styled segments drawn at right edge (may be empty)
+---@field gutter_left? table|table[]  -- single segment or segment list; core still owns show/hide by overflow. All-or-nothing with gutter_right.
+---@field gutter_right? table|table[] -- single segment or segment list; core still owns show/hide by overflow. All-or-nothing with gutter_left.
+
+---Filtered opts passed as the 5th arg to TabRenderFunction. Carries only the
+---plain-string gutter glyphs from `config.tab_bar` — tight contract, expand
+---only when future items demand new fields.
+---@class TabRenderOpts
+---@field gutter_left string
+---@field gutter_right string
 
 ---Custom render function for tab bar
 ---Must return a TabBarLayout with prefix/tabs/suffix slots. The core composes
 ---the final strip from these three slots and applies centered-focus windowing
----plus cell-precise edge clipping to the tabs slot.
----@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme, ctx?: TabRenderContext): TabBarLayout
+---plus cell-precise edge clipping to the tabs slot. When the renderer emits
+---optional `gutter_left` + `gutter_right` segment fields (symmetric, all-or-
+---nothing), core splices them verbatim on the sides that actually need a
+---gutter (overflow) and drops them on sides that don't.
+---@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme, ctx?: TabRenderContext, opts?: TabRenderOpts): TabBarLayout
 
 ---Measure function for tab bar viewport fit
 ---Must return the integer cell-width the renderer will draw for a single tab.
@@ -261,8 +273,8 @@ local POWERLINE_SYMBOLS = {
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
 ---@field render? TabRenderFunction Custom tab bar renderer (overrides default design)
 ---@field measure? TabMeasureFunction Cell-width oracle for viewport scrolling (custom renderer only)
----@field gutter_left? string|table Glyph shown at the left edge when tabs are hidden off-screen (default: "<")
----@field gutter_right? string|table Glyph shown at the right edge when tabs are hidden off-screen (default: ">")
+---@field gutter_left? string Glyph shown at the left edge when tabs are hidden off-screen; plain-string only (default: "<")
+---@field gutter_right? string Glyph shown at the right edge when tabs are hidden off-screen; plain-string only (default: ">")
 ---@field format_title? TabFormatFunction Optional function to format tab titles (default: no formatting)
 
 ---Keybinds are a map from key_string to action name
@@ -4234,12 +4246,39 @@ local function clip_boundary_tab(segments, leading_clip_cells, trailing_clip_cel
     return { { text = flat, style = style } }
 end
 
+---True when `v` is a segment list (array of `{text=...}` entries) rather than
+---a single segment. Distinguishes `{text="x"}` (single) from `{{text="x"}}`
+---(list) by the presence of a `text` field at the top level.
+---@param v table
+---@return boolean
+local function is_segment_list(v)
+    return v[1] ~= nil and v.text == nil
+end
+
+---Append a gutter slot's segments — accepts either a single segment or a list
+---of segments. Nil skips entirely.
+---@param out table[]
+---@param slot table|table[]|nil
+local function append_gutter_slot(out, slot)
+    if slot == nil then
+        return
+    end
+    if is_segment_list(slot) then
+        for _, s in ipairs(slot) do
+            out[#out + 1] = s
+        end
+    else
+        out[#out + 1] = slot
+    end
+end
+
 ---Concatenate prefix + optional left gutter + visible-tab segments + optional
 ---right gutter + suffix into a single flat segment list for `prise.Text`.
+---Gutter slots accept single segment OR segment list (renderer-owned gutters).
 ---@param prefix_segs table[]
----@param gutter_l_seg table? nil to skip
+---@param gutter_l_seg table|table[]|nil nil to skip
 ---@param visible_tab_segs_list table[][] Array of each visible tab's segments.
----@param gutter_r_seg table? nil to skip
+---@param gutter_r_seg table|table[]|nil nil to skip
 ---@param suffix_segs table[]
 ---@return table[]
 local function compose_layout_segments(prefix_segs, gutter_l_seg, visible_tab_segs_list, gutter_r_seg, suffix_segs)
@@ -4247,17 +4286,13 @@ local function compose_layout_segments(prefix_segs, gutter_l_seg, visible_tab_se
     for _, s in ipairs(prefix_segs or {}) do
         out[#out + 1] = s
     end
-    if gutter_l_seg then
-        out[#out + 1] = gutter_l_seg
-    end
+    append_gutter_slot(out, gutter_l_seg)
     for _, tab_segs in ipairs(visible_tab_segs_list or {}) do
         for _, s in ipairs(tab_segs) do
             out[#out + 1] = s
         end
     end
-    if gutter_r_seg then
-        out[#out + 1] = gutter_r_seg
-    end
+    append_gutter_slot(out, gutter_r_seg)
     for _, s in ipairs(suffix_segs or {}) do
         out[#out + 1] = s
     end
@@ -4299,10 +4334,12 @@ local function measure_tab_segments(segments)
     return n
 end
 
----Emit a gutter segment from a config value (string or styled-segment table).
----Returns nil when the config value is absent or empty — caller treats nil as
----"no gutter". Width is derived via `prise.gwidth`.
----@param gutter_cfg string|table|nil
+---Emit a gutter segment from a plain-string config value. Returns nil when
+---the config value is absent or empty — caller treats nil as "no gutter".
+---Width is derived via `prise.gwidth`. Default-renderer fallback only; the
+---styled-segment form used to live here and is now expressed through the
+---renderer's `TabBarLayout.gutter_left`/`gutter_right` fields instead.
+---@param gutter_cfg string|nil
 ---@return table? segment, integer width
 local function build_gutter_segment(gutter_cfg)
     if gutter_cfg == nil or gutter_cfg == "" then
@@ -4310,13 +4347,6 @@ local function build_gutter_segment(gutter_cfg)
     end
     if type(gutter_cfg) == "string" then
         return { text = gutter_cfg, style = {} }, prise.gwidth(gutter_cfg)
-    end
-    if type(gutter_cfg) == "table" then
-        local text = gutter_cfg.text or ""
-        if text == "" then
-            return nil, 0
-        end
-        return { text = text, style = gutter_cfg.style or {} }, prise.gwidth(text)
     end
     return nil, 0
 end
@@ -4338,6 +4368,51 @@ local function degraded_tab_bar(msg, prefix_segs, suffix_segs)
     -- Compose prefix + suffix when they're structurally valid; callers pass
     -- nil when even that isn't safe.
     return compose_layout_segments(prefix_segs or {}, nil, {}, nil, suffix_segs or {})
+end
+
+---Validate a single segment shape: table with string `text` and optional
+---table `style`. Returns nil on success or a reason string on failure.
+---@param seg any
+---@return string?
+local function validate_segment_shape(seg)
+    if type(seg) ~= "table" then
+        return "not a table"
+    end
+    if type(seg.text) ~= "string" then
+        return "segment.text not a string"
+    end
+    if seg.style ~= nil and type(seg.style) ~= "table" then
+        return "segment.style not a table"
+    end
+    return nil
+end
+
+---Validate an optional gutter-slot value: either a single segment or a list
+---of segments (array where each entry passes `validate_segment_shape`).
+---Nil is accepted by the caller — this only runs when the field is present.
+---@param gutter any
+---@param field_name string For error context ("gutter_left" / "gutter_right").
+---@return string?
+local function validate_gutter_field(gutter, field_name)
+    if type(gutter) ~= "table" then
+        return "render()." .. field_name .. " not a table"
+    end
+    -- List form: detect via numeric first entry with no top-level `text`.
+    if gutter[1] ~= nil and gutter.text == nil then
+        for i, seg in ipairs(gutter) do
+            local bad = validate_segment_shape(seg)
+            if bad then
+                return "render()." .. field_name .. "[" .. tostring(i) .. "] " .. bad
+            end
+        end
+        return nil
+    end
+    -- Single-segment form.
+    local bad = validate_segment_shape(gutter)
+    if bad then
+        return "render()." .. field_name .. " " .. bad
+    end
+    return nil
 end
 
 ---Validate the layout shape returned by the custom renderer. Returns a
@@ -4365,6 +4440,23 @@ local function validate_tab_bar_layout(layout)
             or type(tab.segments) ~= "table"
         then
             return "render().tabs[" .. tostring(i) .. "] malformed"
+        end
+    end
+    -- All-or-nothing gutters: asymmetric presence is malformed. Renderer
+    -- proposes both sides; core decides which to show via overflow gate.
+    local has_left = layout.gutter_left ~= nil
+    local has_right = layout.gutter_right ~= nil
+    if has_left ~= has_right then
+        return "render() gutter_left/gutter_right must both be set or both absent"
+    end
+    if has_left then
+        local bad_l = validate_gutter_field(layout.gutter_left, "gutter_left")
+        if bad_l then
+            return bad_l
+        end
+        local bad_r = validate_gutter_field(layout.gutter_right, "gutter_right")
+        if bad_r then
+            return bad_r
         end
     end
     return nil
@@ -4398,12 +4490,47 @@ local function slice_and_clip_visible(tabs, tab_widths, vr)
     return segs_list, meta
 end
 
+---Measure a gutter slot's cell width when the renderer emits a segment or a
+---segment list. Mirrors `measure_tab_segments` but accepts the single-segment
+---shape too. Returns 0 for nil.
+---@param slot table|table[]|nil
+---@return integer
+local function measure_gutter_slot(slot)
+    if slot == nil then
+        return 0
+    end
+    if slot[1] ~= nil and slot.text == nil then
+        return measure_tab_segments(slot)
+    end
+    return prise.gwidth(slot.text or "")
+end
+
+---Pick gutter slots + widths for composition. Prefers renderer-owned gutters
+---when the layout carries them (all-or-nothing, validator-enforced); falls
+---back to the plain-string config glyphs otherwise.
+---@param layout table Validated TabBarLayout.
+---@return table|table[]|nil left_slot, table|table[]|nil right_slot, integer left_w, integer right_w
+local function pick_gutter_slots(layout)
+    if layout.gutter_left ~= nil then
+        return layout.gutter_left,
+            layout.gutter_right,
+            measure_gutter_slot(layout.gutter_left),
+            measure_gutter_slot(layout.gutter_right)
+    end
+    local left, left_w = build_gutter_segment(config.tab_bar.gutter_left)
+    local right, right_w = build_gutter_segment(config.tab_bar.gutter_right)
+    return left, right, left_w, right_w
+end
+
 ---Build tab bar with custom renderer (structured layout).
----Contract: renderer returns `{ prefix, tabs, suffix }` where tabs is a list
----of `{ tab_index, segments }`. Core measures each tab, centres the focus
----window, composes gutters + cell-precise boundary clipping, and emits click
----regions keyed by `tab_index`. Any renderer error / malformed layout →
----warn-once + empty strip (latched on `state.tab_bar_render_warned`).
+---Contract: renderer returns `{ prefix, tabs, suffix, gutter_left?, gutter_right? }`
+---where tabs is a list of `{ tab_index, segments }`. Core measures each tab,
+---centres the focus window, decides gutter visibility by overflow, splices
+---renderer-owned gutter segments verbatim (falling back to plain-string
+---config glyphs when the renderer returns none), applies cell-precise
+---boundary clipping, and emits click regions keyed by `tab_index`. Any
+---renderer error / malformed layout → warn-once + empty strip (latched on
+---`state.tab_bar_render_warned`).
 ---@return table[]
 local function build_tab_bar_custom()
     state.tab_regions = {}
@@ -4415,7 +4542,11 @@ local function build_tab_bar_custom()
         screen_cols = 1
     end
 
-    local ok, layout = pcall(config.tab_bar.render, tab_infos, screen_cols, THEME, { scroll_offset = 0 })
+    local render_opts = {
+        gutter_left = config.tab_bar.gutter_left or "",
+        gutter_right = config.tab_bar.gutter_right or "",
+    }
+    local ok, layout = pcall(config.tab_bar.render, tab_infos, screen_cols, THEME, { scroll_offset = 0 }, render_opts)
     if not ok then
         return degraded_tab_bar("tab_bar.render raised: " .. tostring(layout))
     end
@@ -4445,8 +4576,7 @@ local function build_tab_bar_custom()
     end
     local fw = compute_focus_window(tab_widths, active_idx, tab_budget)
 
-    local gutter_l_seg, gutter_left_w = build_gutter_segment(config.tab_bar.gutter_left)
-    local gutter_r_seg, gutter_right_w = build_gutter_segment(config.tab_bar.gutter_right)
+    local gutter_l_slot, gutter_r_slot, gutter_left_w, gutter_right_w = pick_gutter_slots(layout)
     local ag = apply_gutters(fw.start, tab_budget, fw.total_width, gutter_left_w, gutter_right_w)
 
     local vr = derive_visible_range(tab_widths, ag.adjusted_start, ag.adjusted_budget)
@@ -4464,9 +4594,9 @@ local function build_tab_bar_custom()
     )
     return compose_layout_segments(
         prefix_segs,
-        ag.show_left and gutter_l_seg or nil,
+        ag.show_left and gutter_l_slot or nil,
         visible_tab_segs_list,
-        ag.show_right and gutter_r_seg or nil,
+        ag.show_right and gutter_r_slot or nil,
         suffix_segs
     )
 end
@@ -4871,6 +5001,8 @@ M._test = {
     compose_layout_segments = compose_layout_segments,
     derive_click_regions = derive_click_regions,
     build_tab_bar_custom = build_tab_bar_custom,
+    validate_tab_bar_layout = validate_tab_bar_layout,
+    measure_gutter_slot = measure_gutter_slot,
     -- Test-only setters for the warn-once latch + render callback so tests
     -- can drive the renderer-error posture without relying on test ordering.
     reset_tab_bar_render_warned = function()
