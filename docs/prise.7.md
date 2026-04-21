@@ -146,6 +146,13 @@ A custom UI must return a table with:
 - **get_state(cwd_lookup)**: Serialize state for persistence (optional)
 - **set_state(saved, pty_lookup)**: Restore state (optional)
 
+The built-in tiling UI's `tab_bar.render` returns a structured layout with
+three slots — `{prefix, tabs, suffix}` — so renderers declare fixed left/right
+content separately from the windowed tab list. Core applies centered-focus
+windowing and cell-precise edge clipping to the `tabs` slot only; `prefix` and
+`suffix` are never clipped. See **prise**(5) for the full `TabBarLayout`
+definition and the companion `gutter_left` / `gutter_right` config fields.
+
 # SEE ALSO
 
 [prise(1)](prise.1.html), [prise(5)](prise.5.html)

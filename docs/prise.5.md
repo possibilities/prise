@@ -163,24 +163,60 @@ The **tab_bar** table configures the tab bar.
 
 **render**
 :   Optional custom tab bar renderer. Overrides the default design.
-    Signature: `function(tabs, screen_width, theme, ctx) -> segments`.
-    When viewport scrolling is active, `tabs` holds only the visible slice and
-    `ctx.scroll_offset` reports where that slice starts in the full strip
-    (cells from left, integer, **0** when no scrolling is in effect). The
-    renderer should emit segments sized to `screen_width`; core maps them
-    back to the sliced tabs' original indices for click regions.
+    Signature: `function(tabs, screen_width, theme, ctx) -> TabBarLayout`.
+    Returns a structured layout with three slots:
+
+    **prefix**
+    :   List of styled segments drawn at the left edge. Never clipped.
+        Core reserves this width before measuring tabs — use it for
+        session headers, mode indicators, or any fixed-position content
+        that must always be visible.
+
+    **tabs**
+    :   List of `{tab_index = N, segments = {...}}` entries, one per tab.
+        `tab_index` is the tab's index in the full unsliced `tabs` input
+        and drives click-region mapping. Core applies centered-focus
+        windowing (tmux `format_draw_put_list`-style) to this slot: the
+        active tab stays visually centered when space permits, with
+        cell-precise clipping of boundary tabs that only partially fit.
+
+    **suffix**
+    :   List of styled segments drawn at the right edge. Never clipped.
+        May be empty. Reserved width mirrors **prefix**: use for status
+        segments, clocks, or other right-anchored content.
+
+    The `ctx` argument is reserved for future fields and is currently
+    empty. `tabs` is always the full unsliced list — core handles
+    windowing from the returned `TabBarLayout`. Width math must use
+    `prise.gwidth`; `#str` miscounts wide graphemes. On renderer error
+    (non-table return, missing slot, pcall failure) the tab strip draws
+    empty for the frame and a single warn is logged via `prise.log.warn`
+    (subsequent failures are silent — log hygiene at 60fps).
 
 **measure**
 :   Required when a custom **render** is set and the tab strip may overflow.
     Signature: `function(tab) -> cells` — returns the integer cell-width the
-    renderer will draw for the given tab. Core calls this once per tab per
-    frame to compute the edge-triggered viewport: the active tab is always
-    visible; the strip shifts only when it would clip. Width math must use
+    renderer will draw for the given tab (tabs slot only; **prefix** and
+    **suffix** widths are measured directly from their returned segments).
+    Core calls this once per tab per frame to compute the centered-focus
+    window: the active tab stays centered when possible; boundary tabs clip
+    cell-precise against the available budget. Width math must use
     `prise.gwidth`; `#str` miscounts wide graphemes. Returning `0` marks the
-    tab as zero-width (the viewport skips over it). If **measure** is absent
-    when **render** is set, viewport scrolling is disabled and a warn is
-    logged — existing renderers keep working but long tab lists silently
-    overflow the strip.
+    tab as zero-width (windowing skips over it). If **measure** is absent
+    when **render** is set, a warn is logged and the tab strip draws empty
+    — existing renderers must return `TabBarLayout` and provide **measure**.
+
+**gutter_left**
+:   Glyph rendered at the left edge when one or more tabs are hidden off
+    the left side of the viewport. Only appears when tabs are actually
+    hidden — never shown when the full strip fits. Signature: `string`.
+    Default: **"<"**. Cell-width is measured via `prise.gwidth`, so
+    multi-cell glyphs work correctly.
+
+**gutter_right**
+:   Glyph rendered at the right edge when one or more tabs are hidden off
+    the right side of the viewport. Mirrors **gutter_left**: only appears
+    when tabs are actually hidden. Signature: `string`. Default: **">"**.
 
 **format_title**
 :   Optional `function(title, tab_index) -> string` applied to auto-derived
