@@ -149,7 +149,7 @@ function M.setup_prise_mock()
             }
         end,
         -- Logging (multiple branches)
-        log = { debug = function() end, info = function() end },
+        log = { debug = function() end, info = function() end, warn = function() end, error = function() end },
         -- Session switch support
         set_timeout = function(_, _)
             return { cancel = function() end }
