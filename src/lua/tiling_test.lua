@@ -207,22 +207,40 @@ end
 assert(state_upvalue ~= nil, "spawn placement: state upvalue found")
 
 -- Test: pty_spawned with title queues pending rename (and creates new tab since tab is nil)
+-- Integration-surface: plug-system branch moves new_tab from state.pending_new_tab to
+-- state.pending_spawns[id].new_tab. Accept either model so the test passes both on
+-- feat/spawn-pty alone and on arthack-prod after plug-system lands.
 state_upvalue.pending_title_renames = {}
 state_upvalue.pending_new_tab = false
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
 tiling.update({ type = "pty_spawned", data = { id = 5, title = "editor" } })
 assert(state_upvalue.pending_title_renames[5] == "editor", "pty_spawned: title queues pending rename")
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: nil tab creates new tab")
+assert(
+    state_upvalue.pending_new_tab == true
+        or (state_upvalue.pending_spawns[5] and state_upvalue.pending_spawns[5].new_tab == true),
+    "pty_spawned: nil tab creates new tab"
+)
 
 -- Test: pty_spawned with tab=<new> sets pending_new_tab
 state_upvalue.pending_new_tab = false
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
 tiling.update({ type = "pty_spawned", data = { id = 6, tab = "<new>" } })
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: tab=<new> sets pending_new_tab")
+assert(
+    state_upvalue.pending_new_tab == true
+        or (state_upvalue.pending_spawns[6] and state_upvalue.pending_spawns[6].new_tab == true),
+    "pty_spawned: tab=<new> sets pending_new_tab"
+)
 
 -- Test: pty_spawned without placement fields is no-op
 state_upvalue.pending_new_tab = false
 state_upvalue.pending_title_renames = {}
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
 tiling.update({ type = "pty_spawned", data = { id = 7 } })
-assert(state_upvalue.pending_new_tab == false, "pty_spawned: no placement fields, pending_new_tab unchanged")
+assert(
+    state_upvalue.pending_new_tab == false
+        and (state_upvalue.pending_spawns[7] == nil or state_upvalue.pending_spawns[7].new_tab ~= true),
+    "pty_spawned: no placement fields, pending_new_tab unchanged"
+)
 assert(state_upvalue.pending_title_renames[7] == nil, "pty_spawned: no placement fields, no pending rename")
 
 -- === find_tab_by_title ===
@@ -251,9 +269,14 @@ state_upvalue.tabs = {
 state_upvalue.active_tab = 1
 state_upvalue.pending_new_tab = false
 state_upvalue.pending_title_renames = {}
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
 tiling.update({ type = "pty_spawned", data = { id = 20, tab = "logs" } })
 assert(state_upvalue.active_tab == 2, "pty_spawned: known tab name activates tab")
-assert(state_upvalue.pending_new_tab == false, "pty_spawned: known tab name does not create new tab")
+assert(
+    state_upvalue.pending_new_tab == false
+        and (state_upvalue.pending_spawns[20] == nil or state_upvalue.pending_spawns[20].new_tab ~= true),
+    "pty_spawned: known tab name does not create new tab"
+)
 
 -- Test: pty_spawned with unknown tab name creates new tab
 state_upvalue.tabs = {
@@ -261,8 +284,13 @@ state_upvalue.tabs = {
 }
 state_upvalue.active_tab = 1
 state_upvalue.pending_new_tab = false
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
 tiling.update({ type = "pty_spawned", data = { id = 21, tab = "unknown" } })
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: unknown tab name creates new tab")
+assert(
+    state_upvalue.pending_new_tab == true
+        or (state_upvalue.pending_spawns[21] and state_upvalue.pending_spawns[21].new_tab == true),
+    "pty_spawned: unknown tab name creates new tab"
+)
 
 -- === pty_spawned with missing session ===
 
