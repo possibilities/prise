@@ -174,12 +174,16 @@ The **tab_bar** table configures the tab bar.
         that must always be visible.
 
     **tabs**
-    :   List of `{tab_index = N, segments = {...}}` entries, one per tab.
-        `tab_index` is the tab's index in the full unsliced `tabs` input
-        and drives click-region mapping. Core applies centered-focus
-        windowing (tmux `format_draw_put_list`-style) to this slot: the
-        active tab stays visually centered when space permits, with
-        cell-precise clipping of boundary tabs that only partially fit.
+    :   List of `{tab_index = N, label_segments = {...}}` entries, one
+        per tab. `tab_index` is the tab's index in the full unsliced
+        `tabs` input and drives click-region mapping. `label_segments`
+        carries the tab's label segments only — the inter-tab separator
+        is a 1-cell space injected by the core compositor between
+        adjacent visible tabs and is not part of a tab's segment list
+        or clippable width. Core applies centered-focus windowing (tmux
+        `format_draw_put_list`-style) to this slot: the active tab stays
+        visually centered when space permits, with cell-precise clipping
+        of boundary tabs that only partially fit.
 
     **suffix**
     :   List of styled segments drawn at the right edge. Never clipped.
@@ -212,16 +216,19 @@ The **tab_bar** table configures the tab bar.
 
 **measure**
 :   Required when a custom **render** is set and the tab strip may overflow.
-    Signature: `function(tab) -> cells` — returns the integer cell-width the
-    renderer will draw for the given tab (tabs slot only; **prefix** and
-    **suffix** widths are measured directly from their returned segments).
-    Core calls this once per tab per frame to compute the centered-focus
-    window: the active tab stays centered when possible; boundary tabs clip
-    cell-precise against the available budget. Width math must use
-    `prise.gwidth`; `#str` miscounts wide graphemes. Returning `0` marks the
-    tab as zero-width (windowing skips over it). If **measure** is absent
-    when **render** is set, a warn is logged and the tab strip draws empty
-    — existing renderers must return `TabBarLayout` and provide **measure**.
+    Signature: `function(tab) -> cells` — returns the integer label-only
+    cell-width the renderer will draw for the given tab (tabs slot only;
+    **prefix** and **suffix** widths are measured directly from their
+    returned segments). Must NOT include the inter-tab separator — core
+    injects a 1-cell space between adjacent visible tabs and accounts for
+    it internally. Core calls this once per tab per frame to compute the
+    centered-focus window: the active tab stays centered when possible;
+    boundary tabs clip cell-precise against the available budget. Width
+    math must use `prise.gwidth`; `#str` miscounts wide graphemes.
+    Returning `0` marks the tab as zero-width (windowing skips over it).
+    If **measure** is absent when **render** is set, a warn is logged and
+    the tab strip draws empty — existing renderers must return
+    `TabBarLayout` and provide **measure**.
 
 **gutter_left**
 :   Plain-string glyph rendered at the left edge when one or more tabs

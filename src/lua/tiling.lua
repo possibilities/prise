@@ -239,7 +239,7 @@ local POWERLINE_SYMBOLS = {
 ---Structured tab bar layout returned by custom render functions
 ---@class TabBarLayout
 ---@field prefix table[]   -- styled segments drawn at left edge, never clipped
----@field tabs table[]     -- [{ tab_index = N, segments = {...} }, ...]
+---@field tabs table[]     -- [{ tab_index = N, label_segments = {...} }, ...]; label segments only; the inter-tab separator is owned by the core compositor and is never part of a tab's clippable width.
 ---@field suffix table[]   -- styled segments drawn at right edge (may be empty)
 ---@field gutter_left? table|table[]  -- single segment or segment list; core still owns show/hide by overflow. All-or-nothing with gutter_right.
 ---@field gutter_right? table|table[] -- single segment or segment list; core still owns show/hide by overflow. All-or-nothing with gutter_left.
@@ -4069,6 +4069,7 @@ local function compute_focus_window(tab_widths, active_idx, budget)
     end
     local cols = (budget and budget >= 1) and budget or 1
 
+    -- Total strip width = sum(label_widths) + (N-1) core-injected separators.
     local total_width = 0
     for i = 1, n do
         local w = tab_widths[i] or 0
@@ -4076,6 +4077,9 @@ local function compute_focus_window(tab_widths, active_idx, budget)
             w = 0
         end
         total_width = total_width + w
+    end
+    if n > 1 then
+        total_width = total_width + (n - 1)
     end
 
     if total_width <= cols then
@@ -4087,13 +4091,14 @@ local function compute_focus_window(tab_widths, active_idx, budget)
         a = 1
     end
 
+    -- Focus-start accounts for separators between tabs 1..a-1.
     local focus_start = 0
     for i = 1, a - 1 do
         local w = tab_widths[i] or 0
         if w < 0 then
             w = 0
         end
-        focus_start = focus_start + w
+        focus_start = focus_start + w + 1 -- +1 for the separator after tab i
     end
     local active_w = tab_widths[a] or 0
     if active_w < 0 then
@@ -4121,9 +4126,31 @@ local function compute_focus_window(tab_widths, active_idx, budget)
     return { start = start, total_width = total_width }
 end
 
----Walk cumulative widths to derive the 1-based inclusive visible tab range
----plus the leading/trailing cell clips for the boundary tabs.
+---Cumulative label-start cell of tab `idx` (1-based), accounting for the
+---core-injected separators between each prior adjacent pair. Local helper
+---for the visible-range math; separator width is hard-coded to 1 cell.
 ---@param tab_widths integer[]
+---@param idx integer
+---@return integer
+local function cum_label_start(tab_widths, idx)
+    local c = 0
+    for i = 1, idx - 1 do
+        local w = tab_widths[i] or 0
+        if w < 0 then
+            w = 0
+        end
+        c = c + w + 1 -- +1 for the separator between tab i and tab i+1
+    end
+    return c
+end
+
+---Walk cumulative widths to derive the 1-based inclusive visible tab range
+---plus the leading/trailing cell clips for the boundary tabs. Accounts for
+---the core-injected 1-cell inter-tab separator (never before first, never
+---after last). Honors the snap-past-separator rule: if `start` lands in a
+---separator cell, advance to the next tab's first cell; if `window_end`
+---lands in a separator cell, clip back to the previous tab's last cell.
+---@param tab_widths integer[] Label-only widths; separators added internally.
 ---@param start integer Cells from left of the full strip where window begins.
 ---@param effective_budget integer Cell width of the (gutter-adjusted) window.
 ---@return { first_idx: integer, last_idx: integer, leading_clip: integer, trailing_clip: integer }
@@ -4142,30 +4169,44 @@ local function derive_visible_range(tab_widths, start, effective_budget)
         if w < 0 then
             w = 0
         end
-        local cum_start = cursor
-        local cum_end = cursor + w
-        if cum_end > start and cum_start < window_end then
+        if cursor + w > start and cursor < window_end then
             if not first_idx then
                 first_idx = i
-                first_cum_start = cum_start
+                first_cum_start = cursor
             end
             last_idx = i
-            last_cum_end = cum_end
+            last_cum_end = cursor + w
         end
-        cursor = cum_end
+        cursor = cursor + w + (i < n and 1 or 0)
     end
 
     if not first_idx then
         return { first_idx = 0, last_idx = 0, leading_clip = 0, trailing_clip = 0 }
     end
 
-    local leading_clip = start - first_cum_start
-    if leading_clip < 0 then
-        leading_clip = 0
+    local leading_clip = math.max(0, start - first_cum_start)
+    local trailing_clip = math.max(0, last_cum_end - window_end)
+
+    -- Snap-past-separator (left): leading clip consumed the whole first tab
+    -- → `start` sat inside the following separator cell. Advance to next tab.
+    local first_w = tab_widths[first_idx] or 0
+    if first_w > 0 and leading_clip >= first_w and first_idx < last_idx then
+        first_idx = first_idx + 1
+        first_cum_start = cum_label_start(tab_widths, first_idx)
+        leading_clip = math.max(0, start - first_cum_start)
     end
-    local trailing_clip = last_cum_end - window_end
-    if trailing_clip < 0 then
-        trailing_clip = 0
+
+    -- Snap-past-separator (right): trailing clip consumed the whole last tab
+    -- → `window_end` sat inside the preceding separator cell. Clip back.
+    local last_w = tab_widths[last_idx] or 0
+    if last_w > 0 and trailing_clip >= last_w and first_idx < last_idx then
+        last_idx = last_idx - 1
+        local w = tab_widths[last_idx] or 0
+        if w < 0 then
+            w = 0
+        end
+        last_cum_end = cum_label_start(tab_widths, last_idx) + w
+        trailing_clip = math.max(0, last_cum_end - window_end)
     end
 
     return {
@@ -4273,7 +4314,13 @@ local function append_gutter_slot(out, slot)
 end
 
 ---Concatenate prefix + optional left gutter + visible-tab segments + optional
----right gutter + suffix into a single flat segment list for `prise.Text`.
+---right gutter + suffix into a single flat segment list for `prise.Text`. A
+---single-cell `" "` separator is injected between each adjacent pair of
+---visible tabs (never before the first, never after the last). Zero-width
+---boundary tabs (label clipped to 0 cells) get no adjacent separator on
+---their inner side — the snap-past-separator rule in `derive_visible_range`
+---prevents this shape from arising, and we defensively skip separators next
+---to empty tab segment lists here too.
 ---Gutter slots accept single segment OR segment list (renderer-owned gutters).
 ---@param prefix_segs table[]
 ---@param gutter_l_seg table|table[]|nil nil to skip
@@ -4287,7 +4334,11 @@ local function compose_layout_segments(prefix_segs, gutter_l_seg, visible_tab_se
         out[#out + 1] = s
     end
     append_gutter_slot(out, gutter_l_seg)
-    for _, tab_segs in ipairs(visible_tab_segs_list or {}) do
+    local tab_list = visible_tab_segs_list or {}
+    for i, tab_segs in ipairs(tab_list) do
+        if i > 1 and #tab_segs > 0 and #tab_list[i - 1] > 0 then
+            out[#out + 1] = { text = " ", style = {} }
+        end
         for _, s in ipairs(tab_segs) do
             out[#out + 1] = s
         end
@@ -4300,8 +4351,11 @@ local function compose_layout_segments(prefix_segs, gutter_l_seg, visible_tab_se
 end
 
 ---Walk the visible tabs and emit on-screen click regions keyed by each tab's
----original `tab_index`. x-offset starts at `prefix_w + gutter_l_w`; gutters
----are NOT clickable (matches prior behavior).
+---original `tab_index`. x-offset starts at `prefix_w + gutter_l_w`; advances
+---by `tab.width + 1` between visible tabs (the core-injected inter-tab
+---separator) and by `tab.width` on the last. Gutters and separator cells are
+---NOT clickable — half-open semantics (`start_x` inclusive, `end_x` exclusive)
+---keep separator cells out of every region.
 ---@param prefix_w integer
 ---@param gutter_l_w integer 0 when the left gutter is hidden.
 ---@param visible_tabs { tab_index: integer, width: integer }[]
@@ -4309,15 +4363,21 @@ end
 ---@return { start_x: integer, end_x: integer, tab_index: integer }[]
 local function derive_click_regions(prefix_w, gutter_l_w, visible_tabs, gutter_r_w)
     local _ = gutter_r_w -- doc only
+    local tabs = visible_tabs or {}
     local regions = {}
     local x = prefix_w + gutter_l_w
-    for _, tab in ipairs(visible_tabs or {}) do
+    for i, tab in ipairs(tabs) do
         regions[#regions + 1] = {
             start_x = x,
             end_x = x + tab.width,
             tab_index = tab.tab_index,
         }
+        -- Advance past the tab; inject separator spacing between adjacent tabs
+        -- (never after the last). Zero-width tabs contribute no separator.
         x = x + tab.width
+        if i < #tabs and tab.width > 0 and tabs[i + 1].width > 0 then
+            x = x + 1
+        end
     end
     return regions
 end
@@ -4437,7 +4497,7 @@ local function validate_tab_bar_layout(layout)
             type(tab) ~= "table"
             or type(tab.tab_index) ~= "number"
             or math.floor(tab.tab_index) ~= tab.tab_index
-            or type(tab.segments) ~= "table"
+            or type(tab.label_segments) ~= "table"
         then
             return "render().tabs[" .. tostring(i) .. "] malformed"
         end
@@ -4464,8 +4524,9 @@ end
 
 ---Slice `tabs` by visible range, clip boundary tabs by cell-precise leading /
 ---trailing counts, and emit the flattened segment list + per-tab click-region
----metadata. Local helper for `build_tab_bar_custom` — not exposed.
----@param tabs { tab_index: integer, segments: table[] }[]
+---metadata. Local helper for `build_tab_bar_custom` — not exposed. Consumes
+---`tab.label_segments` (label-only; inter-tab separators are core-injected).
+---@param tabs { tab_index: integer, label_segments: table[] }[]
 ---@param tab_widths integer[]
 ---@param vr { first_idx: integer, last_idx: integer, leading_clip: integer, trailing_clip: integer }
 ---@return table[][] visible_tab_segs_list, { tab_index: integer, width: integer }[] visible_tabs_meta
@@ -4474,7 +4535,7 @@ local function slice_and_clip_visible(tabs, tab_widths, vr)
     local meta = {}
     for i = vr.first_idx, vr.last_idx do
         local tab = tabs[i]
-        local segs = tab.segments
+        local segs = tab.label_segments
         local lead = (i == vr.first_idx) and vr.leading_clip or 0
         local trail = (i == vr.last_idx) and vr.trailing_clip or 0
         local width = tab_widths[i] - lead - trail
@@ -4524,13 +4585,14 @@ end
 
 ---Build tab bar with custom renderer (structured layout).
 ---Contract: renderer returns `{ prefix, tabs, suffix, gutter_left?, gutter_right? }`
----where tabs is a list of `{ tab_index, segments }`. Core measures each tab,
----centres the focus window, decides gutter visibility by overflow, splices
----renderer-owned gutter segments verbatim (falling back to plain-string
----config glyphs when the renderer returns none), applies cell-precise
----boundary clipping, and emits click regions keyed by `tab_index`. Any
----renderer error / malformed layout → warn-once + empty strip (latched on
----`state.tab_bar_render_warned`).
+---where tabs is a list of `{ tab_index, label_segments }`. Core measures each
+---tab's label-only width, centres the focus window (accounting for the core-
+---injected 1-cell separators between adjacent visible tabs), decides gutter
+---visibility by overflow, splices renderer-owned gutter segments verbatim
+---(falling back to plain-string config glyphs when the renderer returns none),
+---applies cell-precise boundary clipping, injects inter-tab separators, and
+---emits click regions keyed by `tab_index`. Any renderer error / malformed
+---layout → warn-once + empty strip (latched on `state.tab_bar_render_warned`).
 ---@return table[]
 local function build_tab_bar_custom()
     state.tab_regions = {}
@@ -4567,7 +4629,7 @@ local function build_tab_bar_custom()
 
     local tab_widths = {}
     for i, tab in ipairs(tabs) do
-        tab_widths[i] = measure_tab_segments(tab.segments)
+        tab_widths[i] = measure_tab_segments(tab.label_segments)
     end
 
     local active_idx = state.active_tab

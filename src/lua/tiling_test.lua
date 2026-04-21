@@ -211,21 +211,22 @@ end
 -- the budget, clamp to 0 on underflow, clamp to max on overrun. Mirrors
 -- tmux's `format_draw_put_list` focus-centre algorithm. No tiling state.
 
--- Test: fits within budget — start snaps to 0, total_width reports sum.
+-- Test: fits within budget — start snaps to 0, total_width reports sum of
+-- label widths PLUS (N-1) core-injected separator cells.
 do
     local r = t.compute_focus_window({ 10, 10, 10 }, 2, 40)
     assert(r.start == 0, "compute_focus_window: fits → start 0")
-    assert(r.total_width == 30, "compute_focus_window: fits → total 30")
+    assert(r.total_width == 32, "compute_focus_window: fits → total 32 (30 + 2 separators)")
 end
 
 -- Test: active in middle — centered when budget < total.
--- Tabs: [0,10][10,20][20,30][30,40]. budget=20. active=2 at [10,20].
--- focus_centre = 10 + floor(10/2) = 15. half = 10. start = 15-10 = 5.
--- max_start = 40-20 = 20. 5 <= 20, so start = 5.
+-- Tabs (label+sep): [0,10] sep[10] [11,21] sep[21] [22,32] sep[32] [33,43].
+-- active=2 at [11,21]. focus_centre = 11 + floor(10/2) = 16. half = 10.
+-- start = 16-10 = 6. max_start = 43-20 = 23. 6 <= 23 → start = 6.
 do
     local r = t.compute_focus_window({ 10, 10, 10, 10 }, 2, 20)
-    assert(r.start == 5, "compute_focus_window: middle active centered")
-    assert(r.total_width == 40, "compute_focus_window: middle → total 40")
+    assert(r.start == 6, "compute_focus_window: middle active centered (with separators)")
+    assert(r.total_width == 43, "compute_focus_window: middle → total 43 (40 + 3 separators)")
 end
 
 -- Test: active near left — underflow branch → start = 0.
@@ -236,11 +237,11 @@ do
 end
 
 -- Test: active near right — start clamps to max.
--- active=4 at [30,40]. focus_centre = 35. half = 10. start = 25.
--- max_start = 40-20 = 20. 25 > 20 → clamp to 20.
+-- active=4 at [33,43]. focus_centre = 33 + 5 = 38. half = 10. start = 28.
+-- max_start = 43-20 = 23. 28 > 23 → clamp to 23.
 do
     local r = t.compute_focus_window({ 10, 10, 10, 10 }, 4, 20)
-    assert(r.start == 20, "compute_focus_window: near right → start clamps to max")
+    assert(r.start == 23, "compute_focus_window: near right → start clamps to max (with separators)")
 end
 
 -- Test: single tab wider than budget — start = 0 (total <= budget path doesn't
@@ -281,45 +282,49 @@ end
 
 -- === derive_visible_range ===
 -- Walk cumulative widths to find the inclusive 1-based range of tabs visible
--- inside [start, start+effective_budget]. leading_clip and trailing_clip
--- report the cell-precise clip needed on the boundary tabs.
+-- inside [start, start+effective_budget]. Separators between adjacent tabs
+-- (1 cell each) are accounted for in the cumulative walk. leading_clip and
+-- trailing_clip report the cell-precise clip needed on the boundary tabs.
+-- Honors snap-past-separator: `start` or `window_end` landing in a separator
+-- cell snaps to the adjacent tab boundary.
 
 -- Test: budget aligns with tab boundary — no clip.
--- Tabs: [0,10][10,20][20,30]. start=10. budget=10. window = [10,20].
--- first=2 (cum_start=10, cum_end=20), last=2. leading=0, trailing=0.
+-- Tabs (label+sep): [0,10] sep[10] [11,21] sep[21] [22,32]. start=10. budget=10. window=[10,20].
+-- tab1 cum[0,10]: 10>10 false → skip. tab2 cum[11,21]: 21>10 AND 11<20 → first=last=2.
+-- leading = 10-11 = -1 → 0. trailing = 21-20 = 1.
 do
     local r = t.derive_visible_range({ 10, 10, 10 }, 10, 10)
     assert(r.first_idx == 2, "derive_visible_range: aligned → first 2")
     assert(r.last_idx == 2, "derive_visible_range: aligned → last 2")
     assert(r.leading_clip == 0, "derive_visible_range: aligned → no leading clip")
-    assert(r.trailing_clip == 0, "derive_visible_range: aligned → no trailing clip")
+    assert(r.trailing_clip == 1, "derive_visible_range: aligned → trailing clip=1 (separator pushes tab 2 trailing)")
 end
 
 -- Test: leading edge mid-tab — leading_clip > 0.
--- Tabs: [0,10][10,20][20,30]. start=5. budget=10. window = [5,15].
--- first=1 (cum_start=0, cum_end=10, overlaps), last=2 (cum_start=10, cum_end=20, overlaps).
--- leading = start - first_cum_start = 5 - 0 = 5.
--- trailing = last_cum_end - window_end = 20 - 15 = 5.
+-- Tabs: [0,10] sep[10] [11,21] sep[21] [22,32]. start=5. budget=10. window=[5,15].
+-- tab1 cum[0,10]: 10>5 AND 0<15 → first=1. tab2 cum[11,21]: 21>5 AND 11<15 → last=2.
+-- leading = 5-0 = 5. trailing = 21-15 = 6.
 do
     local r = t.derive_visible_range({ 10, 10, 10 }, 5, 10)
     assert(r.first_idx == 1 and r.last_idx == 2, "derive_visible_range: mid-tab → 1..2")
     assert(r.leading_clip == 5, "derive_visible_range: mid-tab → leading 5")
-    assert(r.trailing_clip == 5, "derive_visible_range: mid-tab → trailing 5")
+    assert(r.trailing_clip == 6, "derive_visible_range: mid-tab → trailing 6 (accounts for separator)")
 end
 
 -- Test: trailing edge mid-tab only.
--- Tabs: [0,10][10,20][20,30]. start=10. budget=5. window = [10,15].
--- first=2 (10..20 overlaps 10..15), last=2. leading = 10-10 = 0. trailing = 20-15 = 5.
+-- Tabs: [0,10] sep[10] [11,21] sep[21] [22,32]. start=10. budget=5. window=[10,15].
+-- tab1 cum[0,10]: 10>10 false. tab2 cum[11,21]: 21>10 AND 11<15 → first=last=2.
+-- leading = 10-11 = -1 → 0. trailing = 21-15 = 6.
 do
     local r = t.derive_visible_range({ 10, 10, 10 }, 10, 5)
     assert(r.first_idx == 2 and r.last_idx == 2, "derive_visible_range: trailing-only → 2..2")
     assert(r.leading_clip == 0, "derive_visible_range: trailing-only → no leading clip")
-    assert(r.trailing_clip == 5, "derive_visible_range: trailing-only → trailing 5")
+    assert(r.trailing_clip == 6, "derive_visible_range: trailing-only → trailing 6")
 end
 
 -- Test: budget smaller than first tab — visible single tab, clipped both sides.
--- Tabs: [0,20]. start=5. budget=10. window = [5,15]. first=1. last=1.
--- leading = 5 - 0 = 5. trailing = 20 - 15 = 5.
+-- Tabs: [0,20]. start=5. budget=10. window=[5,15]. first=1, last=1.
+-- leading = 5-0 = 5. trailing = 20-15 = 5. N=1 so no separator injection.
 do
     local r = t.derive_visible_range({ 20 }, 5, 10)
     assert(r.first_idx == 1 and r.last_idx == 1, "derive_visible_range: narrow → single")
@@ -336,6 +341,76 @@ end
 do
     local r = t.derive_visible_range({ 10 }, 0, 0)
     assert(r.first_idx == 0, "derive_visible_range: zero budget → 0")
+end
+
+-- Test: snap-past-separator (left edge). `start` lands in a separator cell
+-- between tab 1 and tab 2 — the leading clip would otherwise eat all of tab 1.
+-- Tabs: [0,10] sep[10] [11,21] sep[21] [22,32]. start=10. budget=12. window=[10,22].
+-- tab1 cum[0,10]: 10>10 false. tab2 cum[11,21]: first=2. tab3 cum[22,32]: 32>10 AND 22<22 false → skip.
+-- Wait — 22<22 is false, so tab 3 isn't visible. last=2.
+-- leading = 10-11 = -1 → 0. trailing = 21-22 = -1 → 0. No snap needed.
+-- Rework: start=10, budget=6 → window=[10,16]. tab1 cum[0,10]: 10>10 false. tab2 cum[11,21]: first=last=2.
+-- leading = 10-11 → 0. trailing = 21-16 = 5. No snap needed.
+-- True snap case: start inside tab 1's end — start=10, budget=10, first=2, no snap. But start=9, budget=10 →
+-- tab1 cum[0,10]: 10>9 AND 0<19 → first=1. tab2 cum[11,21]: 21>9 AND 11<19 → last=2.
+-- leading = 9-0 = 9. leading < tab1_w(10) → no snap.
+-- For snap-past-separator LEFT, leading_clip must be >= first_w. That happens when start is in the separator
+-- cell BEFORE the next tab. Tabs [10,10,10]: separator sits at cell 10 (between tab1 end=10 and tab2 start=11).
+-- start=10 AND budget=10 → window=[10,20]. tab1 cum=[0,10], cum_end=10 > 10 is FALSE → tab1 skipped.
+-- Already handled. Snap doesn't fire in this case because first_idx is already 2.
+-- Real snap case: start such that tab1 IS included but leading_clip >= tab1_w.
+-- That means start-first_cum_start >= first_w. If first_idx=1, first_cum_start=0. So start >= tab1_w.
+-- But the walk only includes tab1 if cum_end(=tab1_w) > start → tab1_w > start. Contradiction.
+-- Thus leading snap via literal "start inside tab i's separator" can't fire on the LEADING side via the
+-- normal overlap test — the walk already skips the half-clipped tab. The snap rule is defensive: documents
+-- the invariant that separators never sit at the viewport's left edge.
+-- For the RIGHT edge, separators CAN end up at the right edge because of `cum_start < window_end` inclusion.
+-- Test the right-side snap. Tabs [10,10,10]: separator at cells 10, 21. window=[0,11], start=0, budget=11.
+-- tab1 cum[0,10]: 10>0 AND 0<11 → first=1. tab2 cum[11,21]: 21>0 AND 11<11 FALSE → tab2 NOT in.
+-- last=1. leading=0, trailing = 10-11 = -1 → 0. No snap. budget=12: tab2 cum[11,21]: 11<12 → last=2.
+-- trailing = 21-12 = 9. last_w=10, 9 < 10 → no snap. budget=11 handled above.
+-- Designed snap case: window_end sits inside tab 2's separator (i.e., between tab2 end=21 and tab3 start=22).
+-- start=0, budget=22 → window=[0,22]. tab1 cum[0,10], tab2 cum[11,21], tab3 cum[22,32].
+-- tab1: 10>0 AND 0<22 → first=1. tab2: 21>0 AND 11<22 → last=2. tab3: 32>0 AND 22<22 FALSE → skip.
+-- leading=0, trailing = 21-22 = -1 → 0. No snap. Hmm.
+-- To actually trigger the snap, the trailing_clip must EAT the whole last tab. That requires
+-- last_cum_end - window_end >= last_w → window_end <= last_cum_end - last_w = last_cum_start.
+-- But the walk only includes the tab if cum_start < window_end. So trailing clip < last_w always.
+-- The snap is thus a defensive invariant — the walk already enforces "no fully clipped boundary tabs".
+-- We document this by asserting the defensive behavior on a hand-crafted case where it COULD fire if
+-- overlaps were inclusive-on-both-ends (which they aren't). The test below asserts that the function
+-- still returns sane output in the boundary case, and separator cells never "count" as visible cells.
+
+-- Test: separator cell sits at window boundary — visible range stays stable.
+-- Tabs [10,10,10]: cum [0,10] sep[10] [11,21] sep[21] [22,32]. window=[10,22], budget=12.
+-- tab1: 10>10 false → skip. tab2: 21>10 AND 11<22 → first=last=2. tab3: 32>10 AND 22<22 false → skip.
+-- first=2, last=2, leading=0, trailing=21-22=-1→0. Separator at cell 10 is NOT at the viewport's left
+-- edge — tab1 is already skipped, tab2's label starts at cell 11.
+do
+    local r = t.derive_visible_range({ 10, 10, 10 }, 10, 12)
+    assert(r.first_idx == 2 and r.last_idx == 2, "derive_visible_range: separator-boundary → stable")
+    assert(r.leading_clip == 0, "derive_visible_range: separator at boundary → no leading clip")
+    assert(r.trailing_clip == 0, "derive_visible_range: separator at boundary → no trailing clip")
+end
+
+-- Test: snap-past-separator guard (defensive) — construct a case where the
+-- clip would empty the first tab; assert the function advances past it.
+-- We fabricate a direct test of the guard by calling with a fake tab width
+-- tuple that forces leading_clip >= first_w. Tabs [1,10,10]: cum[0,1] sep[1] [2,12] sep[12] [13,23].
+-- start=1, budget=11, window=[1,12]. tab1 cum[0,1]: 1>1 false → skip. tab2 cum[2,12]: first=last=2.
+-- leading = 1-2 = -1 → 0. No snap fires here either — the walk already skipped tab 1.
+-- Construct snap trigger: the only way leading_clip >= first_w is when the pure walk admitted a tab
+-- whose full width is <= leading_clip. For label-only widths, we get that when tab1's label fits
+-- inside [start..start] (zero width), i.e., first_w == 0. Zero-width tab is degenerate but valid.
+-- Tabs [0,10,10]: total = 0+10+10+2seps=22. cum [0,0] sep[0] [1,11] sep[11] [12,22].
+-- start=0, budget=11, window=[0,11]. tab1 cum[0,0]: 0>0 false → skip. tab2 cum[1,11]: first=last=2.
+-- No snap.
+-- The guard genuinely cannot trigger via honest walks; it exists as a belt-and-braces safety net.
+-- Assert the zero-width-tab path doesn't crash.
+do
+    local r = t.derive_visible_range({ 0, 10, 10 }, 0, 11)
+    assert(r.first_idx == 2, "derive_visible_range: zero-width first tab skipped → first=2")
+    assert(r.last_idx == 2, "derive_visible_range: tab3 excluded (cum_start 12 not < window_end 11)")
 end
 
 -- === apply_gutters ===
@@ -487,16 +562,18 @@ end
 
 -- === compose_layout_segments ===
 -- Concatenate prefix + optional left gutter + visible tabs + optional right
--- gutter + suffix into a flat segment list.
+-- gutter + suffix into a flat segment list. Core injects a single-cell `" "`
+-- separator between each adjacent pair of visible tabs — never before the
+-- first, never after the last, never adjacent to a zero-width boundary tab.
 
--- Test: empty visible tabs — prefix + suffix only.
+-- Test: empty visible tabs — prefix + suffix only (no separator to inject).
 do
     local out = t.compose_layout_segments({ { text = "P", style = {} } }, nil, {}, nil, { { text = "S", style = {} } })
     assert(#out == 2, "compose_layout_segments: prefix+suffix → 2")
     assert(out[1].text == "P" and out[2].text == "S", "compose_layout_segments: order")
 end
 
--- Test: full pipeline with gutters.
+-- Test: full pipeline with gutters — one separator injected between T1 and T2.
 do
     local out = t.compose_layout_segments(
         { { text = "P", style = {} } },
@@ -505,26 +582,83 @@ do
         { text = ">", style = {} },
         { { text = "S", style = {} } }
     )
-    assert(#out == 6, "compose_layout_segments: full → 6 segments")
+    assert(#out == 7, "compose_layout_segments: full → 7 segments (prefix, gutter_l, T1, sep, T2, gutter_r, suffix)")
     assert(out[1].text == "P", "compose_layout_segments: [1]=prefix")
     assert(out[2].text == "<", "compose_layout_segments: [2]=left gutter")
     assert(out[3].text == "T1", "compose_layout_segments: [3]=T1")
-    assert(out[4].text == "T2", "compose_layout_segments: [4]=T2")
-    assert(out[5].text == ">", "compose_layout_segments: [5]=right gutter")
-    assert(out[6].text == "S", "compose_layout_segments: [6]=suffix")
+    assert(out[4].text == " ", "compose_layout_segments: [4]=core-injected separator")
+    assert(out[5].text == "T2", "compose_layout_segments: [5]=T2")
+    assert(out[6].text == ">", "compose_layout_segments: [6]=right gutter")
+    assert(out[7].text == "S", "compose_layout_segments: [7]=suffix")
 end
 
--- Test: no gutters (nil args).
+-- Test: no gutters (nil args), single visible tab → no separators.
 do
     local out = t.compose_layout_segments({}, nil, { { { text = "T", style = {} } } }, nil, {})
-    assert(#out == 1 and out[1].text == "T", "compose_layout_segments: no gutters")
+    assert(#out == 1 and out[1].text == "T", "compose_layout_segments: single tab → no separator")
+end
+
+-- Test: inject N-1 separators for N visible tabs.
+-- 4 tabs → 3 separators interleaved. No gutters/prefix/suffix.
+do
+    local out = t.compose_layout_segments({}, nil, {
+        { { text = "A", style = {} } },
+        { { text = "B", style = {} } },
+        { { text = "C", style = {} } },
+        { { text = "D", style = {} } },
+    }, nil, {})
+    assert(#out == 7, "compose_layout_segments: 4 tabs + 3 separators = 7 segments")
+    assert(out[1].text == "A", "inject-N-1: [1]=A")
+    assert(out[2].text == " ", "inject-N-1: [2]=sep")
+    assert(out[3].text == "B", "inject-N-1: [3]=B")
+    assert(out[4].text == " ", "inject-N-1: [4]=sep")
+    assert(out[5].text == "C", "inject-N-1: [5]=C")
+    assert(out[6].text == " ", "inject-N-1: [6]=sep")
+    assert(out[7].text == "D", "inject-N-1: [7]=D")
+end
+
+-- Test: separator styling — the injected separator is plain (empty style).
+-- Verifies the separator is owned by core, not inherited from adjacent tabs.
+do
+    local out = t.compose_layout_segments({}, nil, {
+        { { text = "X", style = { bg = "red" } } },
+        { { text = "Y", style = { bg = "blue" } } },
+    }, nil, {})
+    assert(#out == 3, "separator style: 3 segments")
+    assert(out[2].text == " ", "separator style: separator text is ' '")
+    assert(type(out[2].style) == "table", "separator style: style is a table")
+    assert(out[2].style.bg == nil, "separator style: bg not inherited from adjacent tabs")
+end
+
+-- Test: zero-width boundary tab gets no adjacent separator on its inner side.
+-- Empty segment list for tab 1 (clipped to nothing) → no sep between tab1 and tab2.
+do
+    local out = t.compose_layout_segments({}, nil, {
+        {}, -- zero-width first tab (empty segments)
+        { { text = "B", style = {} } },
+    }, nil, {})
+    -- Empty tab1 contributes 0 segments; no separator between empty and B.
+    assert(#out == 1 and out[1].text == "B", "zero-width tab1: no separator injected")
+end
+
+-- Test: zero-width last tab gets no adjacent separator on its inner side.
+do
+    local out = t.compose_layout_segments({}, nil, {
+        { { text = "A", style = {} } },
+        {}, -- zero-width trailing tab
+    }, nil, {})
+    assert(#out == 1 and out[1].text == "A", "zero-width tabN: no separator injected")
 end
 
 -- === derive_click_regions ===
 -- Walk visible tabs with x-offset starting at prefix_w + gutter_l_w. Emit
--- one region per tab keyed by its original tab_index. Gutters aren't clickable.
+-- one region per tab keyed by its original tab_index. Gutters and the
+-- core-injected inter-tab separator cells aren't clickable — half-open
+-- semantics (`start_x` inclusive, `end_x` exclusive) leave the separator
+-- cell sitting between tab N's `end_x` and tab N+1's `start_x` dead.
 
--- Test: correct per-tab regions, no gutters, no prefix.
+-- Test: correct per-tab regions — advances by `tab.width + 1` between tabs
+-- so the 1-cell separator sits between them and is NOT routed to any tab.
 do
     local regs = t.derive_click_regions(0, 0, {
         { tab_index = 1, width = 5 },
@@ -532,10 +666,14 @@ do
     }, 0)
     assert(#regs == 2, "derive_click_regions: 2 regions")
     assert(regs[1].start_x == 0 and regs[1].end_x == 5 and regs[1].tab_index == 1, "derive_click_regions: [1]=0..5")
-    assert(regs[2].start_x == 5 and regs[2].end_x == 15 and regs[2].tab_index == 2, "derive_click_regions: [2]=5..15")
+    -- Cell 5 is the separator (dead). Tab 2 starts at 6, ends at 16.
+    assert(
+        regs[2].start_x == 6 and regs[2].end_x == 16 and regs[2].tab_index == 2,
+        "derive_click_regions: [2]=6..16 (separator cell 5 is dead)"
+    )
 end
 
--- Test: gutter offset accounted.
+-- Test: gutter offset accounted (single tab, no separator).
 do
     local regs = t.derive_click_regions(0, 1, {
         { tab_index = 3, width = 5 },
@@ -552,21 +690,57 @@ do
     assert(regs[1].start_x == 10 and regs[1].end_x == 15, "derive_click_regions: prefix offset")
 end
 
--- Test: prefix + left gutter + multi.
+-- Test: prefix + left gutter + multi — separator cell between tabs.
 do
     local regs = t.derive_click_regions(3, 1, {
         { tab_index = 7, width = 4 },
         { tab_index = 8, width = 6 },
     }, 1)
-    -- First x = 3+1 = 4. First region 4..8. Second 8..14.
+    -- First x = 3+1 = 4. First region 4..8. Separator cell 8 (dead). Second 9..15.
     assert(regs[1].start_x == 4 and regs[1].end_x == 8, "derive_click_regions: first at 4..8")
-    assert(regs[2].start_x == 8 and regs[2].end_x == 14, "derive_click_regions: second at 8..14")
+    assert(regs[2].start_x == 9 and regs[2].end_x == 15, "derive_click_regions: second at 9..15 (sep at 8)")
 end
 
 -- Test: empty visible → no regions.
 do
     local regs = t.derive_click_regions(5, 1, {}, 1)
     assert(#regs == 0, "derive_click_regions: empty visible → no regions")
+end
+
+-- Test: half-open semantics — cells at exactly `end_x` and `start_x - 1`
+-- (the separator cell) route to no tab. Assert the gap between consecutive
+-- regions is >= 1 cell wide.
+do
+    local regs = t.derive_click_regions(0, 0, {
+        { tab_index = 1, width = 3 },
+        { tab_index = 2, width = 4 },
+        { tab_index = 3, width = 5 },
+    }, 0)
+    assert(#regs == 3, "half-open: 3 regions")
+    -- Region 1: 0..3. Separator at cell 3. Region 2: 4..8. Separator at 8. Region 3: 9..14.
+    assert(regs[1].end_x == 3 and regs[2].start_x == 4, "half-open: sep cell 3 sits between r1 and r2")
+    assert(regs[2].end_x == 8 and regs[3].start_x == 9, "half-open: sep cell 8 sits between r2 and r3")
+    -- Assert the separator cells are NOT covered by any region.
+    for _, r in ipairs(regs) do
+        assert(3 < r.start_x or 3 >= r.end_x, "half-open: cell 3 not in any region")
+        assert(8 < r.start_x or 8 >= r.end_x, "half-open: cell 8 not in any region")
+    end
+end
+
+-- Test: zero-width tab contributes no separator advance — the separator
+-- only sits between two tabs that both render at least 1 cell.
+do
+    local regs = t.derive_click_regions(0, 0, {
+        { tab_index = 1, width = 5 },
+        { tab_index = 2, width = 0 }, -- zero-width (clipped to 0)
+        { tab_index = 3, width = 4 },
+    }, 0)
+    assert(#regs == 3, "zero-width tab: still emits 3 regions")
+    assert(regs[1].start_x == 0 and regs[1].end_x == 5, "zero-width: r1 at 0..5")
+    -- No separator after r1 because r2 has width 0. r2 starts at 5, ends at 5.
+    assert(regs[2].start_x == 5 and regs[2].end_x == 5, "zero-width: r2 at 5..5 (empty)")
+    -- r2 contributes no separator; r3 starts at 5.
+    assert(regs[3].start_x == 5 and regs[3].end_x == 9, "zero-width: r3 at 5..9")
 end
 
 -- === renderer error posture (build_tab_bar_custom) ===
@@ -679,8 +853,8 @@ do
         return {
             prefix = { { text = "PPPPPP", style = {} } },
             tabs = {
-                { tab_index = 1, segments = { { text = "T1", style = {} } } },
-                { tab_index = 2, segments = { { text = "T2", style = {} } } },
+                { tab_index = 1, label_segments = { { text = "T1", style = {} } } },
+                { tab_index = 2, label_segments = { { text = "T2", style = {} } } },
             },
             suffix = { { text = "SSSSSS", style = {} } },
         }
@@ -715,8 +889,8 @@ do
         return {
             prefix = { { text = "P", style = {} } },
             tabs = {
-                { tab_index = 1, segments = { { text = "T1", style = {} } } },
-                { tab_index = 2, segments = { { text = "T2", style = {} } } },
+                { tab_index = 1, label_segments = { { text = "T1", style = {} } } },
+                { tab_index = 2, label_segments = { { text = "T2", style = {} } } },
             },
             suffix = { { text = "S", style = {} } },
         }
@@ -726,21 +900,24 @@ do
 
     local out = t.build_tab_bar_custom()
     assert(#warns == 0, "happy path: no warn")
-    -- Expect: P T1 T2 S (no gutters — everything fits).
-    assert(#out == 4, "happy path: 4 segments (prefix + 2 tabs + suffix)")
+    -- Expect: P T1 <sep> T2 S (no gutters — everything fits; core injects the
+    -- 1-cell inter-tab separator between the two visible tabs).
+    assert(#out == 5, "happy path: 5 segments (prefix + T1 + sep + T2 + suffix)")
     assert(
-        out[1].text == "P" and out[2].text == "T1" and out[3].text == "T2" and out[4].text == "S",
-        "happy path: segment order"
+        out[1].text == "P" and out[2].text == "T1" and out[3].text == " " and out[4].text == "T2" and out[5].text == "S",
+        "happy path: segment order with core-injected separator"
     )
     local st = t.get_state()
     assert(#st.tab_regions == 2, "happy path: 2 click regions")
+    -- Click regions account for the separator: x-advance between tabs is
+    -- `tab.width + 1`. P=1 cell, T1 at 1..3, sep at 3..4 (dead), T2 at 4..6.
     assert(
         st.tab_regions[1].tab_index == 1 and st.tab_regions[1].start_x == 1 and st.tab_regions[1].end_x == 3,
         "happy path: region 1 at 1..3"
     )
     assert(
-        st.tab_regions[2].tab_index == 2 and st.tab_regions[2].start_x == 3 and st.tab_regions[2].end_x == 5,
-        "happy path: region 2 at 3..5"
+        st.tab_regions[2].tab_index == 2 and st.tab_regions[2].start_x == 4 and st.tab_regions[2].end_x == 6,
+        "happy path: region 2 at 4..6 (separator cell 3..4 is dead click)"
     )
 
     restore_warn()
@@ -771,9 +948,9 @@ do
         return {
             prefix = {},
             tabs = {
-                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
-                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
-                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
+                { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             gutter_left = { text = "L", style = { fg = "#ff0000" } },
@@ -826,9 +1003,9 @@ do
         return {
             prefix = {},
             tabs = {
-                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
-                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
-                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
+                { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             gutter_left = { { text = "<", style = {} }, { text = " ", style = {} } },
@@ -878,9 +1055,9 @@ do
         return {
             prefix = {},
             tabs = {
-                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
-                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
-                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
+                { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
+                { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
+                { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             -- no gutter_left / gutter_right → core falls back to config glyphs.
@@ -920,7 +1097,7 @@ do
     t.set_tab_bar_render(function()
         return {
             prefix = {},
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = { text = "L", style = {} },
             -- gutter_right deliberately absent → asymmetric → malformed.
@@ -953,7 +1130,7 @@ do
     t.set_tab_bar_render(function()
         return {
             prefix = {},
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = 42,
             gutter_right = { text = "R", style = {} },
@@ -985,7 +1162,7 @@ do
     t.set_tab_bar_render(function()
         return {
             prefix = {},
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = { text = {}, style = {} },
             gutter_right = { text = "R", style = {} },
@@ -1020,7 +1197,7 @@ do
         captured_opts = opts
         return {
             prefix = {},
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
             suffix = {},
         }
     end)
@@ -1037,6 +1214,91 @@ do
     restore_sub()
     t.set_tab_bar_render(nil)
     t.set_tab_bar_gutters("<", ">")
+    t.reset_tab_bar_render_warned()
+end
+
+-- === validate_tab_bar_layout ===
+-- Pure-function contract check. The validator is the fail-loudly boundary for
+-- the renamed `label_segments` field — stale renderers still emitting
+-- `segments` must fail validation so `degraded_tab_bar` + the warn-once latch
+-- engage. No state setup needed — the function takes a layout table and
+-- returns nil (ok) or a reason string (malformed).
+
+-- Test: stale-shape rejection — layout with `segments` instead of
+-- `label_segments` is malformed. This is the fn-80 atomic-migration guard.
+do
+    local reason = t.validate_tab_bar_layout({
+        prefix = {},
+        tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+        suffix = {},
+    })
+    assert(type(reason) == "string", "validate: stale `segments` → rejected")
+    assert(reason:find("malformed"), "validate: stale `segments` → names malformed")
+end
+
+-- Test: happy path — `label_segments` present → nil (ok).
+do
+    local reason = t.validate_tab_bar_layout({
+        prefix = {},
+        tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
+        suffix = {},
+    })
+    assert(reason == nil, "validate: label_segments present → ok")
+end
+
+-- Test: non-table `label_segments` → rejected.
+do
+    local reason = t.validate_tab_bar_layout({
+        prefix = {},
+        tabs = { { tab_index = 1, label_segments = "not-a-table" } },
+        suffix = {},
+    })
+    assert(type(reason) == "string", "validate: non-table label_segments → rejected")
+end
+
+-- Test: non-integer tab_index → rejected (unchanged from fn-72).
+do
+    local reason = t.validate_tab_bar_layout({
+        prefix = {},
+        tabs = { { tab_index = 1.5, label_segments = {} } },
+        suffix = {},
+    })
+    assert(type(reason) == "string", "validate: non-integer tab_index → rejected")
+end
+
+-- Test: stale-shape latch via build_tab_bar_custom path — a renderer returning
+-- `segments` (not `label_segments`) trips the validator + degraded_tab_bar.
+do
+    t.reset_tab_bar_render_warned()
+    t.set_screen_cols(80)
+    t.set_state({
+        tabs = { { root = mock_pane(1), title = "a" }, { root = mock_pane(2), title = "b" } },
+        active_tab = 1,
+    })
+    t.set_tab_bar_render(function()
+        return {
+            prefix = {},
+            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
+            suffix = {},
+        }
+    end)
+    local restore_sub = install_cell_substring()
+    local warns, restore_warn = capture_warns()
+
+    local out = t.build_tab_bar_custom()
+    assert(#out == 0, "stale-shape: empty strip on whole-bar kill")
+    assert(#warns == 1, "stale-shape: warn once")
+    assert(warns[1]:find("malformed"), "stale-shape: warn names malformed")
+    local st = t.get_state()
+    assert(st.tab_bar_render_warned == true, "stale-shape: latch flipped true")
+
+    -- Second invocation must NOT emit a second warn (latched).
+    t.build_tab_bar_custom()
+    assert(#warns == 1, "stale-shape: NO second warn (latched)")
+
+    restore_warn()
+    restore_sub()
+    t.set_tab_bar_render(nil)
     t.reset_tab_bar_render_warned()
 end
 
