@@ -417,6 +417,7 @@ local config = {
         width = "60%",
         height = "70%",
     },
+    overlays = {},
     leader = "<D-k>",
     keybinds = {
         ["<D-p>"] = "command_palette",
@@ -552,6 +553,10 @@ local state = {
         pending = false,
         resize_mode = false,
     },
+    -- Overlay system state: per-overlay size (cells + pct tracking), active overlay, resize mode
+    overlay_state = {},
+    active_overlay_name = nil,
+    overlay_resize_mode = false,
     -- Layout picker state
     layout_picker = {
         visible = false,
