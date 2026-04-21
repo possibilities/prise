@@ -811,6 +811,7 @@ test {
     _ = @import("client.zig");
     _ = @import("redraw.zig");
     _ = @import("Surface.zig");
+    _ = @import("ui.zig");
     _ = @import("widget.zig");
     _ = @import("TextInput.zig");
     _ = @import("tui_test.zig");

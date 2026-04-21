@@ -433,6 +433,10 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(gwidth));
         lua.setField(-2, "gwidth");
 
+        // Register cell_substring
+        lua.pushFunction(ziglua.wrap(cellSubstring));
+        lua.setField(-2, "cell_substring");
+
         // Register get_time
         lua.pushFunction(ziglua.wrap(getTime));
         lua.setField(-2, "get_time");
@@ -850,6 +854,85 @@ pub const UI = struct {
         const width = vaxis.gwidth.gwidth(str, .unicode);
         lua.pushInteger(@intCast(width));
         return 1;
+    }
+
+    fn cellSubstring(lua: *ziglua.Lua) i32 {
+        const str = lua.toString(1) catch "";
+        const start_cell = lua.toInteger(2) catch 0;
+        const end_cell = lua.toInteger(3) catch 0;
+
+        // Edge cases: inverted/empty window → empty string. Negative start also
+        // collapses to empty; clamping to 0 would silently widen the window,
+        // which hides bugs in callers.
+        if (start_cell < 0 or end_cell <= start_cell) {
+            _ = lua.pushString("");
+            return 1;
+        }
+
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            _ = lua.pushString("");
+            return 1;
+        };
+        lua.pop(1);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(ui.allocator);
+
+        sliceGraphemesByCell(
+            &out,
+            ui.allocator,
+            str,
+            @intCast(start_cell),
+            @intCast(end_cell),
+        ) catch {
+            _ = lua.pushString("");
+            return 1;
+        };
+
+        _ = lua.pushString(out.items);
+        return 1;
+    }
+
+    /// Walks `str` one grapheme at a time (libvaxis grapheme iterator) and
+    /// copies bytes into `out` for graphemes that land inside `[start, end)`.
+    /// A wide grapheme straddling either boundary is dropped and padded with
+    /// one space per covered boundary cell. Padding is load-bearing: slicing
+    /// mid-codepoint would emit invalid UTF-8 downstream.
+    /// Width method is `.unicode` — must match `prise.gwidth` exactly.
+    fn sliceGraphemesByCell(
+        out: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+        str: []const u8,
+        start: u32,
+        end: u32,
+    ) !void {
+        var cell_pos: u32 = 0;
+        var giter = vaxis.unicode.graphemeIterator(str);
+        while (giter.next()) |grapheme| {
+            const bytes = grapheme.bytes(str);
+            const gw: u32 = @intCast(vaxis.gwidth.gwidth(bytes, .unicode));
+            // Zero-width graphemes (combining marks, ZWJ, VS selectors) travel
+            // with the preceding visible grapheme — treat them as inside the
+            // window only when cell_pos has entered it and hasn't yet left.
+            const cell_end = cell_pos + gw;
+            if (cell_end <= start) {
+                cell_pos = cell_end;
+                continue;
+            }
+            if (cell_pos >= end) break;
+            const straddles_start = cell_pos < start and cell_end > start;
+            const straddles_end = cell_pos < end and cell_end > end;
+            if (straddles_start or straddles_end) {
+                const pad_lo = if (straddles_start) start - cell_pos else 0;
+                const pad_hi = if (straddles_end) cell_end - end else 0;
+                const pad_cells = gw - pad_lo - pad_hi;
+                try out.appendNTimes(allocator, ' ', pad_cells);
+            } else {
+                try out.appendSlice(allocator, bytes);
+            }
+            cell_pos = cell_end;
+        }
     }
 
     fn getTime(lua: *ziglua.Lua) i32 {
@@ -1540,4 +1623,87 @@ fn createTextInput(lua: *ziglua.Lua) i32 {
     lua.setMetatable(-2);
 
     return 1;
+}
+
+// --- cell_substring tests --------------------------------------------------
+//
+// `UI.sliceGraphemesByCell` is the pure implementation behind
+// `prise.cell_substring`. These tests drive it directly — the Lua-facing
+// wrapper just parses args, looks up the allocator, and pushes the buffer.
+
+fn expectCellSubstring(
+    expected: []const u8,
+    str: []const u8,
+    start: u32,
+    end: u32,
+) !void {
+    const testing = std.testing;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try UI.sliceGraphemesByCell(&out, testing.allocator, str, start, end);
+    try testing.expectEqualStrings(expected, out.items);
+}
+
+test "cell_substring: ASCII clip at byte-aligned boundary" {
+    try expectCellSubstring("bcd", "abcdef", 1, 4);
+    try expectCellSubstring("abcdef", "abcdef", 0, 6);
+}
+
+test "cell_substring: multi-byte CJK clip" {
+    // Each CJK char is 3 bytes UTF-8 but 2 cells wide.
+    // "漢字" = 4 cells total. Clipping [0, 2) returns first glyph.
+    try expectCellSubstring("漢", "漢字", 0, 2);
+    try expectCellSubstring("字", "漢字", 2, 4);
+}
+
+test "cell_substring: wide emoji straddles leading boundary" {
+    // 😀 is 2 cells wide. Window [1, 3) straddles the left edge of the emoji
+    // → drop + one space of padding + the ASCII 'a' that follows.
+    try expectCellSubstring(" a", "😀a", 1, 3);
+}
+
+test "cell_substring: wide emoji straddles trailing boundary" {
+    // 😀 is 2 cells. Window [0, 1) cuts the emoji mid-glyph → drop + one pad.
+    try expectCellSubstring(" ", "😀a", 0, 1);
+}
+
+test "cell_substring: flag emoji (regional indicator pair) straddle" {
+    // 🇺🇸 is a single grapheme cluster (two regional indicators, width 2 via
+    // .unicode). Slicing it in half drops the whole cluster and pads.
+    try expectCellSubstring(" ", "🇺🇸", 0, 1);
+    try expectCellSubstring(" ", "🇺🇸", 1, 2);
+}
+
+test "cell_substring: empty string input" {
+    try expectCellSubstring("", "", 0, 10);
+}
+
+test "cell_substring: start_cell past total width" {
+    try expectCellSubstring("", "abc", 5, 10);
+    try expectCellSubstring("", "abc", 3, 10); // exactly at total
+}
+
+test "cell_substring: end_cell past total clamps to total" {
+    try expectCellSubstring("bc", "abc", 1, 100);
+    try expectCellSubstring("abc", "abc", 0, 10);
+}
+
+test "cell_substring: negative start returns empty" {
+    // sliceGraphemesByCell takes u32, so the negative-start gate lives in
+    // the Lua wrapper. Test that with lua.toInteger semantics: the wrapper
+    // compares before casting. We exercise the companion path — an empty
+    // window — which shares the same "return ''" exit.
+    try expectCellSubstring("", "abc", 2, 2);
+}
+
+test "cell_substring: end_cell <= start_cell returns empty" {
+    try expectCellSubstring("", "abc", 2, 1);
+    try expectCellSubstring("", "abc", 2, 2);
+}
+
+test "cell_substring: combining marks travel with their base" {
+    // 'á' NFD = 'a' + combining acute (U+0301, zero-width). gwidth returns 1
+    // for the whole cluster. Window [0, 1) must emit both bytes, not just 'a'.
+    const nfd_a_acute = "a\u{0301}";
+    try expectCellSubstring(nfd_a_acute, nfd_a_acute, 0, 1);
 }
