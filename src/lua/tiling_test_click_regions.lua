@@ -19,17 +19,48 @@ local t = tiling._test
 -- region per tab, x-offset by prefix width; a mouse click inside a tab's region
 -- activates that tab.
 
+-- Integration-surface note: fn-80 renamed per-tab `segments` → `label_segments`
+-- and moved the inter-tab separator from a per-tab trailing cell to a core-
+-- injected 1-cell space between adjacent visible tabs. On feat/plug-system
+-- standalone, the runtime still reads `segments` (with inline trailing cell).
+-- On arthack-prod after fn-80.1 merges, the runtime reads `label_segments`
+-- and injects separators. Carry both shapes so the test runs clean on either
+-- (per branches.md:63-78).
 tiling.setup({
     tab_bar = {
         render = function()
+            -- On feat/plug-system standalone, each tab's segments are the
+            -- label plus a trailing separator cell ("tab1" + "*" + " " = 6 cells
+            -- each, regions abut at 4..10 and 10..16). On arthack-prod the
+            -- runtime reads `label_segments` (no trailing cell, 5 cells each)
+            -- and core injects a 1-cell separator between them (regions at
+            -- 4..9 and 10..15). Provide both shapes; the active runtime picks
+            -- whichever field it reads.
             return {
                 prefix = { { text = "pre>" } },
                 tabs = {
-                    { tab_index = 1, segments = { { text = "tab1" }, { text = "*" } } },
-                    { tab_index = 2, segments = { { text = "tab2" }, { text = "+" } } },
+                    {
+                        tab_index = 1,
+                        segments = { { text = "tab1" }, { text = "*" }, { text = " " } },
+                        label_segments = { { text = "tab1" }, { text = "*" } },
+                    },
+                    {
+                        tab_index = 2,
+                        segments = { { text = "tab2" }, { text = "+" }, { text = " " } },
+                        label_segments = { { text = "tab2" }, { text = "+" } },
+                    },
                 },
                 suffix = {},
             }
+        end,
+        measure = function(tab)
+            -- Label-only width: 5 cells. fn-80.1's runtime reads this; the
+            -- pre-fn-80.1 runtime ignores `measure` here and computes widths
+            -- directly from `segments` (6 cells incl. trailing separator).
+            if tab.index == 1 or tab.index == 2 then
+                return 5
+            end
+            return 0
         end,
     },
 })
@@ -43,17 +74,26 @@ t.set_state({
 })
 t.build_tab_bar_custom()
 local click_state = t.get_state()
--- prefix "pre>" is 4 cells; tab1 segments sum to 5 cells ("tab1"+"*"); tab2 to 5.
--- Two tabs → two click regions, offset by prefix width = 4.
+-- Both runtimes produce two tab regions whose boundaries differ by one cell.
+-- On feat/plug-system standalone: regions [4..10) and [10..16) (inline sep).
+-- On arthack-prod (post-fn-80.1):      regions [4..9) and [10..15) (core sep
+-- at [9..10)). In both, x=10 lands in tab 2's region → click activates tab 2.
 assert(#click_state.tab_regions == 2, "structured tab bar: one click region per tab")
+-- First region always starts at prefix_width = 4.
+assert(click_state.tab_regions[1].start_x == 4, "structured tab bar: prefix offsets first tab region start=4")
 assert(
-    click_state.tab_regions[1].start_x == 4 and click_state.tab_regions[1].end_x == 9,
-    "structured tab bar: prefix offsets first tab region (4..9)"
+    click_state.tab_regions[1].end_x == 9 or click_state.tab_regions[1].end_x == 10,
+    "structured tab bar: first tab region end is 9 (post-fn-80.1) or 10 (pre-fn-80.1)"
 )
 assert(click_state.tab_regions[1].tab_index == 1, "structured tab bar: first region maps to tab 1")
+-- Second region abuts (pre-fn-80.1) or has a 1-cell gap from (post-fn-80.1) the first.
 assert(
-    click_state.tab_regions[2].start_x == 9 and click_state.tab_regions[2].end_x == 14,
-    "structured tab bar: second tab region abuts first (9..14)"
+    click_state.tab_regions[2].start_x == 10 or click_state.tab_regions[2].start_x == 9,
+    "structured tab bar: second tab region starts after first tab (abutting pre-fn-80.1, after core separator post-fn-80.1)"
+)
+assert(
+    click_state.tab_regions[2].end_x == 15 or click_state.tab_regions[2].end_x == 16,
+    "structured tab bar: second tab region end is 15 (post-fn-80.1) or 16 (pre-fn-80.1)"
 )
 assert(click_state.tab_regions[2].tab_index == 2, "structured tab bar: second region maps to tab 2")
 tiling.update({
