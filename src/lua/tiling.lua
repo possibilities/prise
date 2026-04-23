@@ -2424,6 +2424,37 @@ action_handlers = {
             swap_tabs(state.active_tab, state.active_tab + 1)
         end
     end,
+    swap_tab_left_wrap = function()
+        if #state.tabs < 2 then
+            return
+        end
+        if state.active_tab > 1 then
+            swap_tabs(state.active_tab, state.active_tab - 1)
+        else
+            -- Rotate: active tab walks off the left, reappears at the right.
+            -- Relative order of the non-active tabs is preserved.
+            local tab = table.remove(state.tabs, 1)
+            table.insert(state.tabs, tab)
+            state.active_tab = #state.tabs
+            prise.request_frame()
+            prise.save()
+        end
+    end,
+    swap_tab_right_wrap = function()
+        if #state.tabs < 2 then
+            return
+        end
+        if state.active_tab < #state.tabs then
+            swap_tabs(state.active_tab, state.active_tab + 1)
+        else
+            -- Rotate: active tab walks off the right, reappears at the left.
+            local tab = table.remove(state.tabs)
+            table.insert(state.tabs, 1, tab)
+            state.active_tab = 1
+            prise.request_frame()
+            prise.save()
+        end
+    end,
     tab_1 = function()
         set_active_tab_index(1)
     end,
@@ -4485,6 +4516,7 @@ M._test = {
     close_tab = close_tab,
     remove_pane_by_id = remove_pane_by_id,
     set_active_tab_index = set_active_tab_index,
+    action_handlers = action_handlers,
     set_state = function(test_state)
         state.tabs = test_state.tabs or {}
         state.active_tab = test_state.active_tab or 1
