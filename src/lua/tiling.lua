@@ -3308,10 +3308,19 @@ function M.update(event)
         --   bad_args                           — missing/ill-typed pty_id,
         --                                         session_name, or cwd
         --   absent_from_viewer                 — pane not in state.tabs
-        --                                         (viewer isn't attached
-        --                                         to the source session
-        --                                         and no cross-session
-        --                                         primitive was routed)
+        --                                         and no source_session
+        --                                         was provided for the
+        --                                         cross-session JSON-only
+        --                                         path
+        --   cross_session_remove_failed        — viewer-off-source JSON
+        --                                         remove failed before
+        --                                         any place; no state
+        --                                         was mutated
+        --   cross_session_place_failed         — viewer-off-source JSON
+        --                                         place failed after a
+        --                                         successful remove; the
+        --                                         pty is orphaned (no
+        --                                         source tab, no dest)
         --   source_solo_destination_unreachable— single-pane source that
         --                                         couldn't land on the
         --                                         destination; source
@@ -3357,6 +3366,61 @@ function M.update(event)
 
         local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
         if not src_tab or not src_tab_idx then
+            -- Cross-session move: the pane lives in another session's
+            -- saved JSON that our viewer never loads. When the caller
+            -- hands us the source session name explicitly, handle
+            -- remove + place. Remove is always file-based (viewer is
+            -- not on source by this branch's precondition). For the
+            -- place half, split by viewer location: if the viewer is
+            -- already on the destination session, mutate state.tabs
+            -- in-memory to sidestep the autosave race; otherwise use
+            -- the file-based path.
+            local source_session = event.data.source_session
+            if type(source_session) == "string" and source_session ~= "" then
+                local removed = prise.remove_pty_from_session(source_session, pty_id)
+                if not removed then
+                    prise.log.warn(
+                        "move_pane_to_session: cross-session remove failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                    )
+                    return { ok = false, reason = "cross_session_remove_failed" }
+                end
+                local current = prise.get_session_name()
+                if current == session_name then
+                    -- Viewer is on the destination session: append as a
+                    -- new in-memory tab so the pending autosave serializes
+                    -- authoritative state (no file-write race).
+                    local tab_id = state.next_tab_id
+                    state.next_tab_id = tab_id + 1
+                    ---@type Tab
+                    local new_tab = {
+                        id = tab_id,
+                        root = { type = "pane", pty_id = pty_id, cwd = cwd },
+                        title = tab_title,
+                        last_focused_id = pty_id,
+                    }
+                    table.insert(state.tabs, new_tab)
+                    prise.save()
+                    prise.request_frame()
+                    return { ok = true, reason = "moved" }
+                else
+                    -- Viewer is on an unrelated session: file-based place.
+                    local placed = prise.place_pty_in_session(session_name, pty_id, cwd, tab_title)
+                    if not placed then
+                        prise.log.warn(
+                            "move_pane_to_session: cross-session place failed for pty="
+                                .. tostring(pty_id)
+                                .. " session="
+                                .. session_name
+                                .. " (orphaned after remove)"
+                        )
+                        return { ok = false, reason = "cross_session_place_failed" }
+                    end
+                    return { ok = true, reason = "moved" }
+                end
+            end
             return { ok = false, reason = "absent_from_viewer" }
         end
         -- find_tab_for_pane also resolves floating/overlay panes; require
@@ -3372,9 +3436,7 @@ function M.update(event)
         -- tmux/wezterm/zellij pattern: post-move cleanup, not pre-move
         -- refusal. Track the case so we can emit a structured reason if
         -- the destination place fails and we have to restore intent.
-        local source_was_solo_only = (
-            is_pane(src_tab.root) and src_tab.root.id == pty_id and #state.tabs == 1
-        )
+        local source_was_solo_only = (is_pane(src_tab.root) and src_tab.root.id == pty_id and #state.tabs == 1)
         local source_session_for_close = source_was_solo_only and prise.get_session_name() or nil
 
         local was_active = (src_tab_idx == state.active_tab)
@@ -3496,8 +3558,7 @@ function M.update(event)
             local closed = prise.close_session(source_session_for_close)
             if not closed then
                 prise.log.warn(
-                    "move_pane_to_session: close_session failed for session="
-                        .. tostring(source_session_for_close)
+                    "move_pane_to_session: close_session failed for session=" .. tostring(source_session_for_close)
                 )
             end
         end
