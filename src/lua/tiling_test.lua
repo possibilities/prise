@@ -294,20 +294,19 @@ assert(
 
 -- === pty_spawned with missing session ===
 
--- Test: pty_spawned with session that doesn't exist creates fresh session
+-- Test: pty_spawned with session that doesn't exist calls prise.create_session
+-- and bails early. Earlier behaviour rewrote the current session in place
+-- (save + rename_session + clear tabs); the rewritten handler hands off to
+-- prise.create_session and returns without touching state. Assert the new
+-- contract.
 local mock_prise = package.loaded["prise"]
-local switch_result = false
-local saved = false
-local renamed_to = nil
+local created_with = nil
 ---@diagnostic disable: duplicate-set-field
 mock_prise.switch_session = function()
-    return switch_result
+    return false
 end
-mock_prise.save = function()
-    saved = true
-end
-mock_prise.rename_session = function(_, new)
-    renamed_to = new
+mock_prise.create_session = function(name)
+    created_with = name
 end
 mock_prise.get_session_name = function()
     return "default"
@@ -318,22 +317,20 @@ state_upvalue.tabs = { { id = 1, root = mock_pane(1), title = "old", last_focuse
 state_upvalue.active_tab = 1
 state_upvalue.pending_new_tab = false
 state_upvalue.pending_title_renames = {}
-saved = false
-renamed_to = nil
+created_with = nil
 
 tiling.update({ type = "pty_spawned", data = { id = 30, session = "newsession", tab = "<new>" } })
-assert(saved == true, "pty_spawned: missing session triggers save")
-assert(renamed_to == "newsession", "pty_spawned: missing session renames to target")
-assert(#state_upvalue.tabs == 0, "pty_spawned: missing session clears tabs")
-assert(state_upvalue.focused_id == nil, "pty_spawned: missing session clears focused_id")
+assert(
+    created_with == "newsession",
+    "pty_spawned: missing session calls prise.create_session with target name, got " .. tostring(created_with)
+)
 
 -- Restore mock defaults
 ---@diagnostic disable: duplicate-set-field
 mock_prise.switch_session = function()
     return true
 end
-mock_prise.save = function() end
-mock_prise.rename_session = function() end
+mock_prise.create_session = function() end
 mock_prise.get_session_name = function()
     return "test"
 end
