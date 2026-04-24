@@ -967,8 +967,10 @@ local remove_fail_ret = tiling.update({
 })
 assert(type(remove_fail_ret) == "table", "remove-fail: returns a table (widened)")
 assert(remove_fail_ret.ok == false, "remove-fail: ok=false when remove fails")
-assert(remove_fail_ret.reason == "cross_session_remove_failed",
-    "remove-fail: reason=cross_session_remove_failed, got " .. tostring(remove_fail_ret.reason))
+assert(
+    remove_fail_ret.reason == "cross_session_remove_failed",
+    "remove-fail: reason=cross_session_remove_failed, got " .. tostring(remove_fail_ret.reason)
+)
 assert(#remove_calls == 1, "remove-fail: remove was attempted")
 assert(#place_calls == 0, "remove-fail: place NOT called after remove failure")
 assert(#warn_calls == 1, "remove-fail: one warning logged")
@@ -1000,8 +1002,10 @@ local place_fail_ret = tiling.update({
 })
 assert(type(place_fail_ret) == "table", "place-fail: returns a table (widened)")
 assert(place_fail_ret.ok == false, "place-fail: ok=false when place fails after remove")
-assert(place_fail_ret.reason == "cross_session_place_failed",
-    "place-fail: reason=cross_session_place_failed, got " .. tostring(place_fail_ret.reason))
+assert(
+    place_fail_ret.reason == "cross_session_place_failed",
+    "place-fail: reason=cross_session_place_failed, got " .. tostring(place_fail_ret.reason)
+)
 assert(#remove_calls == 1, "place-fail: remove was called")
 assert(#place_calls == 1, "place-fail: place was attempted after remove success")
 assert(#warn_calls == 1, "place-fail: one warning logged")
@@ -1031,8 +1035,10 @@ local no_source_ret = tiling.update({
 })
 assert(type(no_source_ret) == "table", "no-source: returns a table (widened)")
 assert(no_source_ret.ok == false, "no-source: ok=false when source_session absent")
-assert(no_source_ret.reason == "absent_from_viewer",
-    "no-source: reason=absent_from_viewer, got " .. tostring(no_source_ret.reason))
+assert(
+    no_source_ret.reason == "absent_from_viewer",
+    "no-source: reason=absent_from_viewer, got " .. tostring(no_source_ret.reason)
+)
 assert(#remove_calls == 0, "no-source: remove NOT called when source_session missing")
 assert(#place_calls == 0, "no-source: place NOT called when source_session missing")
 
@@ -1059,8 +1065,10 @@ local empty_source_ret = tiling.update({
 })
 assert(type(empty_source_ret) == "table", "empty-source: returns a table (widened)")
 assert(empty_source_ret.ok == false, "empty-source: ok=false on empty source_session")
-assert(empty_source_ret.reason == "absent_from_viewer",
-    "empty-source: reason=absent_from_viewer, got " .. tostring(empty_source_ret.reason))
+assert(
+    empty_source_ret.reason == "absent_from_viewer",
+    "empty-source: reason=absent_from_viewer, got " .. tostring(empty_source_ret.reason)
+)
 assert(#remove_calls == 0, "empty-source: remove NOT called on empty source_session")
 assert(#place_calls == 0, "empty-source: place NOT called on empty source_session")
 

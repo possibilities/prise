@@ -114,6 +114,8 @@ test "lua tiling swap tab wrap" {
     var lua = try setupLua(std.testing.allocator);
     defer lua.deinit();
     try runLuaTest(lua, "src/lua/tiling_test_swap_tab_wrap.lua");
+}
+
 test "lua tiling click regions" {
     var lua = try setupLua(std.testing.allocator);
     defer lua.deinit();

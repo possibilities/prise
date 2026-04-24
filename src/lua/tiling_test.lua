@@ -537,21 +537,6 @@ do
     local r = t.compute_focus_window({ 10, 10, 10, 10 }, 2, 20)
     assert(r.start == 6, "compute_focus_window: middle active centered (with separators)")
     assert(r.total_width == 43, "compute_focus_window: middle → total 43 (40 + 3 separators)")
--- Test: fits within budget — start snaps to 0, total_width reports sum.
-do
-    local r = t.compute_focus_window({ 10, 10, 10 }, 2, 40)
-    assert(r.start == 0, "compute_focus_window: fits → start 0")
-    assert(r.total_width == 30, "compute_focus_window: fits → total 30")
-end
-
--- Test: active in middle — centered when budget < total.
--- Tabs: [0,10][10,20][20,30][30,40]. budget=20. active=2 at [10,20].
--- focus_centre = 10 + floor(10/2) = 15. half = 10. start = 15-10 = 5.
--- max_start = 40-20 = 20. 5 <= 20, so start = 5.
-do
-    local r = t.compute_focus_window({ 10, 10, 10, 10 }, 2, 20)
-    assert(r.start == 5, "compute_focus_window: middle active centered")
-    assert(r.total_width == 40, "compute_focus_window: middle → total 40")
 end
 
 -- Test: active near left — underflow branch → start = 0.
@@ -567,11 +552,6 @@ end
 do
     local r = t.compute_focus_window({ 10, 10, 10, 10 }, 4, 20)
     assert(r.start == 23, "compute_focus_window: near right → start clamps to max (with separators)")
--- active=4 at [30,40]. focus_centre = 35. half = 10. start = 25.
--- max_start = 40-20 = 20. 25 > 20 → clamp to 20.
-do
-    local r = t.compute_focus_window({ 10, 10, 10, 10 }, 4, 20)
-    assert(r.start == 20, "compute_focus_window: near right → start clamps to max")
 end
 
 -- Test: single tab wider than budget — start = 0 (total <= budget path doesn't
@@ -634,13 +614,6 @@ do
     assert(r.last_idx == 2, "derive_visible_range: aligned → last 2")
     assert(r.leading_clip == 0, "derive_visible_range: aligned → no leading clip")
     assert(r.trailing_clip == 1, "derive_visible_range: aligned → trailing clip=1 (separator pushes tab 2 trailing)")
-end
-
--- Test: leading edge mid-tab — leading_clip > 0.
--- Tabs: [0,10] sep[10] [11,21] sep[21] [22,32]. start=5. budget=10. window=[5,15].
--- tab1 cum[0,10]: 10>5 AND 0<15 → first=1. tab2 cum[11,21]: 21>5 AND 11<15 → last=2.
--- leading = 5-0 = 5. trailing = 21-15 = 6.
-    assert(r.trailing_clip == 0, "derive_visible_range: aligned → no trailing clip")
 end
 
 -- Test: leading edge mid-tab — leading_clip > 0.
@@ -995,13 +968,6 @@ do
         {}, -- zero-width trailing tab
     }, nil, {})
     assert(#out == 1 and out[1].text == "A", "zero-width tabN: no separator injected")
-    assert(#out == 6, "compose_layout_segments: full → 6 segments")
-    assert(out[1].text == "P", "compose_layout_segments: [1]=prefix")
-    assert(out[2].text == "<", "compose_layout_segments: [2]=left gutter")
-    assert(out[3].text == "T1", "compose_layout_segments: [3]=T1")
-    assert(out[4].text == "T2", "compose_layout_segments: [4]=T2")
-    assert(out[5].text == ">", "compose_layout_segments: [5]=right gutter")
-    assert(out[6].text == "S", "compose_layout_segments: [6]=suffix")
 end
 
 -- Test: no gutters (nil args).
@@ -1036,10 +1002,6 @@ do
     )
 end
 
--- Test: gutter offset accounted (single tab, no separator).
-    assert(regs[2].start_x == 5 and regs[2].end_x == 15 and regs[2].tab_index == 2, "derive_click_regions: [2]=5..15")
-end
-
 -- Test: gutter offset accounted.
 do
     local regs = t.derive_click_regions(0, 1, {
@@ -1067,9 +1029,6 @@ do
     -- First x = 3+1 = 4. First region 4..8. Separator cell 8 (dead). Second 9..15.
     assert(regs[1].start_x == 4 and regs[1].end_x == 8, "derive_click_regions: first at 4..8")
     assert(regs[2].start_x == 9 and regs[2].end_x == 15, "derive_click_regions: second at 9..15 (sep at 8)")
-    -- First x = 3+1 = 4. First region 4..8. Second 8..14.
-    assert(regs[1].start_x == 4 and regs[1].end_x == 8, "derive_click_regions: first at 4..8")
-    assert(regs[2].start_x == 8 and regs[2].end_x == 14, "derive_click_regions: second at 8..14")
 end
 
 -- Test: empty visible → no regions.
@@ -1226,8 +1185,6 @@ do
             tabs = {
                 { tab_index = 1, label_segments = { { text = "T1", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "T2", style = {} } } },
-                { tab_index = 1, segments = { { text = "T1", style = {} } } },
-                { tab_index = 2, segments = { { text = "T2", style = {} } } },
             },
             suffix = { { text = "SSSSSS", style = {} } },
         }
@@ -1324,9 +1281,6 @@ do
                 { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
                 { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
-                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
-                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
-                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             gutter_left = { text = "L", style = { fg = "#ff0000" } },
@@ -1382,9 +1336,6 @@ do
                 { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
                 { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
-                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
-                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
-                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             gutter_left = { { text = "<", style = {} }, { text = " ", style = {} } },
@@ -1437,9 +1388,6 @@ do
                 { tab_index = 1, label_segments = { { text = "AAAA", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "BBBB", style = {} } } },
                 { tab_index = 3, label_segments = { { text = "CCCC", style = {} } } },
-                { tab_index = 1, segments = { { text = "AAAA", style = {} } } },
-                { tab_index = 2, segments = { { text = "BBBB", style = {} } } },
-                { tab_index = 3, segments = { { text = "CCCC", style = {} } } },
             },
             suffix = {},
             -- no gutter_left / gutter_right → core falls back to config glyphs.
@@ -1480,7 +1428,6 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = { text = "L", style = {} },
             -- gutter_right deliberately absent → asymmetric → malformed.
@@ -1514,7 +1461,6 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = 42,
             gutter_right = { text = "R", style = {} },
@@ -1547,7 +1493,6 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
             gutter_left = { text = {}, style = {} },
             gutter_right = { text = "R", style = {} },
@@ -1583,7 +1528,6 @@ do
         return {
             prefix = {},
             tabs = { { tab_index = 1, label_segments = { { text = "T", style = {} } } } },
-            tabs = { { tab_index = 1, segments = { { text = "T", style = {} } } } },
             suffix = {},
         }
     end)
