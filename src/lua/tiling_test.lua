@@ -656,13 +656,6 @@ do
 end
 
 -- Test: trailing edge mid-tab only.
--- Tabs: [0,10] sep[10] [11,21] sep[21] [22,32]. start=10. budget=5. window=[10,15].
--- tab1 cum[0,10]: 10>10 false. tab2 cum[11,21]: 21>10 AND 11<15 → first=last=2.
--- leading = 10-11 = -1 → 0. trailing = 21-15 = 6.
-    assert(r.trailing_clip == 5, "derive_visible_range: mid-tab → trailing 5")
-end
-
--- Test: trailing edge mid-tab only.
 -- Tabs: [0,10][10,20][20,30]. start=10. budget=5. window = [10,15].
 -- first=2 (10..20 overlaps 10..15), last=2. leading = 10-10 = 0. trailing = 20-15 = 5.
 do
@@ -670,12 +663,6 @@ do
     assert(r.first_idx == 2 and r.last_idx == 2, "derive_visible_range: trailing-only → 2..2")
     assert(r.leading_clip == 0, "derive_visible_range: trailing-only → no leading clip")
     assert(r.trailing_clip == 6, "derive_visible_range: trailing-only → trailing 6")
-end
-
--- Test: budget smaller than first tab — visible single tab, clipped both sides.
--- Tabs: [0,20]. start=5. budget=10. window=[5,15]. first=1, last=1.
--- leading = 5-0 = 5. trailing = 20-15 = 5. N=1 so no separator injection.
-    assert(r.trailing_clip == 5, "derive_visible_range: trailing-only → trailing 5")
 end
 
 -- Test: budget smaller than first tab — visible single tab, clipped both sides.
@@ -1277,8 +1264,6 @@ do
             tabs = {
                 { tab_index = 1, label_segments = { { text = "T1", style = {} } } },
                 { tab_index = 2, label_segments = { { text = "T2", style = {} } } },
-                { tab_index = 1, segments = { { text = "T1", style = {} } } },
-                { tab_index = 2, segments = { { text = "T2", style = {} } } },
             },
             suffix = { { text = "S", style = {} } },
         }
@@ -1299,14 +1284,6 @@ do
     assert(#st.tab_regions == 2, "happy path: 2 click regions")
     -- Click regions account for the separator: x-advance between tabs is
     -- `tab.width + 1`. P=1 cell, T1 at 1..3, sep at 3..4 (dead), T2 at 4..6.
-    -- Expect: P T1 T2 S (no gutters — everything fits).
-    assert(#out == 4, "happy path: 4 segments (prefix + 2 tabs + suffix)")
-    assert(
-        out[1].text == "P" and out[2].text == "T1" and out[3].text == "T2" and out[4].text == "S",
-        "happy path: segment order"
-    )
-    local st = t.get_state()
-    assert(#st.tab_regions == 2, "happy path: 2 click regions")
     assert(
         st.tab_regions[1].tab_index == 1 and st.tab_regions[1].start_x == 1 and st.tab_regions[1].end_x == 3,
         "happy path: region 1 at 1..3"
@@ -1314,8 +1291,6 @@ do
     assert(
         st.tab_regions[2].tab_index == 2 and st.tab_regions[2].start_x == 4 and st.tab_regions[2].end_x == 6,
         "happy path: region 2 at 4..6 (separator cell 3..4 is dead click)"
-        st.tab_regions[2].tab_index == 2 and st.tab_regions[2].start_x == 3 and st.tab_regions[2].end_x == 5,
-        "happy path: region 2 at 3..5"
     )
 
     restore_warn()

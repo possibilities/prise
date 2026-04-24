@@ -5775,53 +5775,6 @@ const Server = struct {
         self.forwardToSubscribedPlugs("rename_tab", msg_bytes, exclude_client);
     }
 
-    fn handleRenameTab(self: *Server, requesting_client: ?*Client, params: msgpack.Value) !msgpack.Value {
-        const parsed = parseRenameTabParams(params) catch |err| {
-            const message = switch (err) {
-                error.InvalidParams => "invalid params",
-                error.MissingPtyId => "missing pty_id",
-                error.MissingTitle => "missing title",
-                error.MissingPtyValidity => "missing pty_validity",
-            };
-            return msgpack.Value{ .string = try self.allocator.dupe(u8, message) };
-        };
-
-        if (parsed.pty_validity != self.start_time_ms) {
-            return msgpack.Value{ .string = try self.allocator.dupe(u8, "stale shell environment; open a new shell") };
-        }
-
-        const pty_instance = self.ptys.get(parsed.pty_id) orelse {
-            return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
-        };
-
-        pty_instance.terminal_mutex.lock();
-        defer pty_instance.terminal_mutex.unlock();
-        try pty_instance.setTitle(parsed.title);
-
-        try self.sendRenameTab(parsed.pty_id, parsed.title, requesting_client);
-
-        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
-    }
-
-    /// Broadcast rename_tab notification to all clients
-    fn sendRenameTab(self: *Server, pty_id: usize, title: []const u8, exclude_client: ?*Client) !void {
-        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
-        defer self.allocator.free(map_items);
-        map_items[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } };
-        map_items[1] = .{ .key = .{ .string = "title" }, .value = .{ .string = title } };
-
-        const map_params = msgpack.Value{ .map = map_items };
-        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "rename_tab", map_params });
-        defer self.allocator.free(msg_bytes);
-
-        for (self.clients.items) |client| {
-            if (exclude_client) |excluded| {
-                if (client == excluded) continue;
-            }
-            try client.sendData(self.loop, msg_bytes);
-        }
-    }
-
     fn sendColorQueries(self: *Server, pty_instance: *Pty) !void {
         pty_instance.color_queries_mutex.lock();
         defer pty_instance.color_queries_mutex.unlock();
