@@ -52,6 +52,11 @@ local place_calls = {}
 local place_return = true
 local warn_calls = {}
 local save_calls = 0
+local delete_calls = {}
+local delete_return = true
+local switch_calls = {}
+local session_name_return = "test"
+local list_sessions_return = {}
 
 -- Install the prise mock module before loading tiling. Kept in scope as
 -- `mock_prise` so scenarios can swap out place_return or inspect state.
@@ -96,14 +101,19 @@ local mock_prise = {
     end,
     exit = function() end,
     get_session_name = function()
-        return "test"
+        return session_name_return
     end,
     attach = function() end,
-    switch_session = function()
+    switch_session = function(name)
+        table.insert(switch_calls, name)
         return true
     end,
     rename_session = function() end,
     create_session = function() end,
+    delete_session = function(session_name)
+        table.insert(delete_calls, session_name)
+        return delete_return
+    end,
     place_pty_in_session = function(session_name, pty_id, cwd, tab_title)
         table.insert(place_calls, {
             session_name = session_name,
@@ -140,7 +150,7 @@ local mock_prise = {
         return "12:00"
     end,
     list_sessions = function()
-        return {}
+        return list_sessions_return
     end,
 }
 package.loaded["prise"] = mock_prise
@@ -154,6 +164,11 @@ local function reset_captures()
     place_return = true
     warn_calls = {}
     save_calls = 0
+    delete_calls = {}
+    delete_return = true
+    switch_calls = {}
+    session_name_return = "test"
+    list_sessions_return = {}
 end
 
 -- === Happy path: 2-pane tab, move one, source tab survives ===
@@ -226,9 +241,15 @@ assert(s.focused_id == 99, "empty: focus unchanged (was in sibling tab)")
 assert(#place_calls == 1, "empty: place_pty_in_session called")
 assert(place_calls[1].pty_id == 1, "empty: correct pty placed")
 
--- === Solo pane in the only tab: refuse (would empty session) ===
+-- === Solo pane in the only tab: move succeeds, source session closes ===
+-- fn-111: the old solo-pane-in-only-tab refusal was dropped. The primitive
+-- now executes the move and cleans up the empty source session via
+-- close_session. Mirrors tmux cmd-join-pane's server_kill_window-on-empty
+-- pattern + wezterm's post-move is_dead cleanup.
 
 reset_captures()
+session_name_return = "alpha"
+list_sessions_return = { "alpha", "bravo" }
 t.set_state({
     tabs = {
         { id = 1, root = mock_pane(1), last_focused_id = 1 },
@@ -241,16 +262,24 @@ tiling.update({
     type = "move_pane_to_session",
     data = {
         pty_id = 1,
-        session_name = "foo",
+        session_name = "bravo",
         cwd = "/tmp",
         tab_title = "t",
     },
 })
 s = t.get_state()
-assert(#s.tabs == 1, "solo-only: tab count unchanged")
-assert(s.tabs[1].root.id == 1, "solo-only: pane still present")
-assert(#place_calls == 0, "solo-only: place_pty_in_session NOT called")
-assert(save_calls == 0, "solo-only: prise.save NOT called (pure no-op)")
+assert(#s.tabs == 0, "solo-only: source tab dropped (session drained)")
+assert(#place_calls == 1, "solo-only: place_pty_in_session called exactly once")
+assert(place_calls[1].session_name == "bravo", "solo-only: placed on destination")
+assert(place_calls[1].pty_id == 1, "solo-only: correct pty placed")
+-- close_session flushes a second save after delete; move's own save runs
+-- first (source drain), then close_session (delete + viewer re-anchor +
+-- save). save_calls == 2 reflects both boundaries.
+assert(save_calls == 2, "solo-only: prise.save called by move AND close_session, got " .. tostring(save_calls))
+assert(#delete_calls == 1, "solo-only: source session closed exactly once")
+assert(delete_calls[1] == "alpha", "solo-only: close targets the source session")
+assert(#switch_calls == 1, "solo-only: viewer re-anchored before close")
+assert(switch_calls[1] == "bravo", "solo-only: viewer re-anchors to the remaining session")
 
 -- === Floating/overlay guard: pane held on tab.floating ===
 
@@ -577,7 +606,10 @@ do
     assert(#place_calls == 1, "overlay-orphan: place_pty_in_session called")
 end
 
--- === Return value: true on happy path ===
+-- === Return value: widened tagged table `{ ok, reason }` on happy path ===
+-- fn-111: return shape widened from bool to `{ ok = <bool>, reason = <token> }`.
+-- Existing `if ret then ... end` truthy checks still work (non-nil tables
+-- are truthy). Reason-aware callers read `ret.ok` / `ret.reason`.
 
 reset_captures()
 t.set_state({
@@ -604,9 +636,11 @@ local happy_ret = tiling.update({
         tab_title = "my-claude",
     },
 })
-assert(happy_ret == true, "return-happy: returns true on successful move")
+assert(type(happy_ret) == "table", "return-happy: returns a table (widened shape)")
+assert(happy_ret.ok == true, "return-happy: ok=true on successful move")
+assert(happy_ret.reason == "moved", "return-happy: reason=moved, got " .. tostring(happy_ret.reason))
 
--- === Return value: false when pane not in viewer's state ===
+-- === Return value: `{ ok = false, reason = "absent_from_viewer" }` when pane missing ===
 
 reset_captures()
 t.set_state({
@@ -627,13 +661,20 @@ local missing_ret = tiling.update({
         tab_title = "ghost",
     },
 })
-assert(missing_ret == false, "return-missing: returns false when pane absent from state")
+assert(type(missing_ret) == "table", "return-missing: returns a table")
+assert(missing_ret.ok == false, "return-missing: ok=false when pane absent")
+assert(missing_ret.reason == "absent_from_viewer",
+    "return-missing: reason=absent_from_viewer, got " .. tostring(missing_ret.reason))
 assert(#place_calls == 0, "return-missing: place_pty_in_session NOT called")
 assert(save_calls == 0, "return-missing: prise.save NOT called")
 
--- === Return value: false on solo-pane-in-only-tab refusal ===
+-- === Return value: `{ ok = true, reason = "moved" }` on solo-only (post-fn-111) ===
+-- fn-111 dropped the solo-pane-in-only-tab refusal. The move now succeeds
+-- and the source session is closed as post-move cleanup.
 
 reset_captures()
+session_name_return = "alpha"
+list_sessions_return = { "alpha", "bravo" }
 t.set_state({
     tabs = {
         { id = 1, root = mock_pane(1), last_focused_id = 1 },
@@ -646,14 +687,16 @@ local solo_ret = tiling.update({
     type = "move_pane_to_session",
     data = {
         pty_id = 1,
-        session_name = "foo",
+        session_name = "bravo",
         cwd = "/tmp",
         tab_title = "t",
     },
 })
-assert(solo_ret == false, "return-solo: returns false when refusing to empty session")
+assert(type(solo_ret) == "table", "return-solo: returns a table")
+assert(solo_ret.ok == true, "return-solo: ok=true (no more pre-flight refusal)")
+assert(solo_ret.reason == "moved", "return-solo: reason=moved, got " .. tostring(solo_ret.reason))
 
--- === Return value: false on bad args ===
+-- === Return value: `{ ok = false, reason = "bad_args" }` on bad args ===
 
 reset_captures()
 t.set_state({
@@ -676,16 +719,156 @@ local bad_pty_ret = tiling.update({
     ---@diagnostic disable-next-line: assign-type-mismatch
     data = { pty_id = "not-a-number", session_name = "foo", cwd = "/tmp", tab_title = "t" },
 })
-assert(bad_pty_ret == false, "return-bad-pty: returns false on non-number pty_id")
+assert(type(bad_pty_ret) == "table", "return-bad-pty: returns a table")
+assert(bad_pty_ret.ok == false, "return-bad-pty: ok=false on non-number pty_id")
+assert(bad_pty_ret.reason == "bad_args", "return-bad-pty: reason=bad_args")
 
 local bad_session_ret = tiling.update({
     type = "move_pane_to_session",
     data = { pty_id = 2, session_name = "", cwd = "/tmp", tab_title = "t" },
 })
-assert(bad_session_ret == false, "return-bad-session: returns false on empty session_name")
+assert(type(bad_session_ret) == "table", "return-bad-session: returns a table")
+assert(bad_session_ret.ok == false, "return-bad-session: ok=false on empty session_name")
+assert(bad_session_ret.reason == "bad_args", "return-bad-session: reason=bad_args")
 
 local bad_cwd_ret = tiling.update({
     type = "move_pane_to_session",
     data = { pty_id = 2, session_name = "foo", cwd = "", tab_title = "t" },
 })
-assert(bad_cwd_ret == false, "return-bad-cwd: returns false on empty cwd")
+assert(type(bad_cwd_ret) == "table", "return-bad-cwd: returns a table")
+assert(bad_cwd_ret.ok == false, "return-bad-cwd: ok=false on empty cwd")
+assert(bad_cwd_ret.reason == "bad_args", "return-bad-cwd: reason=bad_args")
+
+-- === Return value: `{ ok = false, reason = "source_solo_destination_unreachable" }` ===
+-- fn-111 new reason token: solo-source moved out, destination place_pty failed.
+-- Source is already drained + closed by the time place returns false; the
+-- distinct reason lets the caller skip DB re-key / viewer-switch effects that
+-- would land on a non-existent tab.
+
+reset_captures()
+session_name_return = "alpha"
+list_sessions_return = { "alpha", "bravo" }
+place_return = false
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+local solo_unreachable_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 1,
+        session_name = "bravo",
+        cwd = "/tmp",
+        tab_title = "t",
+    },
+})
+assert(type(solo_unreachable_ret) == "table", "solo-unreachable: returns a table")
+assert(solo_unreachable_ret.ok == false,
+    "solo-unreachable: ok=false when destination place fails on a drained source")
+assert(solo_unreachable_ret.reason == "source_solo_destination_unreachable",
+    "solo-unreachable: reason=source_solo_destination_unreachable, got " .. tostring(solo_unreachable_ret.reason))
+assert(#delete_calls == 1, "solo-unreachable: source session still closed (post-move cleanup fired)")
+-- place_pty_in_session still invoked + warned once; close_session did not warn
+assert(#warn_calls == 1, "solo-unreachable: exactly one warning logged (the place failure), got " .. tostring(#warn_calls))
+
+-- === prise.close_session: refuse non-empty current session ===
+-- The primitive must not drain an active session — the caller is
+-- responsible for draining tabs first. A non-empty current session close
+-- returns false and logs a WARN with the tab count.
+
+reset_captures()
+session_name_return = "alpha"
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+        { id = 2, root = mock_pane(2), last_focused_id = 2 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 3,
+})
+local close_nonempty_ret = mock_prise.close_session("alpha")
+assert(close_nonempty_ret == false, "close_nonempty: refuses a non-empty current session")
+assert(#delete_calls == 0, "close_nonempty: delete_session NOT called")
+assert(save_calls == 0, "close_nonempty: prise.save NOT called")
+assert(#warn_calls == 1, "close_nonempty: one WARN logged, got " .. tostring(#warn_calls))
+assert(warn_calls[1]:find("close_session", 1, true), "close_nonempty: warn mentions close_session")
+assert(warn_calls[1]:find("tab_count=2", 1, true), "close_nonempty: warn reports tab count")
+
+-- === prise.close_session: close an empty current session + re-anchor viewer ===
+
+reset_captures()
+session_name_return = "alpha"
+list_sessions_return = { "alpha", "bravo" }
+t.set_state({
+    tabs = {},
+    active_tab = 1,
+    focused_id = nil,
+    next_tab_id = 1,
+})
+local close_empty_ret = mock_prise.close_session("alpha")
+assert(close_empty_ret == true, "close_empty: returns true on empty session close")
+assert(#delete_calls == 1, "close_empty: delete_session called exactly once")
+assert(delete_calls[1] == "alpha", "close_empty: delete targets named session")
+assert(#switch_calls == 1, "close_empty: viewer re-anchored before delete")
+assert(switch_calls[1] == "bravo", "close_empty: viewer re-anchors to remaining session")
+assert(save_calls == 1, "close_empty: prise.save flushed after close")
+assert(#warn_calls == 0, "close_empty: no warnings on happy path")
+
+-- === prise.close_session: last-session edge — zero-sessions transient OK ===
+-- Closing the only session leaves the viewer momentarily attached to nothing.
+-- Prise tolerates this; the primitive doesn't switch (no fallback available).
+
+reset_captures()
+session_name_return = "alpha"
+list_sessions_return = { "alpha" } -- only one session exists
+t.set_state({
+    tabs = {},
+    active_tab = 1,
+    focused_id = nil,
+    next_tab_id = 1,
+})
+local close_last_ret = mock_prise.close_session("alpha")
+assert(close_last_ret == true, "close_last: returns true when closing the last session")
+assert(#delete_calls == 1, "close_last: delete_session still fires")
+assert(#switch_calls == 0, "close_last: viewer NOT switched (no fallback available)")
+assert(save_calls == 1, "close_last: prise.save flushed")
+
+-- === prise.close_session: off-viewer session — delete proceeds ===
+-- When the named session isn't the viewer's current session, emptiness can't
+-- be verified from viewer state. The primitive delegates to delete_session
+-- (idempotent on ENOENT) without a refuse-non-empty gate. Callers that need
+-- that gate for off-viewer sessions pre-check before invoking.
+
+reset_captures()
+session_name_return = "alpha"
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+local close_offviewer_ret = mock_prise.close_session("bravo")
+assert(close_offviewer_ret == true, "close_offviewer: delete proceeds for non-current session")
+assert(#delete_calls == 1, "close_offviewer: delete_session called once")
+assert(delete_calls[1] == "bravo", "close_offviewer: delete targets named session")
+assert(#switch_calls == 0, "close_offviewer: no viewer switch (not current)")
+assert(save_calls == 1, "close_offviewer: prise.save flushed")
+
+-- === prise.close_session: bad args — empty or non-string ===
+
+reset_captures()
+local close_empty_name_ret = mock_prise.close_session("")
+assert(close_empty_name_ret == false, "close_bad: empty session_name refused")
+assert(#delete_calls == 0, "close_bad: delete NOT called on bad args")
+
+---@diagnostic disable-next-line: param-type-mismatch
+local close_nil_ret = mock_prise.close_session(nil)
+assert(close_nil_ret == false, "close_bad: nil session_name refused")
+assert(#delete_calls == 0, "close_bad: delete NOT called on nil")

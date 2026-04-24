@@ -599,6 +599,88 @@ local function detach_session()
     prise.detach(prise.get_session_name())
 end
 
+---Close a session (refuses non-empty sessions, re-anchors the viewer
+---when closing the current session, and flushes save).
+---
+---Invariants:
+---  * Refuses on bad args (non-string or empty name). Returns false.
+---  * When `session_name` matches the current viewer session and
+---    `#state.tabs > 0`, refuses. The caller is responsible for
+---    draining tabs first (e.g. `move_pane_to_session` empties the
+---    source tab tree before calling here).
+---  * When `session_name` matches the current viewer session and
+---    `#state.tabs == 0`:
+---      * If another session is listed by `prise.list_sessions()` the
+---        viewer switches to it BEFORE the file delete, so the viewer
+---        is never anchored on a non-existent session.
+---      * If no other session exists, prise tolerates the transient
+---        zero-sessions state until the next operation creates one.
+---        Document at the call site why the zero-sessions gap is OK.
+---  * When `session_name` does NOT match the current viewer session,
+---    emptiness can't be checked from viewer state — the file delete
+---    proceeds unconditionally (this matches `prise.delete_session`'s
+---    idempotent-on-ENOENT contract). Callers that need non-empty
+---    protection for off-viewer sessions must pre-check before
+---    invoking this helper.
+---  * Always flushes `prise.save()` after a successful close so
+---    source state and on-disk state agree.
+---
+---@param session_name string
+---@return boolean ok
+local function close_session(session_name)
+    if type(session_name) ~= "string" or session_name == "" then
+        return false
+    end
+    local current = prise.get_session_name()
+    if current == session_name then
+        -- Refuse non-empty close for the current session. For
+        -- off-viewer sessions we have no way to enumerate tabs;
+        -- callers own that check.
+        if #state.tabs > 0 then
+            prise.log.warn(
+                "close_session: refusing non-empty current session="
+                    .. tostring(session_name)
+                    .. " tab_count="
+                    .. tostring(#state.tabs)
+            )
+            return false
+        end
+        -- Viewer re-anchor: pick any other session if one exists.
+        -- prise.list_sessions returns the current session name too;
+        -- skip it.
+        local fallback = nil
+        local sessions = prise.list_sessions() or {}
+        for _, name in ipairs(sessions) do
+            if name ~= session_name then
+                fallback = name
+                break
+            end
+        end
+        if fallback then
+            prise.switch_session(fallback)
+        end
+        -- No `else` branch: prise tolerates the momentary
+        -- zero-sessions state until the next op creates one.
+    end
+    local deleted = prise.delete_session(session_name)
+    -- delete_session returns false only when no callback is wired
+    -- (tests may mock it permissively) — treat that as fatal so we
+    -- don't flush an inconsistent state.
+    if deleted == false then
+        return false
+    end
+    prise.save()
+    return true
+end
+-- Expose on the prise module so external Lua code (and tests via the
+-- mock prise table) can invoke `prise.close_session(name)`. The
+-- policy logic above belongs to tiling.lua because only this layer
+-- holds viewer state (state.tabs, active session); the registration
+-- makes the helper reachable without widening the Zig surface.
+if prise and not prise.close_session then
+    prise.close_session = close_session
+end
+
 ---Get the currently active tab
 ---@return Tab?
 local function get_active_tab()
@@ -3220,54 +3302,80 @@ function M.update(event)
         -- own the policy of which session to land in (cwd basename, per-
         -- project routing, etc.); this primitive just executes the move.
         --
-        -- Returns true on success, false when the move is refused or
-        -- can't be performed (bad args, pane not in the viewer's state,
-        -- solo-pane-in-only-tab refusal). Callers can gate downstream
-        -- effects (DB re-key, event emission) on the return value so a
-        -- no-op doesn't produce a ghost move. The pane isn't in the
-        -- viewer's state when the pane lives in another session's
-        -- saved JSON (find_tab_for_pane only walks state.tabs) — the
-        -- caller either needs to be attached to the source session or
-        -- route the move through a cross-session primitive.
+        -- Returns a tagged table `{ ok = <bool>, reason = <string>, ... }`.
+        -- `reason` is one of:
+        --   moved                              — success
+        --   bad_args                           — missing/ill-typed pty_id,
+        --                                         session_name, or cwd
+        --   absent_from_viewer                 — pane not in state.tabs
+        --                                         (viewer isn't attached
+        --                                         to the source session
+        --                                         and no cross-session
+        --                                         primitive was routed)
+        --   source_solo_destination_unreachable— single-pane source that
+        --                                         couldn't land on the
+        --                                         destination; source
+        --                                         session stays intact
+        -- Non-nil tables are truthy in Lua, so existing `if ret then ...`
+        -- checks still work; callers that need reason-aware branching
+        -- read `ret.ok` / `ret.reason`.
+        --
+        -- Callers can gate downstream effects (DB re-key, event emission)
+        -- on `ret.ok` so a no-op doesn't produce a ghost move. The pane
+        -- isn't in the viewer's state when the pane lives in another
+        -- session's saved JSON (find_tab_for_pane only walks state.tabs)
+        -- — the caller either needs to be attached to the source session
+        -- or route the move through a cross-session primitive.
+        --
+        -- Post-move source cleanup: after the move succeeds, the source
+        -- tab is dropped from state.tabs. When that drop leaves
+        -- `#state.tabs == 0` the source session is empty — this primitive
+        -- closes it via `prise.close_session` so the caller doesn't see a
+        -- ghost viewer on a session with no tabs. Ordering is
+        -- source-save-then-place-dest-then-close so fn-8's viewer-on-
+        -- destination race guarantees stay intact.
         --
         -- Invariant caveat: the tree mutation happens BEFORE the cross-
         -- session file write. If prise.place_pty_in_session fails, we log
-        -- and leave the PTY orphaned in memory — no rollback primitive
-        -- exists and re-attaching the leaf would race with an in-flight
-        -- save. The move still counts as "succeeded" (return true) from
-        -- the caller's perspective: the pane left the source tree and
-        -- the DB re-key reflects the intended post-move session.
+        -- and still return `{ ok = true, reason = "moved" }` — saving
+        -- the mutated source state is more important than trying to
+        -- unwind half a cross-session move, and the pane has left the
+        -- source tree from the caller's perspective.
         local pty_id = event.data and event.data.pty_id
         local session_name = event.data and event.data.session_name
         local cwd = event.data and event.data.cwd
         local tab_title = event.data and event.data.tab_title
         if type(pty_id) ~= "number" then
-            return false
+            return { ok = false, reason = "bad_args" }
         end
         if type(session_name) ~= "string" or session_name == "" then
-            return false
+            return { ok = false, reason = "bad_args" }
         end
         if type(cwd) ~= "string" or cwd == "" then
-            return false
+            return { ok = false, reason = "bad_args" }
         end
 
         local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
         if not src_tab or not src_tab_idx then
-            return false
+            return { ok = false, reason = "absent_from_viewer" }
         end
         -- find_tab_for_pane also resolves floating/overlay panes; require
         -- the leaf to live in the tileable tree. Doubles as a nil-guard
         -- on the tree walk.
         if not find_node_path(src_tab.root, pty_id) then
-            return false
+            return { ok = false, reason = "absent_from_viewer" }
         end
 
-        -- Solo-pane in the only tab: refusing the move keeps the current
-        -- session from going empty. Multi-tab solo panes fall through —
-        -- dropping one tab still leaves the session non-empty.
-        if is_pane(src_tab.root) and src_tab.root.id == pty_id and #state.tabs == 1 then
-            return false
-        end
+        -- Solo-pane-in-only-tab used to refuse the move outright; the
+        -- primitive now lets the move through and cleans up the empty
+        -- source session at the tail of this handler. Matches the
+        -- tmux/wezterm/zellij pattern: post-move cleanup, not pre-move
+        -- refusal. Track the case so we can emit a structured reason if
+        -- the destination place fails and we have to restore intent.
+        local source_was_solo_only = (
+            is_pane(src_tab.root) and src_tab.root.id == pty_id and #state.tabs == 1
+        )
+        local source_session_for_close = source_was_solo_only and prise.get_session_name() or nil
 
         local was_active = (src_tab_idx == state.active_tab)
         local was_focused = (state.focused_id == pty_id)
@@ -3356,16 +3464,58 @@ function M.update(event)
         -- in-memory (still alive, no tree reference). We log and move on
         -- — saving the mutated source state is more important than
         -- trying to unwind half a cross-session move.
-        local ok = prise.place_pty_in_session(session_name, pty_id, cwd, tab_title)
-        if not ok then
+        local placed = prise.place_pty_in_session(session_name, pty_id, cwd, tab_title)
+        if not placed then
             prise.log.warn(
                 "move_pane_to_session: place failed for pty=" .. tostring(pty_id) .. " session=" .. session_name
             )
         end
 
+        -- Flush source state BEFORE any cross-session close. fn-8 race
+        -- guarantee: destination write happened above, source save
+        -- captures the now-empty tree so the viewer and on-disk state
+        -- agree.
         prise.save()
+
+        -- Close the now-empty source session when the move drained its
+        -- last tab. `source_session_for_close` is set above only when
+        -- the source was the single tab holding a single pane; by here
+        -- that tab has been removed from state.tabs and the session is
+        -- genuinely empty from the viewer's vantage point.
+        --
+        -- Zero-sessions transient: when closing the only session in
+        -- prise, the viewer is momentarily attached to nothing. Prise
+        -- tolerates this as long as the next operation creates a
+        -- session (the destination place above is exactly that — but
+        -- it's a file-based write, not a viewer attach). The human
+        -- workflow that ends up here (cross-session move with focus
+        -- follow) issues `prise.switch_session(destination)` from the
+        -- caller moments after this primitive returns, landing the
+        -- viewer on the new session before any input would crash.
+        if source_session_for_close and source_session_for_close ~= session_name then
+            local closed = prise.close_session(source_session_for_close)
+            if not closed then
+                prise.log.warn(
+                    "move_pane_to_session: close_session failed for session="
+                        .. tostring(source_session_for_close)
+                )
+            end
+        end
+
         prise.request_frame()
-        return true
+
+        if not placed and source_was_solo_only then
+            -- The source session was already drained (tabs dropped, save
+            -- flushed, close_session may have fired). The destination
+            -- refused the leaf, so the PTY is orphaned and the
+            -- workflow's post-move steps (viewer switch, DB re-key)
+            -- would land on a non-existent tab. Surface a distinct
+            -- reason so the caller can skip those effects without
+            -- colliding with the cross-session `absent_from_viewer`
+            -- path.
+            return { ok = false, reason = "source_solo_destination_unreachable" }
+        end
+        return { ok = true, reason = "moved" }
     elseif event.type == "mouse" then
         local d = event.data
 
