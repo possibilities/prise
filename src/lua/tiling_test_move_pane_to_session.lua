@@ -57,6 +57,8 @@ local delete_return = true
 local switch_calls = {}
 local session_name_return = "test"
 local list_sessions_return = {}
+local remove_calls = {}
+local remove_return = true
 
 -- Install the prise mock module before loading tiling. Kept in scope as
 -- `mock_prise` so scenarios can swap out place_return or inspect state.
@@ -123,6 +125,10 @@ local mock_prise = {
         })
         return place_return
     end,
+    remove_pty_from_session = function(session_name, pty_id)
+        table.insert(remove_calls, { session_name = session_name, pty_id = pty_id })
+        return remove_return
+    end,
     create_text_input = function()
         return {
             text = function()
@@ -169,6 +175,8 @@ local function reset_captures()
     switch_calls = {}
     session_name_return = "test"
     list_sessions_return = {}
+    remove_calls = {}
+    remove_return = true
 end
 
 -- === Happy path: 2-pane tab, move one, source tab survives ===
@@ -872,3 +880,59 @@ assert(#delete_calls == 0, "close_bad: delete NOT called on bad args")
 local close_nil_ret = mock_prise.close_session(nil)
 assert(close_nil_ret == false, "close_bad: nil session_name refused")
 assert(#delete_calls == 0, "close_bad: delete NOT called on nil")
+
+-- === Cross-session × source-was-solo-only: NO close_session fires ===
+--
+-- The cross-session arm returns from the `not src_tab` branch BEFORE
+-- `source_was_solo_only` is computed (the capture lives below the
+-- early-return), so the post-move close gate at the tail of the handler
+-- never runs on cross-session moves. This pins that contract: even when
+-- the source session would be solo-only-if-loaded, no close_session /
+-- delete_session fires on a cross-session move. A future refactor that
+-- pulls the solo-only computation up above the early-return would
+-- silently start closing sessions the viewer never owned — this test
+-- catches that.
+reset_captures()
+session_name_return = "viewer"
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_pane(99),
+            last_focused_id = 99,
+        },
+    },
+    active_tab = 1,
+    focused_id = 99,
+    next_tab_id = 2,
+})
+local cross_solo_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 7,
+        session_name = "dest",
+        cwd = "/home/user/code/dest",
+        tab_title = "claude",
+        source_session = "src",
+    },
+})
+assert(type(cross_solo_ret) == "table", "cross_solo: returns a table (widened)")
+assert(cross_solo_ret.ok == true, "cross_solo: ok=true on successful cross-session place")
+assert(cross_solo_ret.reason == "moved", "cross_solo: reason=moved")
+assert(#remove_calls == 1, "cross_solo: remove_pty_from_session called once")
+assert(remove_calls[1].session_name == "src", "cross_solo: remove targets source session")
+assert(remove_calls[1].pty_id == 7, "cross_solo: remove targets the moved pty")
+assert(#place_calls == 1, "cross_solo: place_pty_in_session called once (file-based)")
+assert(place_calls[1].session_name == "dest", "cross_solo: place targets dest session")
+-- The load-bearing assertion: cross-session arm never reaches the
+-- post-move close gate, so close_session (which would call delete_session
+-- on the captured source session) MUST NOT fire — even though the source
+-- session would be solo-only-if-loaded by viewer state.
+assert(#delete_calls == 0, "cross_solo: close_session did NOT fire (no delete on viewer-foreign source)")
+-- Viewer state never mutated either: state.tabs is left at its single
+-- pre-existing tab, save was not called by the cross-session file-based
+-- arm (it's a pure JSON write), and the viewer didn't switch sessions.
+local cross_solo_state = t.get_state()
+assert(#cross_solo_state.tabs == 1, "cross_solo: viewer's state.tabs untouched")
+assert(save_calls == 0, "cross_solo: prise.save NOT flushed (file-based arm)")
+assert(#switch_calls == 0, "cross_solo: viewer did not switch sessions")
