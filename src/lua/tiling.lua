@@ -3729,6 +3729,24 @@ function M.update(event)
             return
         end
 
+        -- Check if this PTY should be assigned to a pending named overlay
+        -- (mirror of state.floating.pending for the multi-overlay model added
+        -- by feat/overlay-terminals — toggle_overlay sets ost.pending = true
+        -- before prise.spawn, so the next pty_attach is the overlay's own pty).
+        for overlay_name, ost in pairs(state.overlay_state) do
+            if ost.pending then
+                ost.pending = false
+                local tab = get_active_tab()
+                if tab then
+                    tab.overlays = tab.overlays or {}
+                    tab.overlays[overlay_name] = { pane = new_pane, visible = true }
+                    state.active_overlay_name = overlay_name
+                end
+                prise.request_frame()
+                return
+            end
+        end
+
         local spawn_opts = state.pending_spawns[new_pane.id]
         local spawn_no_focus = spawn_opts and spawn_opts.no_focus
         state.pending_spawns[new_pane.id] = nil
@@ -4216,6 +4234,24 @@ function M.update(event)
                 tab.floating = nil
                 prise.request_frame()
                 return
+            end
+        end
+
+        -- Check if this is a named overlay pane (parallel to floating cleanup
+        -- above; auto-dismiss when an overlay's PTY exits, mirroring the
+        -- exec-wrapped cmd contract added by feat/overlay-terminals).
+        for _, tab in ipairs(state.tabs) do
+            if tab.overlays then
+                for overlay_name, overlay in pairs(tab.overlays) do
+                    if overlay.pane and overlay.pane.id == id then
+                        tab.overlays[overlay_name] = nil
+                        if state.active_overlay_name == overlay_name then
+                            state.active_overlay_name = nil
+                        end
+                        prise.request_frame()
+                        return
+                    end
+                end
             end
         end
 
