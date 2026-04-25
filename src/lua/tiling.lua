@@ -3418,6 +3418,15 @@ function M.update(event)
                         )
                         return { ok = false, reason = "cross_session_place_failed" }
                     end
+                    -- No prise.request_frame() here, intentionally. The
+                    -- viewer is on neither the source nor the destination
+                    -- session; both `state.tabs` and any rendered widgets
+                    -- are untouched by this branch (the place is a pure
+                    -- file write into another session's JSON). The
+                    -- in-memory arm above DOES request a frame because it
+                    -- mutates `state.tabs` directly. Re-adding a frame
+                    -- request here would be a wasted render with no
+                    -- changed bytes to draw.
                     return { ok = true, reason = "moved" }
                 end
             end
