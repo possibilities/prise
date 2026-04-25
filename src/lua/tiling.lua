@@ -6893,6 +6893,7 @@ function M.get_state(cwd_lookup)
             width = state.floating.width,
             height = state.floating.height,
         },
+        overlay_settings = overlay_settings,
     }
 end
 
