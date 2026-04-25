@@ -3733,6 +3733,16 @@ function M.update(event)
         -- (mirror of state.floating.pending for the multi-overlay model added
         -- by feat/overlay-terminals — toggle_overlay sets ost.pending = true
         -- before prise.spawn, so the next pty_attach is the overlay's own pty).
+        --
+        -- Invariant: at most one entry in state.overlay_state has pending=true.
+        -- Enforced by toggle_overlay's early-return when ost.pending is already
+        -- set (see :2674-2676), which prevents the same overlay from re-pending.
+        -- Two *different* overlays cannot both be pending because pty_attach
+        -- runs on the same Lua VM that drives toggle_overlay — there is no
+        -- intermediate yield between toggle_overlay setting pending=true and
+        -- the resulting pty_attach landing here. Without this invariant,
+        -- pairs() iteration order is undefined and assignment would be
+        -- non-deterministic.
         for overlay_name, ost in pairs(state.overlay_state) do
             if ost.pending then
                 ost.pending = false
