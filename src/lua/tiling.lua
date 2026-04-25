@@ -641,6 +641,10 @@ local action_handlers
 ---@type fun(name: string)
 local toggle_overlay
 
+---Forward declaration for get_active_overlay (defined alongside toggle_overlay)
+---@type fun(): string?, table?
+local get_active_overlay
+
 ---Forward declaration for parse_overlay_size (defined near FLOATING_* constants)
 ---@type fun(spec: any, axis: "width"|"height", overlay_name: string): number?, number?
 local parse_overlay_size
@@ -2815,6 +2819,27 @@ toggle_overlay = function(name)
         end
         prise.request_frame()
     end
+end
+
+---Look up the currently-active overlay on the active tab.
+---Returns (name, overlay) when an overlay is active, or (nil, nil) when none.
+---The toggle_overlay invariant keeps state.active_overlay_name in sync with the
+---overlay's visible flag, so callers can rely on the returned overlay being live.
+---@return string?, table?
+get_active_overlay = function()
+    local name = state.active_overlay_name
+    if not name then
+        return nil, nil
+    end
+    local tab = get_active_tab()
+    if not tab or not tab.overlays then
+        return nil, nil
+    end
+    local overlay = tab.overlays[name]
+    if not overlay then
+        return nil, nil
+    end
+    return name, overlay
 end
 
 ---Command palette commands
