@@ -168,6 +168,8 @@ local t = tiling._test
 local function reset_captures()
     place_calls = {}
     place_return = true
+    remove_calls = {} ---@diagnostic disable-line:lowercase-global
+    remove_return = true ---@diagnostic disable-line:lowercase-global
     warn_calls = {}
     save_calls = 0
     delete_calls = {}
@@ -175,8 +177,6 @@ local function reset_captures()
     switch_calls = {}
     session_name_return = "test"
     list_sessions_return = {}
-    remove_calls = {}
-    remove_return = true
 end
 
 -- === Happy path: 2-pane tab, move one, source tab survives ===
@@ -946,7 +946,7 @@ assert(#switch_calls == 0, "cross_solo: viewer did not switch sessions")
 -- === Cross-session: remove fails first — bail out, no place call ===
 
 reset_captures()
-remove_return = false
+remove_return = false ---@diagnostic disable-line:lowercase-global
 t.set_state({
     tabs = {
         { id = 1, root = mock_pane(500), last_focused_id = 500 },
@@ -1107,8 +1107,8 @@ assert(#place_calls == 0, "viewer-on-dest: place_pty_in_session NOT called (in-m
 assert(save_calls == 1, "viewer-on-dest: prise.save() called once")
 local vod_state = t.get_state()
 assert(#vod_state.tabs == 2, "viewer-on-dest: new tab appended to state.tabs")
-assert(vod_state.tabs[2].root.pty_id == 42, "viewer-on-dest: new tab root has pty_id (fn-8 spec shape)")
-assert(vod_state.tabs[2].root.cwd == "/home/user/code/bravo", "viewer-on-dest: new tab root has cwd")
+assert(vod_state.tabs[2].root.pty_id == 42, "viewer-on-dest: new tab root has pty_id (fn-8 spec shape)") ---@diagnostic disable-line:undefined-field
+assert(vod_state.tabs[2].root.cwd == "/home/user/code/bravo", "viewer-on-dest: new tab root has cwd") ---@diagnostic disable-line:undefined-field
 assert(vod_state.tabs[2].root.id == nil, "viewer-on-dest: new tab root has no id field (fn-8 spec shape)")
 assert(vod_state.tabs[2].title == "moved", "viewer-on-dest: new tab has correct title")
 assert(vod_state.next_tab_id == 3, "viewer-on-dest: next_tab_id bumped")
