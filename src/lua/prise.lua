@@ -67,6 +67,7 @@
 ---@field get_focused_id? fun(): number? Return the raw pty_id of the focused pane (optional)
 ---@field get_macos_option_as_alt? fun(): boolean Return whether macOS Option should act as Alt
 ---@field execute_action? fun(name: string) Execute a built-in action by name
+---@field set_overlay? fun(name: string, enabled?: boolean): boolean, string? Show/hide/toggle a named overlay; returns (true) or (false, err)
 
 local M = {}
 

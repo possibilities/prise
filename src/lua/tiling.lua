@@ -637,11 +637,7 @@ local M = {}
 ---@type table<string, fun()>
 local action_handlers
 
----Forward declaration for toggle_overlay (defined with action_handlers)
----@type fun(name: string)
-local toggle_overlay
-
----Forward declaration for get_active_overlay (defined alongside toggle_overlay)
+---Forward declaration for get_active_overlay (defined alongside set_overlay)
 ---@type fun(): string?, table?
 local get_active_overlay
 
@@ -705,7 +701,7 @@ function M.setup(opts)
     for name, cfg in pairs(config.overlays) do
         if cfg.key then
             config.keybinds[cfg.key] = function()
-                toggle_overlay(name)
+                M.set_overlay(name)
             end
         end
     end
@@ -2771,18 +2767,21 @@ local open_rename
 ---@type fun()
 local open_session_picker
 
----Toggle a named overlay: spawn if new, show/hide if existing
+---Set a named overlay's visibility: spawn if new, show/hide/toggle if existing.
 ---@param name string Overlay name (e.g. "floating", "lazygit")
-toggle_overlay = function(name)
+---@param enabled? boolean nil → toggle, true → ensure visible, false → ensure hidden
+---@return boolean ok
+---@return string? err Error message when ok is false
+function M.set_overlay(name, enabled)
     local cfg = config.overlays[name]
     local ost = state.overlay_state[name]
     if not cfg or not ost then
-        return
+        return false, "unknown overlay '" .. tostring(name) .. "'"
     end
 
     local tab = get_active_tab()
     if not tab then
-        return
+        return false, "no active tab"
     end
 
     tab.overlays = tab.overlays or {}
@@ -2790,7 +2789,11 @@ toggle_overlay = function(name)
     if not tab.overlays[name] then
         -- No overlay pane exists yet — spawn one (skip if already pending)
         if ost.pending then
-            return
+            return false, "overlay '" .. name .. "' spawn pending"
+        end
+        -- For ensure-hidden: nothing to do, already hidden (no pane)
+        if enabled == false then
+            return true
         end
         ost.pending = true
         local pty = get_focused_pty()
@@ -2806,9 +2809,19 @@ toggle_overlay = function(name)
             prise.spawn({ cwd = pty and pty:cwd(), cmd = spawn_cmd })
         end
     else
-        -- Toggle visibility
+        -- Pane exists — set or toggle visibility
         local overlay = tab.overlays[name]
-        overlay.visible = not overlay.visible
+        local want_visible
+        if enabled == nil then
+            want_visible = not overlay.visible
+        else
+            want_visible = enabled
+        end
+        -- Short-circuit when already in desired state
+        if overlay.visible == want_visible then
+            return true
+        end
+        overlay.visible = want_visible
         if overlay.visible then
             state.active_overlay_name = name
         else
@@ -2819,11 +2832,12 @@ toggle_overlay = function(name)
         end
         prise.request_frame()
     end
+    return true
 end
 
 ---Look up the currently-active overlay on the active tab.
 ---Returns (name, overlay) when an overlay is active, or (nil, nil) when none.
----The toggle_overlay invariant keeps state.active_overlay_name in sync with the
+---The set_overlay invariant keeps state.active_overlay_name in sync with the
 ---overlay's visible flag, so callers can rely on the returned overlay being live.
 ---@return string?, table?
 get_active_overlay = function()
@@ -3731,15 +3745,15 @@ function M.update(event)
 
         -- Check if this PTY should be assigned to a pending named overlay
         -- (mirror of state.floating.pending for the multi-overlay model added
-        -- by feat/overlay-terminals — toggle_overlay sets ost.pending = true
+        -- by feat/overlay-terminals — set_overlay sets ost.pending = true
         -- before prise.spawn, so the next pty_attach is the overlay's own pty).
         --
         -- Invariant: at most one entry in state.overlay_state has pending=true.
-        -- Enforced by toggle_overlay's early-return when ost.pending is already
-        -- set (see :2674-2676), which prevents the same overlay from re-pending.
+        -- Enforced by set_overlay's early-return when ost.pending is already
+        -- set, which prevents the same overlay from re-pending.
         -- Two *different* overlays cannot both be pending because pty_attach
-        -- runs on the same Lua VM that drives toggle_overlay — there is no
-        -- intermediate yield between toggle_overlay setting pending=true and
+        -- runs on the same Lua VM that drives set_overlay — there is no
+        -- intermediate yield between set_overlay setting pending=true and
         -- the resulting pty_attach landing here. Without this invariant,
         -- pairs() iteration order is undefined and assignment would be
         -- non-deterministic.
@@ -7323,7 +7337,6 @@ M._test = {
         return state.focused_id
     end,
     serialize_node = serialize_node,
-    toggle_overlay = toggle_overlay,
     get_active_overlay = get_active_overlay,
     action_handlers = action_handlers,
     -- Clear config.overlays between test cases so a malformed overlay from
