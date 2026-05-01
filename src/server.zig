@@ -64,6 +64,10 @@ pub const LIMITS = struct {
     pub const PENDING_FORWARDS_MAX: usize = 256;
     pub const PLUG_TOKEN_BYTES: usize = 16;
     pub const PLUG_TOKEN_HEX_LEN: usize = PLUG_TOKEN_BYTES * 2;
+    /// Grace window for a managed plug to honor SIGTERM during server
+    /// shutdown before we escalate to SIGKILL. Bounded so the server
+    /// itself cannot block indefinitely on a wedged plug.
+    pub const PLUG_SHUTDOWN_GRACE_MS: u64 = 1500;
 };
 
 /// A plug process spawned and managed by the server.
@@ -5959,14 +5963,50 @@ const Server = struct {
         }
     }
 
-    fn shutdown(self: *Server) void {
-        std.log.info("Shutting down server...", .{});
+    /// Synchronously reap one managed plug after SIGTERM has already been sent.
+    /// Polls waitpid(NOHANG) for up to PLUG_SHUTDOWN_GRACE_MS, then escalates
+    /// to SIGKILL and keeps polling.
+    fn reapManagedPlugSync(mp: *ManagedPlug) void {
+        const pid = mp.pid orelse return;
+        const poll_interval_ms: u64 = 20;
+        const grace_iterations: u64 = LIMITS.PLUG_SHUTDOWN_GRACE_MS / poll_interval_ms;
 
-        // Gate restart timer callbacks before killing children
-        self.shutting_down = true;
+        for (0..grace_iterations) |_| {
+            const res = posix.waitpid(pid, posix.W.NOHANG);
+            if (res.pid != 0) {
+                log.info("plug.{s} pid {} exited on shutdown (status {})", .{ mp.name, pid, res.status });
+                mp.pid = null;
+                return;
+            }
+            std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+        }
 
-        // Kill managed plug processes — set flag BEFORE signal to prevent
-        // onPlugExit from scheduling a restart
+        log.warn(
+            "plug.{s} pid {} ignored SIGTERM after {}ms, sending SIGKILL",
+            .{ mp.name, pid, LIMITS.PLUG_SHUTDOWN_GRACE_MS },
+        );
+        posix.kill(pid, posix.SIG.KILL) catch {};
+        while (true) {
+            const res = posix.waitpid(pid, posix.W.NOHANG);
+            if (res.pid != 0) {
+                log.info("plug.{s} pid {} reaped after SIGKILL (status {})", .{ mp.name, pid, res.status });
+                mp.pid = null;
+                return;
+            }
+            std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+        }
+    }
+
+    /// Tear down all managed plugs as part of server shutdown. SIGTERMs each
+    /// plug and cancels its async waitpid_task / restart_timer in one pass
+    /// (so plugs shut down in parallel), then synchronously reaps each one in
+    /// a second pass. Without the synchronous reap the server's own process
+    /// can exit before its plugs have, leaving them reparented to launchd as
+    /// orphans.
+    fn shutdownManagedPlugs(self: *Server) void {
+        // Pass 1: signal every plug and cancel async tasks. Setting
+        // killed_by_server BEFORE the signal prevents onPlugExit from
+        // scheduling a restart if it races us.
         for (self.managed_plugs.items) |*mp| {
             if (mp.pid) |pid| {
                 mp.killed_by_server = true;
@@ -5976,7 +6016,6 @@ const Server = struct {
                 task.cancel(self.loop) catch {};
                 mp.waitpid_task = null;
             }
-            // Cancel pending restart timers and free their context
             if (mp.restart_timer_task) |*task| {
                 task.cancel(self.loop) catch {};
                 mp.restart_timer_task = null;
@@ -5987,6 +6026,21 @@ const Server = struct {
                 mp.restart_ctx = null;
             }
         }
+
+        // Pass 2: synchronously reap. Bounded per plug by
+        // PLUG_SHUTDOWN_GRACE_MS + SIGKILL.
+        for (self.managed_plugs.items) |*mp| {
+            reapManagedPlugSync(mp);
+        }
+    }
+
+    fn shutdown(self: *Server) void {
+        std.log.info("Shutting down server...", .{});
+
+        // Gate restart timer callbacks before killing children
+        self.shutting_down = true;
+
+        self.shutdownManagedPlugs();
 
         // Cancel sweep timer before freeing its context
         if (self.sweep_timer_task) |*task| {
