@@ -63,9 +63,11 @@ from within an existing pane.
 
 **PRISE_PLUG_TOKEN**
 :   Ephemeral authentication token for plug processes. Set automatically by the
-    server when spawning a plug via `spawn_plug`. The plug must include this
-    token in its `register_plug` RPC call. A new token is generated for each
-    spawn and restart.
+    server when it spawns a plug — both for plugs initiated via the
+    **spawn_plug** RPC and for plugs declared in
+    **~/.config/prise/prise.toml** at server startup (see **prise**(5) for the
+    config schema). The plug must include this token in its **register_plug**
+    RPC call. A new token is generated for each spawn and restart.
 
 **PRISE_SOCKET**
 :   Override path for the prise server socket.

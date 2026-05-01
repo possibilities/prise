@@ -12,6 +12,7 @@ const key_parse = @import("key_parse.zig");
 const main = @import("main.zig");
 const mouse_encode = @import("mouse_encode.zig");
 const msgpack = @import("msgpack.zig");
+const plug_config = @import("plug_config.zig");
 const pty = @import("pty.zig");
 const redraw = @import("redraw.zig");
 const rpc = @import("rpc.zig");
@@ -70,12 +71,21 @@ pub const LIMITS = struct {
     pub const PLUG_SHUTDOWN_GRACE_MS: u64 = 1500;
 };
 
+/// Who initiated this managed plug. Drives the spawn_plug RPC collision check:
+/// a `.config` plug is server-owned (declared in prise.toml) and may not be
+/// reconfigured at runtime; a `.rpc` plug is client-owned (declared via the
+/// spawn_plug RPC) and keeps existing dedup semantics.
+pub const PlugOwner = enum { config, rpc };
+
 /// A plug process spawned and managed by the server.
 const ManagedPlug = struct {
     name: []const u8,
     cmd: []const []const u8,
     restart: bool,
     restart_delay_ms: u32,
+    /// Default `.rpc` so the existing RPC path keeps current semantics with
+    /// no callsite churn. The TOML-driven loader explicitly sets `.config`.
+    owner: PlugOwner = .rpc,
     token: [LIMITS.PLUG_TOKEN_HEX_LEN]u8 = undefined,
     pid: ?posix.pid_t = null,
     registered: bool = false,
@@ -4101,6 +4111,12 @@ const Server = struct {
 
         // Idempotent: if a managed plug with this name exists, check state and config
         if (self.findManagedPlug(parsed.name)) |mp| {
+            // Config-owned plugs cannot be reconfigured via RPC. Reject before
+            // any state inspection — the TOML declaration is the source of
+            // truth for a config-owned name.
+            if (mp.owner == .config) {
+                return error.PlugConfigOwned;
+            }
             const active = mp.pid != null or mp.restart_timer_task != null or mp.registered;
             if (active) {
                 if (plugCmdMatchesParsed(mp.cmd, parsed.cmd) and
@@ -4119,16 +4135,42 @@ const Server = struct {
             return error.PlugConfigConflict;
         }
 
-        // Dupe name (params are transient)
-        const owned_name = try self.allocator.dupe(u8, parsed.name);
-        errdefer self.allocator.free(owned_name);
-
-        // Dupe cmd args
+        // Dupe cmd args from msgpack values into owned strings, then hand off
+        // to the shared spawnManagedPlug helper that the TOML loader also uses.
         const owned_cmd = try self.dupePlugCmd(parsed.cmd);
         errdefer self.freePlugCmd(owned_cmd);
 
+        try self.spawnManagedPlug(
+            parsed.name,
+            owned_cmd,
+            parsed.restart,
+            parsed.restart_delay_ms,
+            .rpc,
+        );
+        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+    }
+
+    /// Spawn a child process and register it as a managed plug. Takes
+    /// ownership of `cmd` on success (frees on failure). The caller must dupe
+    /// `name` into a value the caller does not need; this helper dupes it
+    /// internally.
+    ///
+    /// Used by both the spawn_plug RPC handler and the TOML config loader.
+    /// Centralizes: name dupe, token gen, child spawn, waitpid registration,
+    /// managed_plugs.append. Reuses spawnPlugProcess unchanged.
+    fn spawnManagedPlug(
+        self: *Server,
+        name: []const u8,
+        cmd: []const []const u8,
+        restart: bool,
+        restart_delay_ms: u32,
+        owner: PlugOwner,
+    ) !void {
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+
         const token = generatePlugToken();
-        const pid = try self.spawnPlugProcess(owned_cmd, &token);
+        const pid = try self.spawnPlugProcess(cmd, &token);
         const task = try self.loop.waitpid(pid, .{
             .ptr = self,
             .cb = onPlugExit,
@@ -4136,16 +4178,16 @@ const Server = struct {
 
         try self.managed_plugs.append(self.allocator, .{
             .name = owned_name,
-            .cmd = owned_cmd,
-            .restart = parsed.restart,
-            .restart_delay_ms = parsed.restart_delay_ms,
+            .cmd = cmd,
+            .restart = restart,
+            .restart_delay_ms = restart_delay_ms,
+            .owner = owner,
             .token = token,
             .pid = pid,
             .waitpid_task = task,
         });
 
-        log.info("Spawned plug '{s}' pid={}", .{ owned_name, pid });
-        return msgpack.Value{ .string = try self.allocator.dupe(u8, "ok") };
+        log.info("Spawned plug '{s}' pid={} owner={s}", .{ owned_name, pid, @tagName(owner) });
     }
 
     /// Dupe an array of msgpack string values into owned slices.
@@ -6238,6 +6280,81 @@ const Server = struct {
         pty_instance.cwd.deinit(self.allocator);
         self.allocator.destroy(pty_instance);
     }
+
+    /// Read ~/.config/prise/prise.toml and spawn one managed plug per
+    /// `[[plug]]` block. ENOENT → no-op (server starts clean). Any other read
+    /// or parse error is FATAL: log and propagate so the caller exits.
+    /// Per-plug spawn failure is non-fatal: log a single WARN and continue.
+    fn loadConfigPlugs(self: *Server) !void {
+        const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch |err| {
+            log.err("FATAL: cannot resolve HOME for prise.toml: {s}", .{@errorName(err)});
+            return err;
+        };
+        defer self.allocator.free(home);
+
+        const path = try std.fs.path.join(self.allocator, &.{ home, ".config", "prise", "prise.toml" });
+        defer self.allocator.free(path);
+
+        const content = std.fs.cwd().readFileAlloc(self.allocator, path, 1 * 1024 * 1024) catch |err| {
+            if (err == error.FileNotFound) {
+                log.info("No prise.toml at {s} — starting with no config-declared plugs", .{path});
+                return;
+            }
+            log.err("FATAL: cannot read {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        defer self.allocator.free(content);
+
+        const decls = plug_config.parsePlugConfig(self.allocator, content) catch |err| {
+            log.err("FATAL: parse error in {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        defer plug_config.deinitDecls(self.allocator, decls);
+
+        for (decls) |decl| {
+            self.spawnConfigDecl(decl) catch |err| {
+                const cmd0 = if (decl.cmd.len > 0) decl.cmd[0] else "";
+                log.warn(
+                    "plug spawn failed name={s} cmd0={s} error={s}",
+                    .{ decl.name, cmd0, @errorName(err) },
+                );
+            };
+        }
+    }
+
+    /// Spawn a single config-declared plug. On error, the helper makes sure
+    /// no half-built ManagedPlug is left in the list — the caller logs WARN
+    /// and continues to the next decl.
+    fn spawnConfigDecl(self: *Server, decl: plug_config.PlugDecl) !void {
+        // Dupe cmd (decl is owned by deinitDecls — we need our own copy for
+        // ManagedPlug's lifetime, which exceeds the parsed decls).
+        const owned_cmd = try self.dupePlugCmdFromStrings(decl.cmd);
+        errdefer self.freePlugCmd(owned_cmd);
+
+        try self.spawnManagedPlug(
+            decl.name,
+            owned_cmd,
+            decl.restart,
+            decl.restart_delay_ms,
+            .config,
+        );
+    }
+
+    /// Dupe a slice of owned strings into fresh server-allocated slices.
+    /// Sibling of `dupePlugCmd` for the non-msgpack path.
+    fn dupePlugCmdFromStrings(self: *Server, cmd: []const []const u8) ![]const []const u8 {
+        const owned = try self.allocator.alloc([]const u8, cmd.len);
+        var i: usize = 0;
+        errdefer {
+            for (owned[0..i]) |arg| self.allocator.free(arg);
+            self.allocator.free(owned);
+        }
+        for (cmd) |arg| {
+            owned[i] = try self.allocator.dupe(u8, arg);
+            i += 1;
+        }
+        return owned;
+    }
 };
 
 fn buildPtyEntry(allocator: std.mem.Allocator, pty_instance: *const Pty) ![]msgpack.Value.KeyValue {
@@ -6424,6 +6541,14 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         }
         server.managed_plugs.deinit(allocator);
     }
+
+    // Load and spawn config-declared plugs from ~/.config/prise/prise.toml.
+    // Runs after Server struct is constructed and before the accept enqueue,
+    // so loop.waitpid registrations made by spawnManagedPlug ride alongside
+    // the same pre-`loop.run` enqueues already used for accept and signals.
+    // Failure to read/parse the config is FATAL — launchd's ThrottleInterval
+    // is the circuit breaker for malformed config.
+    try server.loadConfigPlugs();
 
     // Start accepting connections
     crash_context.record("server accepting connections", .{});
@@ -9052,6 +9177,110 @@ test "handleSpawnPlug - stopped plug is removed for re-spawn" {
 
     // The stale entry should have been removed before the spawn attempt
     try testing.expectEqual(@as(usize, 0), server.managed_plugs.items.len);
+}
+
+test "handleSpawnPlug - config-owned name rejected with PlugConfigOwned" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate a config-owned managed plug
+    const name = try testing.allocator.dupe(u8, "control-plug");
+    const cmd_arg = try testing.allocator.dupe(u8, "/usr/local/bin/control-plug");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = true,
+        .restart_delay_ms = 1000,
+        .owner = .config,
+        .pid = 12345,
+    });
+
+    // Attempt to RPC-spawn with same name (any cmd) — must reject with
+    // PlugConfigOwned regardless of whether the cmd matches.
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "/usr/local/bin/control-plug" }};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "control-plug" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    try testing.expectError(error.PlugConfigOwned, server.handleSpawnPlug(params));
+}
+
+test "handleSpawnPlug - rpc-owned name keeps existing dedup behavior" {
+    const testing = std.testing;
+
+    var loop = try io.Loop.init(testing.allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = testing.allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
+        .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
+    };
+    defer {
+        for (server.managed_plugs.items) |*mp| mp.deinit(testing.allocator);
+        server.managed_plugs.deinit(testing.allocator);
+        server.plugs.deinit();
+        server.pending_forwards.deinit();
+        server.ptys.deinit();
+        server.clients.deinit(testing.allocator);
+    }
+
+    // Pre-populate an rpc-owned managed plug (default owner = .rpc)
+    const name = try testing.allocator.dupe(u8, "echo");
+    const cmd_arg = try testing.allocator.dupe(u8, "echo");
+    const cmd = try testing.allocator.alloc([]const u8, 1);
+    cmd[0] = cmd_arg;
+    try server.managed_plugs.append(testing.allocator, .{
+        .name = name,
+        .cmd = cmd,
+        .restart = false,
+        .restart_delay_ms = 1000,
+        .pid = 12345,
+    });
+
+    // Same name + same cmd + matching defaults → idempotent "ok"
+    var cmd_vals: [1]msgpack.Value = .{.{ .string = "echo" }};
+    var kv_buf: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "name" }, .value = .{ .string = "echo" } },
+        .{ .key = .{ .string = "cmd" }, .value = .{ .array = &cmd_vals } },
+    };
+    const params: msgpack.Value = .{ .map = &kv_buf };
+
+    const result = try server.handleSpawnPlug(params);
+    try testing.expectEqualStrings("ok", result.string);
+    testing.allocator.free(result.string);
 }
 
 test "plugCmdMatchesParsed - matching commands" {

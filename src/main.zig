@@ -1842,6 +1842,7 @@ test {
     _ = @import("keybind_matcher.zig");
     _ = @import("lua_msgpack.zig");
     _ = @import("crash_context.zig");
+    _ = @import("plug_config.zig");
 
     if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {
         _ = @import("io/kqueue.zig");

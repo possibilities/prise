@@ -41,6 +41,12 @@ pub fn build(b: *std.Build) void {
     const zeit = b.dependency("zeit", .{});
     exe_mod.addImport("zeit", zeit.module("zeit"));
 
+    const zig_toml = b.dependency("zig_toml", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("toml", zig_toml.module("toml"));
+
     const exe = b.addExecutable(.{
         .name = "prise",
         .root_module = exe_mod,
