@@ -159,9 +159,6 @@ const Pty = struct {
     // Pointer to server for callbacks (opaque to avoid circular type dependency)
     server_ptr: *anyopaque = undefined,
 
-    // Command to write to PTY after first output (consumed on use)
-    cmd: ?[]const u8 = null,
-
     fn init(allocator: std.mem.Allocator, id: usize, process_instance: pty.Process, size: pty.Winsize) !*Pty {
         // Precondition: terminal size must be positive (zero would crash ghostty-vt)
         std.debug.assert(size.ws_col > 0);
@@ -2329,9 +2326,9 @@ const Server = struct {
 
         // argv, when present, bypasses the login shell entirely and execs
         // directly in the PTY child. This eliminates the visible shell-prompt
-        // flash that occurs with the cmd-on-first-output path, which must
-        // first spawn the shell, source rc files, and paint a prompt before
-        // the cmd bytes can be written. cmd and argv are mutually exclusive
+        // flash that occurs with the cmd path, which must first spawn the
+        // shell, source rc files, and paint a prompt before the cmd bytes
+        // are written at spawn time. cmd and argv are mutually exclusive
         // from the caller's perspective; argv takes precedence here.
         var argv_buf: [LIMITS.SPAWN_ARGV_MAX][]const u8 = undefined;
         var argv_slice: []const []const u8 = &.{shell};
@@ -2352,14 +2349,6 @@ const Server = struct {
 
         const pty_instance = try Pty.init(self.allocator, pty_id, process, parsed.size);
         pty_instance.server_ptr = self;
-
-        // argv-mode spawns never use the type-on-first-output cmd mechanism
-        // since the target program is already running as the PTY child.
-        if (parsed.argv == null) {
-            if (parsed.cmd) |cmd| {
-                pty_instance.cmd = try self.allocator.dupe(u8, cmd);
-            }
-        }
 
         try self.ptys.put(pty_id, pty_instance);
         std.debug.assert(self.ptys.count() <= LIMITS.PTYS_MAX);
@@ -3728,17 +3717,6 @@ const Server = struct {
                     return;
                 }
 
-                // Write pending cmd on first output (shell is producing bytes = ready for input)
-                if (pty_instance.cmd) |cmd| {
-                    _ = posix.write(pty_instance.process.master, cmd) catch |err| {
-                        log.err("Failed to write cmd to PTY {}: {}", .{ pty_instance.id, err });
-                    };
-                    _ = posix.write(pty_instance.process.master, "\n") catch {};
-                    server.allocator.free(cmd);
-                    pty_instance.cmd = null;
-                    log.info("Wrote cmd to PTY {}", .{pty_instance.id});
-                }
-
                 const now = std.time.milliTimestamp();
                 // 8ms (~120fps) balances responsiveness with efficiency. Lower values
                 // increase CPU usage with diminishing perceptual benefit; higher values
@@ -3794,11 +3772,6 @@ const Server = struct {
         if (pty_instance.read_thread) |thread| {
             thread.join();
             pty_instance.read_thread = null;
-        }
-
-        if (pty_instance.cmd) |cmd| {
-            self.allocator.free(cmd);
-            pty_instance.cmd = null;
         }
 
         // Free PTY resources

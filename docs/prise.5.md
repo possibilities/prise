@@ -177,8 +177,8 @@ Each layout has:
 :   `{ type = "pane", cwd = "...", cmd = "...", ratio = 0.5 }`
 
 The **cmd** field can also be passed as a spawn option. The command is written
-to the PTY after the shell produces its first output (i.e., when the shell is
-ready for input).
+to the PTY master immediately at spawn time. The kernel queues the bytes in
+the line discipline buffer; the shell consumes them on its first read.
 
 **split**
 :   `{ type = "split", direction = "horizontal"|"vertical", ratio = 0.5, children = { ... } }`
