@@ -181,7 +181,9 @@ to the PTY after the shell produces its first output (i.e., when the shell is
 ready for input).
 
 **split**
-:   `{ type = "split", direction = "horizontal"|"vertical", ratio = 0.5, children = { ... } }`
+:   `{ type = "split", direction = "horizontal"|"vertical", children = { ... } }`
+
+Ratios live on children, not on the split node. A child with no ratio gets an equal share of remaining space (Pass 3). A child with `ratio = r` is sized at `r * available` (Pass 2). For an asymmetric 70/30 split: set `ratio = 0.7` on `children[1]` and `ratio = 0.3` on `children[2]`. For an equal split, omit ratio on all children.
 
 **floating**
 :   Optional floating pane for a tab. `{ pane = { ... }, visible = true, width = 120, height = 40 }`
