@@ -4969,72 +4969,6 @@ const Server = struct {
         self.forwardToSubscribedPlugs("pty_spawned", msg_bytes, null);
     }
 
-    /// Place a PTY into a session state file so it is discovered on next attach.
-    /// Used when no TUI client is connected to receive the pty_spawned event.
-    fn placePtyInSessionFile(self: *Server, session_name: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8) !void {
-        // Validate session name (no path traversal)
-        if (session_name.len == 0) return error.InvalidSessionName;
-        if (std.mem.indexOfAny(u8, session_name, "/\\") != null) return error.InvalidSessionName;
-        if (std.mem.indexOf(u8, session_name, "..") != null) return error.InvalidSessionName;
-        if (std.mem.indexOfScalar(u8, session_name, 0) != null) return error.InvalidSessionName;
-
-        const home = posix.getenv("HOME") orelse return error.NoHomeDirectory;
-        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
-        defer self.allocator.free(state_dir);
-
-        // Ensure directory exists
-        std.fs.makeDirAbsolute(state_dir) catch |err| {
-            if (err != error.PathAlreadyExists) {
-                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
-                std.fs.makeDirAbsolute(parent) catch |e| {
-                    if (e != error.PathAlreadyExists) return e;
-                };
-                std.fs.makeDirAbsolute(state_dir) catch |e| {
-                    if (e != error.PathAlreadyExists) return e;
-                };
-            }
-        };
-
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
-        defer self.allocator.free(filename);
-
-        const path = try std.fs.path.join(self.allocator, &.{ state_dir, filename });
-        defer self.allocator.free(path);
-
-        const validity = self.start_time_ms;
-
-        // Try to read existing file
-        if (std.fs.openFileAbsolute(path, .{})) |file| {
-            defer file.close();
-            const existing = try file.readToEndAlloc(self.allocator, 1024 * 1024);
-            defer self.allocator.free(existing);
-            try self.appendTabToSessionFile(path, existing, pty_id, cwd, tab_title, validity);
-        } else |_| {
-            try self.writeNewSessionFile(path, pty_id, cwd, tab_title, validity);
-        }
-
-        log.info("Placed PTY {d} in session file '{s}' (no TUI clients)", .{ pty_id, session_name });
-    }
-
-    /// Create a new session file with a single tab containing the given PTY.
-    fn writeNewSessionFile(self: *Server, path: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
-        const Pane = struct { type: []const u8, id: u32, pty_id: usize, cwd: []const u8 };
-        const Tab = struct { id: u32, title: ?[]const u8, root: Pane, last_focused_id: u32 };
-        const Session = struct { pty_validity: i64, tabs: []const Tab, active_tab: u32, next_split_id: u32, next_tab_id: u32 };
-
-        const pane: Pane = .{ .type = "pane", .id = 1, .pty_id = pty_id, .cwd = cwd };
-        const tab: Tab = .{ .id = 1, .title = tab_title, .root = pane, .last_focused_id = 1 };
-        const tabs = [_]Tab{tab};
-        const session: Session = .{ .pty_validity = validity, .tabs = &tabs, .active_tab = 1, .next_split_id = 2, .next_tab_id = 2 };
-
-        const json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(session, .{})});
-        defer self.allocator.free(json);
-
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(json);
-    }
-
     /// Append a new tab to an existing session JSON file.
     fn appendTabToSessionFile(self: *Server, path: []const u8, existing_json: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, existing_json, .{});
@@ -5200,46 +5134,6 @@ const Server = struct {
             else => {},
         }
         return false;
-    }
-
-    /// Build and send pty_spawned notification to all clients
-    fn sendPtySpawned(self: *Server, pty_id: usize, cwd: []const u8, session: ?[]const u8, tab: ?[]const u8, title: ?[]const u8) !void {
-        var field_count: usize = 2; // id + cwd always present
-        if (session != null) field_count += 1;
-        if (tab != null) field_count += 1;
-        if (title != null) field_count += 1;
-
-        const params = try self.allocator.alloc(msgpack.Value.KeyValue, field_count);
-        defer self.allocator.free(params);
-
-        var idx: usize = 0;
-        params[idx] = .{ .key = .{ .string = "id" }, .value = .{ .unsigned = pty_id } };
-        idx += 1;
-        params[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
-        idx += 1;
-        if (session) |s| {
-            params[idx] = .{ .key = .{ .string = "session" }, .value = .{ .string = s } };
-            idx += 1;
-        }
-        if (tab) |t| {
-            params[idx] = .{ .key = .{ .string = "tab" }, .value = .{ .string = t } };
-            idx += 1;
-        }
-        if (title) |t| {
-            params[idx] = .{ .key = .{ .string = "title" }, .value = .{ .string = t } };
-            idx += 1;
-        }
-
-        const params_value = msgpack.Value{ .map = params };
-        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "pty_spawned", params_value });
-        defer self.allocator.free(msg_bytes);
-
-        log.info("Sending pty_spawned for pty {}", .{pty_id});
-
-        // Send to all clients
-        for (self.clients.items) |client| {
-            try client.sendData(self.loop, msg_bytes);
-        }
     }
 
     /// Describes a "split into existing tab" placement: the new PTY becomes
