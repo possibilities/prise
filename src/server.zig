@@ -370,7 +370,6 @@ const Pty = struct {
         self.clients.deinit(allocator);
         self.title.deinit(allocator);
         self.cwd.deinit(allocator);
-        if (self.cmd) |c| allocator.free(c);
         allocator.destroy(self);
     }
 
