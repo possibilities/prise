@@ -2066,6 +2066,32 @@ const Server = struct {
         session: ?[]const u8,
         tab: ?[]const u8,
         title: ?[]const u8,
+        /// When set, the new PTY is placed as a split sibling of the pane
+        /// with this pty_id rather than as a new tab. Used by callers that
+        /// want a stacked or side-by-side layout in detached mode (e.g.
+        /// `prisectl start-arthack` building a single dash tab with two
+        /// panes). When null, behavior matches the original append-tab path.
+        split_target_pty_id: ?usize,
+        /// Layout direction for the new split node. "col" stacks panes
+        /// vertically (top/bottom), "row" places them side-by-side (left/
+        /// right). Mirrors the in-memory `tiling.lua` direction tokens
+        /// (split_vertical → "col", split_horizontal → "row").
+        split_direction: SplitDirection,
+        /// Initial ratio of the new split node. Honored by the layout
+        /// renderer (`tiling.lua:render_node`); 0.5 is an even split.
+        split_ratio: f64,
+    };
+
+    const SplitDirection = enum {
+        col,
+        row,
+
+        fn toString(self: SplitDirection) []const u8 {
+            return switch (self) {
+                .col => "col",
+                .row => "row",
+            };
+        }
     };
 
     fn parseSpawnPtyParams(params: msgpack.Value) ParsedSpawnPty {
@@ -2080,6 +2106,9 @@ const Server = struct {
         var session: ?[]const u8 = null;
         var tab: ?[]const u8 = null;
         var title: ?[]const u8 = null;
+        var split_target_pty_id: ?usize = null;
+        var split_direction: SplitDirection = .col;
+        var split_ratio: f64 = 0.5;
 
         if (params == .map) {
             for (params.map) |kv| {
@@ -2106,6 +2135,37 @@ const Server = struct {
                     tab = kv.value.string;
                 } else if (std.mem.eql(u8, kv.key.string, "title") and kv.value == .string) {
                     title = kv.value.string;
+                } else if (std.mem.eql(u8, kv.key.string, "split_target_pty_id")) {
+                    // Accept both .unsigned (msgpack uint) and .integer
+                    // (msgpack signed int). Negative or wrong-type values
+                    // leave split_target_pty_id null, matching the
+                    // "missing field" path — callers that supply garbage
+                    // will fall through to append-tab semantics rather
+                    // than failing the RPC, mirroring how cmd/cwd/title
+                    // parse errors are silently dropped.
+                    if (kv.value == .unsigned) {
+                        split_target_pty_id = @intCast(kv.value.unsigned);
+                    } else if (kv.value == .integer and kv.value.integer >= 0) {
+                        split_target_pty_id = @intCast(kv.value.integer);
+                    }
+                } else if (std.mem.eql(u8, kv.key.string, "split_direction") and kv.value == .string) {
+                    if (std.mem.eql(u8, kv.value.string, "row")) {
+                        split_direction = .row;
+                    } else if (std.mem.eql(u8, kv.value.string, "col")) {
+                        split_direction = .col;
+                    }
+                } else if (std.mem.eql(u8, kv.key.string, "split_ratio")) {
+                    // Accept .float for the canonical msgpack float type;
+                    // also accept .unsigned/.integer (e.g. ratio = 1) so a
+                    // caller passing an int doesn't silently get the
+                    // default 0.5.
+                    if (kv.value == .float) {
+                        split_ratio = kv.value.float;
+                    } else if (kv.value == .unsigned) {
+                        split_ratio = @floatFromInt(kv.value.unsigned);
+                    } else if (kv.value == .integer) {
+                        split_ratio = @floatFromInt(kv.value.integer);
+                    }
                 }
             }
         }
@@ -2126,6 +2186,9 @@ const Server = struct {
             .session = session,
             .tab = tab,
             .title = title,
+            .split_target_pty_id = split_target_pty_id,
+            .split_direction = split_direction,
+            .split_ratio = split_ratio,
         };
     }
 
@@ -2350,7 +2413,12 @@ const Server = struct {
         // record — the PTY will be discovered on next attach.
         if (parsed.session) |session_name| {
             const tab_title = parsed.tab orelse parsed.title;
-            self.placePtyInSessionFile(session_name, pty_id, cwd orelse "", tab_title) catch |err| {
+            const split_spec: ?SplitSpec = if (parsed.split_target_pty_id) |target| .{
+                .target_pty_id = target,
+                .direction = parsed.split_direction,
+                .ratio = parsed.split_ratio,
+            } else null;
+            self.placePtyInSessionFile(session_name, pty_id, cwd orelse "", tab_title, split_spec) catch |err| {
                 log.warn("Failed to place PTY {} in session file '{s}': {}", .{ pty_id, session_name, err });
             };
         }
@@ -2966,9 +3034,36 @@ const Server = struct {
         }
     }
 
+    /// Describes a "split into existing tab" placement: the new PTY becomes
+    /// a sibling of the targeted pane inside its tab's existing pane tree,
+    /// not a brand-new tab. Honored only by the detached-mode write path
+    /// (`placePtyInSessionFile`); when a TUI client is attached, the
+    /// runtime tiling layer governs placement instead.
+    const SplitSpec = struct {
+        target_pty_id: usize,
+        direction: SplitDirection,
+        ratio: f64,
+    };
+
     /// Place a PTY into a session state file so it is discovered on next attach.
     /// Used when no TUI client is connected to receive the pty_spawned event.
-    fn placePtyInSessionFile(self: *Server, session_name: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8) !void {
+    ///
+    /// When `split` is non-null and the targeted pty_id is found in the
+    /// session file, the new PTY is added as a sibling pane inside the
+    /// target's tab — its single-pane root is promoted to a split node.
+    /// When `split` is null, the new PTY lands as a new tab (legacy
+    /// append-tab semantics; this is the path every existing caller hits).
+    /// Target-not-found is intentionally a hard error rather than a silent
+    /// fallback to append-tab — falling back masks the bug the split path
+    /// was added to fix (the human chose this layout for a reason).
+    fn placePtyInSessionFile(
+        self: *Server,
+        session_name: []const u8,
+        pty_id: usize,
+        cwd: []const u8,
+        tab_title: ?[]const u8,
+        split: ?SplitSpec,
+    ) !void {
         // Validate session name (no path traversal)
         if (session_name.len == 0) return error.InvalidSessionName;
         if (std.mem.indexOfAny(u8, session_name, "/\\") != null) return error.InvalidSessionName;
@@ -3005,8 +3100,16 @@ const Server = struct {
             defer file.close();
             const existing = try file.readToEndAlloc(self.allocator, 1024 * 1024);
             defer self.allocator.free(existing);
-            try self.appendTabToSessionFile(path, existing, pty_id, cwd, tab_title, validity);
+            if (split) |spec| {
+                try self.splitTabContainingPtyId(path, existing, pty_id, cwd, spec, validity);
+            } else {
+                try self.appendTabToSessionFile(path, existing, pty_id, cwd, tab_title, validity);
+            }
         } else |_| {
+            // No existing session file: split params have no anchor to
+            // target, so a split-mode call here is a usage error rather
+            // than a "create a new file with one pane" fallback.
+            if (split != null) return error.SplitTargetNotFound;
             try self.writeNewSessionFile(path, pty_id, cwd, tab_title, validity);
         }
 
@@ -3119,6 +3222,220 @@ const Server = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(output);
+    }
+
+    /// Split the tab containing `spec.target_pty_id` into a two-pane split,
+    /// then write the updated session JSON back to disk. Errors with
+    /// `error.SplitTargetNotFound` if no tab in the file references
+    /// `spec.target_pty_id` — the caller (placePtyInSessionFile) treats
+    /// this as a hard failure rather than falling back to append-tab,
+    /// because falling back masks the bug the split path was added to fix.
+    fn splitTabContainingPtyId(
+        self: *Server,
+        path: []const u8,
+        existing_json: []const u8,
+        new_pty_id: usize,
+        cwd: []const u8,
+        spec: SplitSpec,
+        validity: i64,
+    ) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, existing_json, .{});
+        defer parsed.deinit();
+
+        const arena = parsed.arena.allocator();
+        var root = &parsed.value.object;
+
+        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
+        if (tabs_val.* != .array) return error.InvalidSessionFile;
+
+        // Duplicate guard: if the new pty_id is already in the tree (server
+        // bounce + spawn-fallback retry), skip the write. Mirrors the
+        // append-tab path's no-op-on-duplicate.
+        if (tabsContainPtyId(tabs_val.*, @intCast(new_pty_id))) |host_tab_id| {
+            log.warn(
+                "splitTabContainingPtyId: pty_id={d} already in session file {s} at tab_id={d} — skipping write",
+                .{ new_pty_id, path, host_tab_id },
+            );
+            return;
+        }
+
+        const next_split_val = root.get("next_split_id") orelse return error.InvalidSessionFile;
+        const next_split_id = if (next_split_val == .integer) next_split_val.integer else return error.InvalidSessionFile;
+
+        // Allocate two ids: one for the split node, one for the new pane
+        // child. The original pane keeps its existing id. Counter bump is
+        // exactly +2 per split — verified by inline test.
+        const split_node_id = next_split_id;
+        const new_pane_id = next_split_id + 1;
+
+        // Apply the split in-place on the parsed tree.
+        const file_pty_id = try splitTargetPaneInTabs(
+            arena,
+            tabs_val,
+            spec,
+            new_pane_id,
+            split_node_id,
+            cwd,
+            new_pty_id,
+        );
+        _ = file_pty_id;
+
+        try root.put("next_split_id", .{ .integer = next_split_id + 2 });
+        try root.put("pty_validity", .{ .integer = validity });
+
+        const output = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+        defer self.allocator.free(output);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(output);
+    }
+
+    /// Pure tree mutation: find the tab whose root pane references
+    /// `spec.target_pty_id`, replace that root pane with a split node
+    /// containing the original pane and a new sibling pane, and update
+    /// `last_focused_id` to the new pane (so attach focus lands there).
+    /// Returns the file-pty_id assigned to the new pane (after the
+    /// bounced-server collision remap), or `error.SplitTargetNotFound` if
+    /// no eligible tab is present. Out of scope for v1: targeted pane
+    /// already inside an existing split — fails with
+    /// `error.SplitTargetIsSplitChild` rather than guessing where to land.
+    fn splitTargetPaneInTabs(
+        arena: std.mem.Allocator,
+        tabs_val: *std.json.Value,
+        spec: SplitSpec,
+        new_pane_id: i64,
+        split_node_id: i64,
+        cwd: []const u8,
+        new_pty_id: usize,
+    ) !i64 {
+        const target_i64: i64 = @intCast(spec.target_pty_id);
+
+        for (tabs_val.array.items) |*tab_val| {
+            if (tab_val.* != .object) continue;
+            var tab_obj = &tab_val.*.object;
+            const root_val = tab_obj.getPtr("root") orelse continue;
+            if (root_val.* != .object) continue;
+
+            const type_val = root_val.object.get("type") orelse continue;
+            if (type_val != .string) continue;
+
+            // v1 only handles tabs whose root is a single pane. If the tab
+            // is already split, fail visibly — promotion-into-split is a
+            // future task, and falling back to append-tab is the bug.
+            if (!std.mem.eql(u8, type_val.string, "pane")) {
+                if (paneSubtreeContainsPtyId(root_val.*, target_i64)) {
+                    return error.SplitTargetIsSplitChild;
+                }
+                continue;
+            }
+
+            const pid_val = root_val.object.get("pty_id") orelse continue;
+            if (pid_val != .integer or pid_val.integer != target_i64) continue;
+
+            // Found the target. Remap the new pty_id past any existing
+            // pane pty_ids elsewhere in the file (bounced-server collision
+            // guard, parity with appendTabToSessionFile).
+            const file_pty_id = remappedFilePtyId(tabs_val.*, new_pty_id);
+            try promoteRootPaneToSplit(
+                arena,
+                tab_obj,
+                root_val,
+                spec,
+                new_pane_id,
+                split_node_id,
+                cwd,
+                file_pty_id,
+            );
+            return file_pty_id;
+        }
+
+        return error.SplitTargetNotFound;
+    }
+
+    /// Build the new split node + new pane, replace the tab's root with it,
+    /// and update `last_focused_id` to the new pane. Caller has already
+    /// confirmed `root_val.*` is a pane node referencing the target pty_id.
+    fn promoteRootPaneToSplit(
+        arena: std.mem.Allocator,
+        tab_obj: *std.json.ObjectMap,
+        root_val: *std.json.Value,
+        spec: SplitSpec,
+        new_pane_id: i64,
+        split_node_id: i64,
+        cwd: []const u8,
+        file_pty_id: i64,
+    ) !void {
+        const original_pane = root_val.*;
+
+        var new_pane_obj = std.json.ObjectMap.init(arena);
+        try new_pane_obj.put("type", .{ .string = "pane" });
+        try new_pane_obj.put("id", .{ .integer = new_pane_id });
+        try new_pane_obj.put("pty_id", .{ .integer = file_pty_id });
+        try new_pane_obj.put("cwd", .{ .string = cwd });
+
+        var children = std.json.Array.init(arena);
+        try children.append(original_pane);
+        try children.append(.{ .object = new_pane_obj });
+
+        var split_obj = std.json.ObjectMap.init(arena);
+        try split_obj.put("type", .{ .string = "split" });
+        try split_obj.put("split_id", .{ .integer = split_node_id });
+        try split_obj.put("direction", .{ .string = spec.direction.toString() });
+        try split_obj.put("ratio", .{ .float = spec.ratio });
+        try split_obj.put("children", .{ .array = children });
+
+        root_val.* = .{ .object = split_obj };
+
+        // last_focused_id → new pane so the attached client lands there.
+        // Stale focus on the original pane is harmless visually, but the
+        // human's intent (e.g. "type into planctl watch") wants focus on
+        // the freshly-spawned pane.
+        try tab_obj.put("last_focused_id", .{ .integer = new_pane_id });
+    }
+
+    /// Bounced-server pty_id collision remap: scan all panes in the file
+    /// and bump `proposed` past any existing pty_id so the new pane gets a
+    /// unique id. Mirrors the inline remap in appendTabToSessionFile.
+    fn remappedFilePtyId(tabs_val: std.json.Value, proposed: usize) i64 {
+        var file_pty_id: i64 = @intCast(proposed);
+        if (tabs_val != .array) return file_pty_id;
+        for (tabs_val.array.items) |tab_entry| {
+            file_pty_id = bumpPastPanePtyIds(tab_entry, file_pty_id);
+        }
+        return file_pty_id;
+    }
+
+    /// Walk a JSON value (tab, pane, split, or anything in between) and
+    /// bump `current` past any pane's pty_id encountered. Pure tree walk;
+    /// does not mutate. Used by remappedFilePtyId — split into a helper so
+    /// the recursion stays readable inside the 70-line cap.
+    fn bumpPastPanePtyIds(value: std.json.Value, current: i64) i64 {
+        var max_seen: i64 = current;
+        switch (value) {
+            .object => |obj| {
+                if (obj.get("type")) |type_val| {
+                    if (type_val == .string and std.mem.eql(u8, type_val.string, "pane")) {
+                        if (obj.get("pty_id")) |pid_val| {
+                            if (pid_val == .integer and pid_val.integer >= max_seen) {
+                                max_seen = pid_val.integer + 1;
+                            }
+                        }
+                    }
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    max_seen = bumpPastPanePtyIds(entry.value_ptr.*, max_seen);
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    max_seen = bumpPastPanePtyIds(item, max_seen);
+                }
+            },
+            else => {},
+        }
+        return max_seen;
     }
 
     /// Compute the 0-based insert index for a new tab in a session file's
@@ -3909,6 +4226,44 @@ test "parseSpawnPtyParams" {
 
     // Without argv param - null
     try testing.expectEqual(@as(?[]const msgpack.Value, null), p1.argv);
+
+    // Defaults for split-related fields when missing.
+    try testing.expectEqual(@as(?usize, null), p1.split_target_pty_id);
+    try testing.expectEqual(Server.SplitDirection.col, p1.split_direction);
+    try testing.expectEqual(@as(f64, 0.5), p1.split_ratio);
+
+    // With split params: col / row direction, integer + float ratio.
+    var params_with_split_col = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "split_target_pty_id" }, .value = .{ .unsigned = 7 } },
+        .{ .key = .{ .string = "split_direction" }, .value = .{ .string = "col" } },
+        .{ .key = .{ .string = "split_ratio" }, .value = .{ .float = 0.7 } },
+    };
+    const p7 = Server.parseSpawnPtyParams(.{ .map = &params_with_split_col });
+    try testing.expectEqual(@as(?usize, 7), p7.split_target_pty_id);
+    try testing.expectEqual(Server.SplitDirection.col, p7.split_direction);
+    try testing.expectEqual(@as(f64, 0.7), p7.split_ratio);
+
+    var params_with_split_row = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "split_target_pty_id" }, .value = .{ .integer = 9 } },
+        .{ .key = .{ .string = "split_direction" }, .value = .{ .string = "row" } },
+    };
+    const p8 = Server.parseSpawnPtyParams(.{ .map = &params_with_split_row });
+    try testing.expectEqual(@as(?usize, 9), p8.split_target_pty_id);
+    try testing.expectEqual(Server.SplitDirection.row, p8.split_direction);
+    // Ratio defaults to 0.5 when omitted.
+    try testing.expectEqual(@as(f64, 0.5), p8.split_ratio);
+
+    // Reject path: wrong-type / negative split_target_pty_id leaves it null,
+    // wrong-type direction stays at default .col, integer ratio coerces.
+    var params_split_rejects = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "split_target_pty_id" }, .value = .{ .integer = -3 } },
+        .{ .key = .{ .string = "split_direction" }, .value = .{ .string = "diagonal" } },
+        .{ .key = .{ .string = "split_ratio" }, .value = .{ .unsigned = 1 } },
+    };
+    const p9 = Server.parseSpawnPtyParams(.{ .map = &params_split_rejects });
+    try testing.expectEqual(@as(?usize, null), p9.split_target_pty_id);
+    try testing.expectEqual(Server.SplitDirection.col, p9.split_direction);
+    try testing.expectEqual(@as(f64, 1.0), p9.split_ratio);
 }
 
 test "prepareSpawnEnv" {
@@ -4343,4 +4698,221 @@ test "placePtyInSessionFile active_tab=0 (zero) floors to 1, insert index 1 (0-b
     const insert_idx = Server.computeSessionFileInsertIndex(active_tab, 3);
     // Zero / negative active_tab values route to 1 via the floored guard.
     try testing.expectEqual(@as(usize, 1), insert_idx);
+}
+
+// ========================================================================
+// splitTargetPaneInTabs tests (fn-302-spawn-pty-split-for-start-arthack-dash.1)
+// ========================================================================
+// The pure-tree-mutation core of the new split path. We test against a
+// parsed JSON value tree rather than spinning up a Server + filesystem,
+// matching the computeSessionFileInsertIndex template.
+
+test "splitTargetPaneInTabs promotes single-pane root into a stacked split" {
+    const testing = std.testing;
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "title": "dash", "root": {"type": "pane", "id": 1, "pty_id": 7, "cwd": "/tmp"}, "last_focused_id": 1}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const tabs_val = parsed.value.object.getPtr("tabs").?;
+    const spec: Server.SplitSpec = .{
+        .target_pty_id = 7,
+        .direction = .col,
+        .ratio = 0.5,
+    };
+
+    const file_pty_id = try Server.splitTargetPaneInTabs(
+        parsed.arena.allocator(),
+        tabs_val,
+        spec,
+        99, // new pane id
+        88, // split node id
+        "/home/user",
+        42, // new pty_id
+    );
+    try testing.expectEqual(@as(i64, 42), file_pty_id);
+
+    // After mutation: tab 1's root is a split with two pane children, the
+    // first being the original pane (id=1, pty_id=7) and the second the
+    // new pane (id=99, pty_id=42). The split itself has split_id=88,
+    // direction="col", ratio=0.5. last_focused_id moved to 99.
+    const tab_obj = tabs_val.array.items[0].object;
+    const root_obj = tab_obj.get("root").?.object;
+    try testing.expectEqualStrings("split", root_obj.get("type").?.string);
+    try testing.expectEqual(@as(i64, 88), root_obj.get("split_id").?.integer);
+    try testing.expectEqualStrings("col", root_obj.get("direction").?.string);
+    try testing.expectEqual(@as(f64, 0.5), root_obj.get("ratio").?.float);
+
+    const children = root_obj.get("children").?.array.items;
+    try testing.expectEqual(@as(usize, 2), children.len);
+
+    const original = children[0].object;
+    try testing.expectEqualStrings("pane", original.get("type").?.string);
+    try testing.expectEqual(@as(i64, 1), original.get("id").?.integer);
+    try testing.expectEqual(@as(i64, 7), original.get("pty_id").?.integer);
+
+    const new_pane = children[1].object;
+    try testing.expectEqualStrings("pane", new_pane.get("type").?.string);
+    try testing.expectEqual(@as(i64, 99), new_pane.get("id").?.integer);
+    try testing.expectEqual(@as(i64, 42), new_pane.get("pty_id").?.integer);
+    try testing.expectEqualStrings("/home/user", new_pane.get("cwd").?.string);
+
+    try testing.expectEqual(@as(i64, 99), tab_obj.get("last_focused_id").?.integer);
+}
+
+test "splitTargetPaneInTabs returns SplitTargetNotFound when pty_id absent" {
+    const testing = std.testing;
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "id": 1, "pty_id": 7, "cwd": "/tmp"}, "last_focused_id": 1}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const tabs_val = parsed.value.object.getPtr("tabs").?;
+    const spec: Server.SplitSpec = .{
+        .target_pty_id = 999, // not present
+        .direction = .col,
+        .ratio = 0.5,
+    };
+
+    try testing.expectError(error.SplitTargetNotFound, Server.splitTargetPaneInTabs(
+        parsed.arena.allocator(),
+        tabs_val,
+        spec,
+        99,
+        88,
+        "/home/user",
+        42,
+    ));
+}
+
+test "splitTargetPaneInTabs rejects target inside an existing split (v1 scope)" {
+    const testing = std.testing;
+    // Tab 2's root is already a split containing pty_id=11. v1 only handles
+    // single-pane-root tabs; promotion-into-existing-split is a future task.
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "id": 1, "pty_id": 7, "cwd": "/tmp"}, "last_focused_id": 1},
+        \\    {"id": 2, "root": {
+        \\      "type": "split",
+        \\      "split_id": 5,
+        \\      "direction": "col",
+        \\      "ratio": 0.5,
+        \\      "children": [
+        \\        {"type": "pane", "id": 2, "pty_id": 11, "cwd": "/a"},
+        \\        {"type": "pane", "id": 3, "pty_id": 13, "cwd": "/b"}
+        \\      ]
+        \\    }, "last_focused_id": 2}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const tabs_val = parsed.value.object.getPtr("tabs").?;
+    const spec: Server.SplitSpec = .{
+        .target_pty_id = 11,
+        .direction = .col,
+        .ratio = 0.5,
+    };
+
+    try testing.expectError(error.SplitTargetIsSplitChild, Server.splitTargetPaneInTabs(
+        parsed.arena.allocator(),
+        tabs_val,
+        spec,
+        99,
+        88,
+        "/home/user",
+        42,
+    ));
+}
+
+test "splitTargetPaneInTabs remaps file_pty_id past existing pty_ids on collision" {
+    const testing = std.testing;
+    // The new pty_id (7) collides with tab 2's existing pane pty_id (7).
+    // The remap should bump file_pty_id to one past the highest pane
+    // pty_id seen anywhere in the file (mirrors appendTabToSessionFile).
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "id": 1, "pty_id": 3, "cwd": "/tmp"}, "last_focused_id": 1},
+        \\    {"id": 2, "root": {"type": "pane", "id": 2, "pty_id": 7, "cwd": "/a"}, "last_focused_id": 2}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const tabs_val = parsed.value.object.getPtr("tabs").?;
+    const spec: Server.SplitSpec = .{
+        .target_pty_id = 3, // split into tab 1
+        .direction = .col,
+        .ratio = 0.5,
+    };
+
+    const file_pty_id = try Server.splitTargetPaneInTabs(
+        parsed.arena.allocator(),
+        tabs_val,
+        spec,
+        99,
+        88,
+        "/home/user",
+        7, // collides with tab 2's pty_id=7
+    );
+    // 7 collided → bumped past max (7) to 8.
+    try testing.expectEqual(@as(i64, 8), file_pty_id);
+}
+
+test "splitTargetPaneInTabs honors direction=row and a non-default ratio" {
+    const testing = std.testing;
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "id": 1, "pty_id": 7, "cwd": "/tmp"}, "last_focused_id": 1}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const tabs_val = parsed.value.object.getPtr("tabs").?;
+    const spec: Server.SplitSpec = .{
+        .target_pty_id = 7,
+        .direction = .row,
+        .ratio = 0.7,
+    };
+
+    _ = try Server.splitTargetPaneInTabs(
+        parsed.arena.allocator(),
+        tabs_val,
+        spec,
+        99,
+        88,
+        "/home/user",
+        42,
+    );
+
+    const root_obj = tabs_val.array.items[0].object.get("root").?.object;
+    try testing.expectEqualStrings("row", root_obj.get("direction").?.string);
+    try testing.expectEqual(@as(f64, 0.7), root_obj.get("ratio").?.float);
+}
+
+test "bumpPastPanePtyIds returns input when tabs array contains no panes" {
+    const testing = std.testing;
+    // Empty tabs array — nothing to scan, current value passes through.
+    const json = "{\"tabs\": []}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const tabs_val = parsed.value.object.get("tabs").?;
+    try testing.expectEqual(@as(i64, 5), Server.bumpPastPanePtyIds(tabs_val, 5));
 }
