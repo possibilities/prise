@@ -714,6 +714,52 @@ function M.list_tab_pty_ids(pty_id)
     return ids
 end
 
+---Classify whether a break_pane operation is safe for the given pty_id.
+---Pure read-only — never mutates state. External callers (e.g. the RPC
+---layer) must call this before dispatching the break_pane event to get a
+---structured reason token rather than a plain boolean from the handler.
+---
+---Returns one of:
+---  "ok"                — pty is in tile tree, tab has 2+ panes; break is safe.
+---  "solo_pane"         — pty is the only pane in its tab's tile tree.
+---  "pty_not_tileable"  — pty exists in a floating/overlay slot, not the tree.
+---  "pty_not_in_session"— pty is known (state.ptys) but not in any tab tree or
+---                        floating slot (cross-session / foreign-session case).
+---  "pty_not_found"     — pty_id unknown to this session entirely.
+---
+---@param pty_id number
+---@return "ok"|"solo_pane"|"pty_not_tileable"|"pty_not_in_session"|"pty_not_found"
+function M.classify_break_pane(pty_id)
+    -- Fast path: check the main tileable tree first.
+    local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
+    if src_tab then
+        -- find_tab_for_pane walks tab.root (tile tree only). A non-nil
+        -- src_tab guarantees the pane is in the tile tree, not floating.
+        if is_pane(src_tab.root) and src_tab.root.id == pty_id then
+            return "solo_pane"
+        end
+        _ = src_tab_idx -- suppress unused warning
+        return "ok"
+    end
+
+    -- Not in the tile tree. Check floating/overlay slots across all tabs.
+    for _, tab in ipairs(state.tabs) do
+        if tab.floating and tab.floating.pane and tab.floating.pane.id == pty_id then
+            return "pty_not_tileable"
+        end
+    end
+
+    -- Not in any tab at all. If the session has a pty registry and the id
+    -- is there, the pane belongs to a different session (cross-session arm).
+    -- state.ptys is not present in v1 live runtime — this arm is reachable
+    -- from tests that inject state.ptys to exercise the token.
+    if state.ptys and state.ptys[pty_id] then
+        return "pty_not_in_session"
+    end
+
+    return "pty_not_found"
+end
+
 ---@param node? Node
 ---@return Pane?
 local function get_first_leaf(node)
@@ -2119,6 +2165,17 @@ local commands = {
         end,
     },
     {
+        name = "Break Pane",
+        action = function()
+            local focused_id = state.focused_id
+            if not focused_id then
+                prise.log.warn("break_pane: no focused pane")
+                return
+            end
+            M.update({ type = "break_pane", data = { pty_id = focused_id, focus = true } })
+        end,
+    },
+    {
         name = "New Tab",
         shortcut = key_prefix .. " t",
         action = function()
@@ -2440,6 +2497,14 @@ action_handlers = {
             state.zoomed_pane_id = state.focused_id
         end
         prise.request_frame()
+    end,
+    break_pane = function()
+        local focused_id = state.focused_id
+        if not focused_id then
+            prise.log.warn("break_pane: no focused pane")
+            return
+        end
+        M.update({ type = "break_pane", data = { pty_id = focused_id, focus = true } })
     end,
     new_tab = function()
         local pty = get_focused_pty()
@@ -3309,10 +3374,7 @@ function M.update(event)
                 end
                 local tab_title = event.data and event.data.tab_title
                 prise.log.info(
-                    "break_pane: cross-session pre-remove pty="
-                        .. tostring(pty_id)
-                        .. " source="
-                        .. source_session
+                    "break_pane: cross-session pre-remove pty=" .. tostring(pty_id) .. " source=" .. source_session
                 )
                 local removed = prise.remove_pty_from_session(source_session, pty_id)
                 if not removed then
@@ -3343,10 +3405,7 @@ function M.update(event)
                     return false
                 end
                 prise.log.info(
-                    "break_pane: cross-session done pty="
-                        .. tostring(pty_id)
-                        .. " source="
-                        .. source_session
+                    "break_pane: cross-session done pty=" .. tostring(pty_id) .. " source=" .. source_session
                 )
                 return true
             end
@@ -4778,6 +4837,7 @@ end
 M._test = {
     is_pane = is_pane,
     is_split = is_split,
+    action_handlers = action_handlers,
     collect_panes = collect_panes,
     find_node_path = find_node_path,
     get_first_leaf = get_first_leaf,

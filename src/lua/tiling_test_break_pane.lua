@@ -93,7 +93,7 @@ package.loaded["prise"] = {
             insert = function() end,
         }
     end,
-    log = { debug = function() end, info = function() end },
+    log = { debug = function() end, info = function() end, warn = function() end },
     set_timeout = function(_, _)
         return { cancel = function() end }
     end,
@@ -704,3 +704,145 @@ assert(s.tabs[4].root.id == 22, "normalize overflow: new tab lands at index 4 (a
 -- session.lua on that branch. Here on feat/break-pane the handler early-
 -- returns on `not src_tab`, so an empty state.tabs never reaches the
 -- insertion path.
+
+-- ========================================================================
+-- classify_break_pane: structured reason taxonomy
+-- ========================================================================
+-- Covers all five return tokens: "ok", "solo_pane", "pty_not_tileable",
+-- "pty_not_in_session", and "pty_not_found".
+
+-- === classify: "ok" — pty in tile tree, tab has 2+ panes ===
+
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+    },
+    active_tab = 1,
+    focused_id = 1,
+})
+assert(
+    tiling.classify_break_pane(1) == "ok",
+    "classify: multi-pane tile tree returns 'ok', got " .. tostring(tiling.classify_break_pane(1))
+)
+assert(
+    tiling.classify_break_pane(2) == "ok",
+    "classify: other pane in multi-pane tree also 'ok', got " .. tostring(tiling.classify_break_pane(2))
+)
+
+-- === classify: "solo_pane" — pty is the only pane in its tab's tile tree ===
+
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(42), last_focused_id = 42 },
+    },
+    active_tab = 1,
+    focused_id = 42,
+})
+assert(
+    tiling.classify_break_pane(42) == "solo_pane",
+    "classify: sole root pane returns 'solo_pane', got " .. tostring(tiling.classify_break_pane(42))
+)
+
+-- === classify: "pty_not_tileable" — pty lives in a floating slot only ===
+
+do
+    local tab = { id = 1, root = mock_pane(1), last_focused_id = 1 }
+    tab.floating = { pane = mock_pane(77), visible = true }
+    t.set_state({
+        tabs = { tab },
+        active_tab = 1,
+        focused_id = 1,
+    })
+end
+assert(
+    tiling.classify_break_pane(77) == "pty_not_tileable",
+    "classify: floating pane returns 'pty_not_tileable', got " .. tostring(tiling.classify_break_pane(77))
+)
+
+-- === classify: "pty_not_in_session" — in state.ptys but not in any tab ===
+-- state.ptys is not present in v1 live runtime; injected here via the
+-- direct state reference to exercise the cross-session token.
+
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+})
+-- Inject a pty into state.ptys that doesn't appear in any tab tree.
+local raw_state = t.get_state()
+raw_state.ptys = { [99] = mock_pane(99) }
+assert(
+    tiling.classify_break_pane(99) == "pty_not_in_session",
+    "classify: pty known via state.ptys but absent from tabs returns 'pty_not_in_session', got "
+        .. tostring(tiling.classify_break_pane(99))
+)
+-- Clean up so subsequent tests get a fresh state.
+raw_state.ptys = nil
+
+-- === classify: "pty_not_found" — completely unknown pty_id ===
+
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+})
+assert(
+    tiling.classify_break_pane(999) == "pty_not_found",
+    "classify: unknown id returns 'pty_not_found', got " .. tostring(tiling.classify_break_pane(999))
+)
+
+-- ========================================================================
+-- commands-table Break Pane action closure
+-- ========================================================================
+-- The Break Pane entry in the commands table resolves state.focused_id
+-- and dispatches M.update({type="break_pane", data={pty_id, focus=true}}).
+-- When focused_id is nil the closure is a silent no-op (warn only).
+
+-- === commands Break Pane: dispatches break_pane event for focused pane ===
+
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(5),
+                mock_pane(6),
+            }),
+            last_focused_id = 5,
+        },
+    },
+    active_tab = 1,
+    focused_id = 5,
+    next_tab_id = 2,
+})
+-- Invoke the Break Pane command via the keybind action_handler, which
+-- mirrors the commands-table closure exactly.
+t.action_handlers.break_pane()
+s = t.get_state()
+assert(#s.tabs == 2, "commands Break Pane: break dispatched — 2 tabs after break")
+assert(s.tabs[2].root.id == 5, "commands Break Pane: focused pane moved to new tab")
+
+-- === commands Break Pane: no-op (silent warn) when focused_id is nil ===
+
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+    },
+    active_tab = 1,
+    focused_id = nil,
+    next_tab_id = 2,
+})
+t.action_handlers.break_pane()
+s = t.get_state()
+assert(#s.tabs == 1, "commands Break Pane: nil focus is no-op, tab count unchanged")
