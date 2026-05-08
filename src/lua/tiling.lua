@@ -730,11 +730,13 @@ end
 ---@param pty_id number
 ---@return "ok"|"solo_pane"|"pty_not_tileable"|"pty_not_in_session"|"pty_not_found"
 function M.classify_break_pane(pty_id)
-    -- Fast path: check the main tileable tree first.
+    -- Resolve the owning tab. find_tab_for_pane semantics shift across
+    -- branches: on this branch it walks tab.root only, but on arthack-prod
+    -- (after feat/overlay-terminals merges) it also matches tab.floating.
+    -- Don't lean on its tree-only-ness — verify membership explicitly below.
     local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
-    if src_tab then
-        -- find_tab_for_pane walks tab.root (tile tree only). A non-nil
-        -- src_tab guarantees the pane is in the tile tree, not floating.
+    if src_tab and find_node_path(src_tab.root, pty_id) then
+        -- Pane is in the tileable tree.
         if is_pane(src_tab.root) and src_tab.root.id == pty_id then
             return "solo_pane"
         end
@@ -742,10 +744,17 @@ function M.classify_break_pane(pty_id)
         return "ok"
     end
 
-    -- Not in the tile tree. Check floating/overlay slots across all tabs.
+    -- Not in any tile tree. Check floating/overlay slots across all tabs.
     for _, tab in ipairs(state.tabs) do
         if tab.floating and tab.floating.pane and tab.floating.pane.id == pty_id then
             return "pty_not_tileable"
+        end
+        if tab.overlays then
+            for _, overlay in pairs(tab.overlays) do
+                if overlay.pane and overlay.pane.id == pty_id then
+                    return "pty_not_tileable"
+                end
+            end
         end
     end
 
