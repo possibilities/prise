@@ -2509,12 +2509,17 @@ const Server = struct {
             deadline_ts,
         });
 
-        // TODO(fn-388-...1 phase 6): emit Notification(broker_client,
-        // "break_pane_request", {pty_id, focus, request_id}) here.
-        // Until that lands, the pending entry sits idle and is
-        // retired by either the deadline-sweep timer (phase 9) or by
-        // a Lua-driven `break_pane_reply` for tests that fast-forward
-        // (phase 7). Real CLIs will see `broker_timeout` after 2s.
+        // Emit the broker notification AFTER the pending entry is
+        // written so a fast broker reply finds the entry. If the send
+        // fails (e.g. SendQueueFull, BrokerNotFound from a race with
+        // removeClient), drop the pending entry immediately and reply
+        // `broker_timeout` synchronously rather than wait the full
+        // 2s for the deadline-sweep timer.
+        self.sendBreakPaneRequest(broker_client.id, parsed.pty_id, parsed.focus, request_id) catch |err| {
+            log.warn("break_pane: sendBreakPaneRequest failed: {}, replying broker_timeout", .{err});
+            _ = self.pending.remove(request_id);
+            return client.sendBreakPaneResponse(self.loop, msgid, false, "broker_timeout");
+        };
     }
 
     fn handleAttachPty(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
@@ -2960,6 +2965,57 @@ const Server = struct {
         }
 
         client.finishClose(self.loop);
+    }
+
+    /// Send a `break_pane_request` Notification to the chosen broker.
+    ///
+    /// Mirrors `sendRedraw`'s targeted-send filter pattern: walk all
+    /// clients, skip those whose id doesn't match `broker_id`, send to
+    /// exactly one. The wire envelope is `[2, "break_pane_request",
+    /// {pty_id, focus, request_id}]`. The broker correlates the reply
+    /// via `request_id` in the payload (msgpack-RPC Notifications carry
+    /// no msgid, so correlation must live in the params).
+    ///
+    /// Returns `error.BrokerNotFound` if no client matches `broker_id`
+    /// (raced with `removeClient`); caller drops the pending entry and
+    /// replies `broker_timeout` to the CLI.
+    fn sendBreakPaneRequest(self: *Server, broker_id: usize, pty_id: u32, focus: bool, request_id: usize) !void {
+        var target: ?*Client = null;
+        for (self.clients.items) |c| {
+            if (c.id == broker_id) {
+                target = c;
+                break;
+            }
+        }
+        const broker = target orelse return error.BrokerNotFound;
+
+        const map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{
+            .key = .{ .string = "pty_id" },
+            .value = .{ .unsigned = pty_id },
+        };
+        map_items[1] = .{
+            .key = .{ .string = "focus" },
+            .value = .{ .boolean = focus },
+        };
+        map_items[2] = .{
+            .key = .{ .string = "request_id" },
+            .value = .{ .unsigned = request_id },
+        };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "break_pane_request", params });
+        defer self.allocator.free(msg_bytes);
+
+        log.info("break_pane_request: broker_id={} pty_id={} focus={} request_id={}", .{
+            broker_id,
+            pty_id,
+            focus,
+            request_id,
+        });
+
+        try broker.sendData(self.loop, msg_bytes);
     }
 
     /// Send redraw notification (bytes) to attached clients
@@ -4173,6 +4229,37 @@ test "handleBreakPane - broker-pick is lowest Client.id among attached" {
     try testing.expectEqual(@as(u32, 1), entry_v0.cli_msgid);
     try testing.expect(entry_v0.cli_client == cli);
 
+    // The broker (id=1, fd=201) should have received exactly one
+    // break_pane_request notification — no other client should see one.
+    const broker1_msg_opt = try findPendingSendOnFd(allocator, &loop, 201);
+    try testing.expect(broker1_msg_opt != null);
+    const broker1_msg = broker1_msg_opt.?;
+    defer broker1_msg.deinit(allocator);
+    try testing.expect(broker1_msg == .notification);
+    try testing.expectEqualStrings("break_pane_request", broker1_msg.notification.method);
+    try testing.expect(broker1_msg.notification.params == .map);
+    var saw_pty_id = false;
+    var saw_focus = false;
+    var saw_request_id = false;
+    for (broker1_msg.notification.params.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+            try testing.expectEqual(@as(u64, 7), kv.value.unsigned);
+            saw_pty_id = true;
+        } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+            try testing.expectEqual(false, kv.value.boolean);
+            saw_focus = true;
+        } else if (std.mem.eql(u8, kv.key.string, "request_id")) {
+            try testing.expectEqual(@as(u64, 0), kv.value.unsigned);
+            saw_request_id = true;
+        }
+    }
+    try testing.expect(saw_pty_id);
+    try testing.expect(saw_focus);
+    try testing.expect(saw_request_id);
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 202)) == null);
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 203)) == null);
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 999)) == null);
+
     // Detach client 1 and re-fire — broker should become id 2.
     // (Mutating attached_ptys directly bypasses the detach RPC to keep
     // the test focused on broker selection.)
@@ -4193,6 +4280,14 @@ test "handleBreakPane - broker-pick is lowest Client.id among attached" {
         return;
     };
     try testing.expectEqual(@as(usize, 2), entry_v1.broker_id);
+
+    // Broker now id=2 (fd=202) — verify a notification went there.
+    const broker2_msg_opt = try findPendingSendOnFd(allocator, &loop, 202);
+    try testing.expect(broker2_msg_opt != null);
+    const broker2_msg = broker2_msg_opt.?;
+    defer broker2_msg.deinit(allocator);
+    try testing.expect(broker2_msg == .notification);
+    try testing.expectEqualStrings("break_pane_request", broker2_msg.notification.method);
 }
 
 test "server - pty exit notification" {
