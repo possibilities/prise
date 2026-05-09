@@ -4399,14 +4399,12 @@ const Server = struct {
                 client.* = .{
                     .id = assigned_id,
                     .fd = client_fd,
-                    .id = self.next_client_id,
                     .server = self,
                     .msg_buffer = std.ArrayList(u8).empty,
                     .send_queue = std.ArrayList([]u8).empty,
                     .attached_ptys = std.ArrayList(usize).empty,
                     // .style_cache = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(self.allocator),
                 };
-                self.next_client_id += 1;
                 try self.clients.append(self.allocator, client);
                 std.debug.assert(self.clients.items.len <= LIMITS.CLIENTS_MAX);
                 std.log.debug("Total clients: {} (assigned id={})", .{ self.clients.items.len, client.id });
