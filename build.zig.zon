@@ -9,8 +9,8 @@
             .hash = "ghostty-1.3.2-dev-5UdBC6LmAwWo-O--rkIn0OW7T9wQY8HGhAxgWQFPGcb8",
         },
         .vaxis = .{
-            .url = "https://github.com/rockorager/libvaxis/archive/68d6ea1d94fa0e5575e3af505bebab29a15acb96.tar.gz",
-            .hash = "vaxis-0.5.1-BWNV_AAyCQAyuU8AUmRpkPzTW51DmXQ2nG6I-EyrROg_",
+            .url = "https://github.com/rockorager/libvaxis/archive/b58ae3a2fa16b3b7f11d2a7297c73a1e839d035b.tar.gz",
+            .hash = "vaxis-0.5.1-BWNV_DalCQA3qQzAHjsNuYuoLt_lut3TmN-iGkC9xJoo",
         },
         .zlua = .{
             .url = "https://github.com/natecraddock/ziglua/archive/af970851f5412a32c9eceb1c4519679a242c6093.tar.gz",
