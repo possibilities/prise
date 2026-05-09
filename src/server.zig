@@ -1393,6 +1393,8 @@ const Client = struct {
             try self.handleFocusEvent(notif);
         } else if (std.mem.eql(u8, notif.method, "color_response")) {
             try self.handleColorResponse(notif);
+        } else if (std.mem.eql(u8, notif.method, "break_pane_reply")) {
+            try self.server.handleBreakPaneReply(notif);
         }
     }
 
@@ -2440,6 +2442,87 @@ const Server = struct {
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
         }
+    }
+
+    /// Parse a `break_pane_reply` notification payload. The broker
+    /// must include `request_id` (correlator), `ok` (success flag),
+    /// and optionally `reason` (refusal-token string when ok=false).
+    /// Returns `error.MalformedParams` on missing/wrong-type required
+    /// fields. `reason` defaults to null when absent.
+    fn parseBreakPaneReplyParams(params: msgpack.Value) !struct { request_id: usize, ok: bool, reason: ?[]const u8 } {
+        if (params != .map) return error.MalformedParams;
+
+        var have_request_id = false;
+        var have_ok = false;
+        var request_id: usize = 0;
+        var ok: bool = false;
+        var reason: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "request_id")) {
+                request_id = switch (kv.value) {
+                    .unsigned => |u| @intCast(u),
+                    .integer => |i| std.math.cast(usize, i) orelse return error.MalformedParams,
+                    else => return error.MalformedParams,
+                };
+                have_request_id = true;
+            } else if (std.mem.eql(u8, kv.key.string, "ok")) {
+                if (kv.value != .boolean) return error.MalformedParams;
+                ok = kv.value.boolean;
+                have_ok = true;
+            } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+                if (kv.value == .string) {
+                    reason = kv.value.string;
+                }
+            }
+        }
+
+        if (!have_request_id or !have_ok) return error.MalformedParams;
+
+        return .{ .request_id = request_id, .ok = ok, .reason = reason };
+    }
+
+    /// Handle a `break_pane_reply` Notification from the broker.
+    ///
+    /// Looks up the pending entry by `request_id`. On match: drop the
+    /// entry, send the matching Response back to the originating CLI,
+    /// and (on `ok=true`) fan out a `break_pane_applied` broadcast to
+    /// converge non-broker clients (broadcast helper lands in phase 8).
+    /// Unknown `request_id` (timeout already fired, or never existed)
+    /// is logged under the stable event name `rpc.broker.late_reply`
+    /// and silently dropped — never a panic. Malformed payload is
+    /// logged + dropped.
+    fn handleBreakPaneReply(self: *Server, notif: rpc.Notification) !void {
+        const parsed = parseBreakPaneReplyParams(notif.params) catch |err| {
+            log.warn("break_pane_reply: malformed payload: {}", .{err});
+            return;
+        };
+
+        const entry = self.pending.fetchRemove(parsed.request_id) orelse {
+            log.info("event=\"rpc.broker.late_reply\" request_id={} ok={}", .{
+                parsed.request_id,
+                parsed.ok,
+            });
+            return;
+        };
+
+        const cli_client = entry.value.cli_client;
+        const cli_msgid = entry.value.cli_msgid;
+
+        log.info("break_pane_reply: request_id={} ok={} reason={?s}", .{
+            parsed.request_id,
+            parsed.ok,
+            parsed.reason,
+        });
+
+        // Reply to originating CLI BEFORE fanout — siblings can wait;
+        // the CLI is blocked on this Response.
+        try cli_client.sendBreakPaneResponse(self.loop, cli_msgid, parsed.ok, parsed.reason);
+
+        // TODO(fn-388-...1 phase 8): on ok=true, fire
+        // sendBreakPaneApplied(broker_id, pty_id, focus) to fan out a
+        // convergence notification to non-broker attached clients.
     }
 
     /// Handle the `break_pane` Request: pick a deterministic broker among
@@ -4070,6 +4153,210 @@ fn findPendingSendOnFd(allocator: std.mem.Allocator, loop: *io.Loop, fd: posix.f
         }
     }
     return null;
+}
+
+test "parseBreakPaneReplyParams - happy paths and edge cases" {
+    const testing = std.testing;
+
+    var ok_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 5 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    const ok_parsed = try Server.parseBreakPaneReplyParams(.{ .map = &ok_params });
+    try testing.expectEqual(@as(usize, 5), ok_parsed.request_id);
+    try testing.expectEqual(true, ok_parsed.ok);
+    try testing.expectEqual(@as(?[]const u8, null), ok_parsed.reason);
+
+    var refuse_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 5 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = false } },
+        .{ .key = .{ .string = "reason" }, .value = .{ .string = "solo_pane" } },
+    };
+    const refuse_parsed = try Server.parseBreakPaneReplyParams(.{ .map = &refuse_params });
+    try testing.expectEqual(false, refuse_parsed.ok);
+    try testing.expectEqualStrings("solo_pane", refuse_parsed.reason.?);
+
+    var no_id = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneReplyParams(.{ .map = &no_id }));
+
+    var no_ok = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 1 } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneReplyParams(.{ .map = &no_ok }));
+
+    var bad_ok = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 1 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .string = "true" } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneReplyParams(.{ .map = &bad_ok }));
+}
+
+test "handleBreakPaneReply - non-ok refusal sends Response with reason" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pre-populate a pending entry as if handleBreakPane wrote it.
+    try server.pending.put(0, .{
+        .cli_msgid = 77,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 2000,
+        .pty_id = 7,
+        .focus = false,
+    });
+
+    // Build the broker's reply notification payload.
+    var reply_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = false } },
+        .{ .key = .{ .string = "reason" }, .value = .{ .string = "solo_pane" } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+
+    // Pending dropped, Response queued to CLI fd.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 77), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var got_ok = false;
+    var got_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expect(kv.value.boolean == false);
+            got_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("solo_pane", kv.value.string);
+            got_reason = true;
+        }
+    }
+    try testing.expect(got_ok);
+    try testing.expect(got_reason);
+}
+
+test "handleBreakPaneReply - unknown request_id silently dropped" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Spurious reply for a request_id that was never registered.
+    var reply_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 999 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+
+    // No pending entries created; no spurious sends queued.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+    var any_send = false;
+    var it = loop.pending.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.kind == .send) any_send = true;
+    }
+    try testing.expect(!any_send);
+}
+
+test "handleBreakPaneReply - malformed payload silently dropped" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Missing `ok` field — handler must not panic, must not send.
+    var bad = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &bad } });
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
 }
 
 test "handleBreakPane - zero attached clients sends synchronous session_not_attached" {
