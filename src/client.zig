@@ -4614,7 +4614,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
             .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 42 } },
@@ -4642,7 +4642,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
         };
@@ -4663,7 +4663,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 11 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
         };
@@ -4690,7 +4690,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 11 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .unsigned = 1 } },
         };
