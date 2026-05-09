@@ -6764,6 +6764,7 @@ fn initRenameTestServer(allocator: std.mem.Allocator, loop: *io.Loop, start_time
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .signal_pipe_fds = .{ -1, -1 },
         .start_time_ms = start_time_ms,
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
     };
 }
@@ -7198,6 +7199,7 @@ test "handleBreakPaneReply - non-ok refusal sends Response with reason" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7285,6 +7287,7 @@ test "handleBreakPaneReply - unknown request_id silently dropped" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7333,6 +7336,7 @@ test "handleBreakPaneReply - malformed payload silently dropped" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7364,6 +7368,7 @@ test "handleBreakPaneReply - ok path broadcasts to non-broker attached clients" 
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7479,6 +7484,7 @@ test "sweepPending - expired entries reply broker_timeout and drop" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7572,6 +7578,7 @@ test "removeClient - broker disconnect replies broker_timeout to CLI" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
         .exit_on_idle = false,
     };
@@ -7666,6 +7673,7 @@ test "drainPendingForShutdown - replies broker_timeout to all and clears" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
         .exit_on_idle = false,
     };
@@ -7771,6 +7779,7 @@ test "removeClient - cli disconnect drops pending without reply" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
         .exit_on_idle = false,
     };
@@ -7865,6 +7874,7 @@ test "handleBreakPane - zero attached clients sends synchronous session_not_atta
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7942,6 +7952,7 @@ test "handleBreakPane - broker-pick is lowest Client.id among attached" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -8665,6 +8676,7 @@ test "handleSpawnPlug - idempotent with same managed cmd" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -8717,6 +8729,7 @@ test "handleSpawnPlug - config conflict for external plug" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -8759,6 +8772,7 @@ test "handleSpawnPlug - config conflict with different managed cmd" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -8809,6 +8823,7 @@ test "handleSpawnPlug - config conflict with different restart policy" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -8860,6 +8875,7 @@ test "handleSpawnPlug - stopped plug is removed for re-spawn" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -8918,6 +8934,7 @@ test "handleSpawnPlug - config-owned name rejected with PlugConfigOwned" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -8970,6 +8987,7 @@ test "handleSpawnPlug - rpc-owned name keeps existing dedup behavior" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9040,6 +9058,7 @@ test "onPlugExit - reaps exited process" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9097,6 +9116,7 @@ test "onPlugExit - no restart when killed_by_server" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9153,6 +9173,7 @@ test "onPlugExit - no restart when shutting_down" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
         .shutting_down = true,
     };
@@ -9208,6 +9229,7 @@ test "handleRegisterPlug - valid token succeeds" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9279,6 +9301,7 @@ test "handleRegisterPlug - missing token returns error" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9325,6 +9348,7 @@ test "handleRegisterPlug - wrong token returns PermissionDenied" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9389,6 +9413,7 @@ test "handleRegisterPlug - unknown plug name returns PermissionDenied" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9436,6 +9461,7 @@ test "handleRegisterPlug - already registered returns error" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9483,6 +9509,7 @@ test "onPlugExit - defers when registered" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9545,6 +9572,7 @@ test "onPlugExit - proceeds when not registered" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9610,6 +9638,7 @@ test "finishClose - deferred restart when pid null" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9683,6 +9712,7 @@ test "handleSpawnPlug - registered but pidless treated as active" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9750,6 +9780,7 @@ test "handleRegisterPlug - cancels pending restart timer on late registration" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9847,6 +9878,7 @@ test "next_client_id is monotonic and unique" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9886,6 +9918,7 @@ test "handleNotifyPlugClient - delivers to exact client" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9962,6 +9995,7 @@ test "handleNotifyPlugClient - unknown client_id returns error" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9996,6 +10030,7 @@ test "forwardPtyClientEvent - delivers to subscribed plug" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -10059,6 +10094,7 @@ test "handleRegisterPlug - replays client_connected for existing clients" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
