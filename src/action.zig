@@ -33,6 +33,12 @@ pub const Action = union(enum) {
     toggle_zoom,
     break_pane,
 
+    // Pane swap (move focused pane within tile tree)
+    swap_pane_left,
+    swap_pane_right,
+    swap_pane_up,
+    swap_pane_down,
+
     // Tab management
     new_tab,
     close_tab,
@@ -126,6 +132,10 @@ pub const Action = union(enum) {
             .close_pane => "Close Pane",
             .toggle_zoom => "Toggle Zoom",
             .break_pane => "Break Pane",
+            .swap_pane_left => "Swap Pane Left",
+            .swap_pane_right => "Swap Pane Right",
+            .swap_pane_up => "Swap Pane Up",
+            .swap_pane_down => "Swap Pane Down",
             .new_tab => "New Tab",
             .close_tab => "Close Tab",
             .rename_tab => "Rename Tab",
@@ -175,6 +185,8 @@ test "action from string" {
     try std.testing.expectEqual(@as(Action, .floating_increase_size), Action.fromString("floating_increase_size").?);
     try std.testing.expectEqual(@as(Action, .floating_decrease_size), Action.fromString("floating_decrease_size").?);
     try std.testing.expectEqual(@as(Action, .focus_left_wrap), Action.fromString("focus_left_wrap").?);
+    try std.testing.expectEqual(@as(Action, .swap_pane_left), Action.fromString("swap_pane_left").?);
+    try std.testing.expectEqual(@as(Action, .break_pane), Action.fromString("break_pane").?);
     try std.testing.expect(Action.fromString("invalid_action") == null);
 }
 
