@@ -1286,6 +1286,15 @@ const Client = struct {
     fn handleRpcRequest(self: *Client, loop: *io.Loop, req: rpc.Request) !void {
         std.debug.assert(req.method.len > 0);
 
+        // Async-broker requests (currently only `break_pane`) own their own
+        // response lifecycle: they may send the Response synchronously
+        // (refusal short-circuits) OR defer it until the broker replies via
+        // a `break_pane_reply` notification. Returning early here keeps the
+        // synchronous-response wrapper below from sending an extra Response.
+        if (std.mem.eql(u8, req.method, "break_pane")) {
+            return self.server.handleBreakPane(self, req.msgid, req.params);
+        }
+
         const result = self.server.handleRequest(self, req.method, req.params) catch |err| {
             return self.sendErrorResponse(loop, req.msgid, err);
         };
@@ -1317,6 +1326,46 @@ const Client = struct {
         const response_value = msgpack.Value{ .array = response_arr };
         const response_bytes = try msgpack.encodeFromValue(self.server.allocator, response_value);
         defer self.server.allocator.free(response_bytes);
+
+        std.debug.assert(response_bytes.len <= LIMITS.MESSAGE_SIZE_MAX);
+        try self.sendData(loop, response_bytes);
+    }
+
+    /// Send a `{ok, reason?}` map Response for a `break_pane` request.
+    ///
+    /// Used by every terminal state of the broker dance: synchronous
+    /// `session_not_attached` refusal at request time, broker reply
+    /// arrival (`ok=true` or refusal token), deadline-sweep timeout,
+    /// and broker disconnect. `reason` is omitted when null
+    /// (success replies use `{ok=true}` only).
+    fn sendBreakPaneResponse(self: *Client, loop: *io.Loop, msgid: u32, ok: bool, reason: ?[]const u8) !void {
+        const allocator = self.server.allocator;
+
+        const map_len: usize = if (reason) |_| 2 else 1;
+        const map_items = try allocator.alloc(msgpack.Value.KeyValue, map_len);
+        defer allocator.free(map_items);
+
+        map_items[0] = .{
+            .key = .{ .string = "ok" },
+            .value = .{ .boolean = ok },
+        };
+        if (reason) |r| {
+            map_items[1] = .{
+                .key = .{ .string = "reason" },
+                .value = .{ .string = r },
+            };
+        }
+
+        const response_arr = try allocator.alloc(msgpack.Value, 4);
+        defer allocator.free(response_arr);
+        response_arr[0] = msgpack.Value{ .unsigned = 1 }; // type=Response
+        response_arr[1] = msgpack.Value{ .unsigned = msgid };
+        response_arr[2] = msgpack.Value.nil; // no error
+        response_arr[3] = msgpack.Value{ .map = map_items };
+
+        const response_value = msgpack.Value{ .array = response_arr };
+        const response_bytes = try msgpack.encodeFromValue(allocator, response_value);
+        defer allocator.free(response_bytes);
 
         std.debug.assert(response_bytes.len <= LIMITS.MESSAGE_SIZE_MAX);
         try self.sendData(loop, response_bytes);
@@ -2391,6 +2440,81 @@ const Server = struct {
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
         }
+    }
+
+    /// Handle the `break_pane` Request: pick a deterministic broker among
+    /// attached clients, store a pending entry keyed by `request_id`, and
+    /// notify the broker. The synchronous Response is sent only when we
+    /// can refuse without consulting Lua (no attached clients, malformed
+    /// params, or pending-table full); otherwise the eventual Response is
+    /// emitted by `handleBreakPaneReply` when the broker fires its
+    /// notification reply, by the deadline-sweep timer on timeout, or by
+    /// `removeClient` if the broker disconnects.
+    ///
+    /// Owns its own response lifecycle — called from `handleRpcRequest`
+    /// before the value-returning `handleRequest`. Returns an error only
+    /// if the synchronous Response itself fails to send.
+    fn handleBreakPane(self: *Server, client: *Client, msgid: u32, params: msgpack.Value) !void {
+        const parsed = parseBreakPaneParams(params) catch |err| {
+            log.warn("break_pane: malformed params: {}", .{err});
+            return client.sendErrorResponse(self.loop, msgid, err);
+        };
+
+        // Broker-pick: lowest `Client.id` among clients with at least one
+        // attached PTY. Empty result → synchronous `session_not_attached`
+        // refusal (no point queueing for a possibly-never-attaching client).
+        var broker: ?*Client = null;
+        for (self.clients.items) |c| {
+            if (c.attached_ptys.items.len == 0) continue;
+            if (broker) |current| {
+                if (c.id < current.id) broker = c;
+            } else {
+                broker = c;
+            }
+        }
+        const broker_client = broker orelse {
+            log.info("break_pane: no attached clients, refusing with session_not_attached", .{});
+            return client.sendBreakPaneResponse(self.loop, msgid, false, "session_not_attached");
+        };
+
+        // Defensive cap. Single-user case never approaches PENDING_MAX;
+        // a misbehaving caller hitting it gets the same UX as a slow
+        // broker (broker_timeout) so the CLI exit-code map stays single-token.
+        if (self.pending.count() >= LIMITS.PENDING_MAX) {
+            log.warn("break_pane: pending table at limit ({}), refusing with broker_timeout", .{LIMITS.PENDING_MAX});
+            return client.sendBreakPaneResponse(self.loop, msgid, false, "broker_timeout");
+        }
+
+        const request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        const deadline_ts = std.time.milliTimestamp() + LIMITS.PENDING_DEADLINE_MS;
+
+        // Write pending FIRST so a fast broker reply that arrives before
+        // we return finds the entry.
+        try self.pending.put(request_id, .{
+            .cli_msgid = msgid,
+            .cli_client = client,
+            .broker_id = broker_client.id,
+            .deadline_ts = deadline_ts,
+            .pty_id = parsed.pty_id,
+            .focus = parsed.focus,
+        });
+
+        log.info("break_pane: pty_id={} focus={} broker_id={} request_id={} deadline_ts={}", .{
+            parsed.pty_id,
+            parsed.focus,
+            broker_client.id,
+            request_id,
+            deadline_ts,
+        });
+
+        // TODO(fn-388-...1 phase 6): emit Notification(broker_client,
+        // "break_pane_request", {pty_id, focus, request_id}) here.
+        // Until that lands, the pending entry sits idle and is
+        // retired by either the deadline-sweep timer (phase 9) or by
+        // a Lua-driven `break_pane_reply` for tests that fast-forward
+        // (phase 7). Real CLIs will see `broker_timeout` after 2s.
     }
 
     fn handleAttachPty(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
@@ -3877,6 +4001,198 @@ test "style optimization" {
     try testing.expect(style_def_red != null);
     try testing.expect(found_row0);
     try testing.expect(found_row1);
+}
+
+// Test helper: decode the most recent Response sent on `fd` (if any)
+// from the mock Loop's pending send queue. Returns null when no send
+// is queued. Caller owns the returned message and must deinit.
+fn findPendingSendOnFd(allocator: std.mem.Allocator, loop: *io.Loop, fd: posix.fd_t) !?rpc.Message {
+    var it = loop.pending.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.kind == .send and entry.value_ptr.fd == fd) {
+            return try rpc.decodeMessage(allocator, entry.value_ptr.buf);
+        }
+    }
+    return null;
+}
+
+test "handleBreakPane - zero attached clients sends synchronous session_not_attached" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // CLI client with NO attached PTYs.
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 200,
+        .id = 0,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 1 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+    try server.handleBreakPane(cli, 42, .{ .map = &params });
+
+    // Synchronous Response queued; pending stays empty.
+    try testing.expectEqual(@as(u32, 0), @as(u32, @intCast(server.pending.count())));
+
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 200);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 42), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var got_ok = false;
+    var got_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expect(kv.value.boolean == false);
+            got_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("session_not_attached", kv.value.string);
+            got_reason = true;
+        }
+    }
+    try testing.expect(got_ok);
+    try testing.expect(got_reason);
+}
+
+test "handleBreakPane - broker-pick is lowest Client.id among attached" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Three attached clients with ids 1, 2, 3 (registered out of insert
+    // order to verify the comparator looks at id, not insert order).
+    const ids = [_]usize{ 3, 1, 2 };
+    for (ids) |client_id| {
+        const c = try allocator.create(Client);
+        c.* = .{
+            .fd = @intCast(200 + @as(i32, @intCast(client_id))),
+            .id = client_id,
+            .server = &server,
+            .msg_buffer = std.ArrayList(u8).empty,
+            .send_queue = std.ArrayList([]u8).empty,
+            .attached_ptys = std.ArrayList(usize).empty,
+        };
+        try c.attached_ptys.append(allocator, 7);
+        try server.clients.append(allocator, c);
+    }
+
+    // Add a CLI client with no attachment so it's never the broker.
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 999,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
+    };
+
+    try server.handleBreakPane(cli, 1, .{ .map = &params });
+
+    try testing.expectEqual(@as(usize, 1), server.pending.count());
+    try testing.expectEqual(@as(usize, 1), server.next_request_id);
+
+    const entry_v0 = server.pending.get(0) orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expectEqual(@as(usize, 1), entry_v0.broker_id);
+    try testing.expectEqual(@as(u32, 7), entry_v0.pty_id);
+    try testing.expectEqual(false, entry_v0.focus);
+    try testing.expectEqual(@as(u32, 1), entry_v0.cli_msgid);
+    try testing.expect(entry_v0.cli_client == cli);
+
+    // Detach client 1 and re-fire — broker should become id 2.
+    // (Mutating attached_ptys directly bypasses the detach RPC to keep
+    // the test focused on broker selection.)
+    for (server.clients.items) |c| {
+        if (c.id == 1) {
+            c.attached_ptys.clearRetainingCapacity();
+            break;
+        }
+    }
+
+    try server.handleBreakPane(cli, 2, .{ .map = &params });
+
+    try testing.expectEqual(@as(usize, 2), server.pending.count());
+    try testing.expectEqual(@as(usize, 2), server.next_request_id);
+
+    const entry_v1 = server.pending.get(1) orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expectEqual(@as(usize, 2), entry_v1.broker_id);
 }
 
 test "server - pty exit notification" {
