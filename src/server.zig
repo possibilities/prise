@@ -2171,6 +2171,43 @@ const Server = struct {
         return parsePtyId(params);
     }
 
+    /// Parse `break_pane` request params from a msgpack map.
+    ///
+    /// Wire shape: `{pty_id: u32, focus: bool}` — both fields required.
+    /// `pty_id` accepts the full u32 range; `focus` must be a boolean.
+    ///
+    /// Returns `error.MalformedParams` on missing fields or wrong types
+    /// — same error name the CLI's wire-shape test expects, surfaced
+    /// back to the originating client via `sendErrorResponse`.
+    fn parseBreakPaneParams(params: msgpack.Value) !struct { pty_id: u32, focus: bool } {
+        if (params != .map) return error.MalformedParams;
+
+        var have_pty_id = false;
+        var have_focus = false;
+        var pty_id: u32 = 0;
+        var focus: bool = false;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .unsigned => |u| std.math.cast(u32, u) orelse return error.MalformedParams,
+                    .integer => |i| std.math.cast(u32, i) orelse return error.MalformedParams,
+                    else => return error.MalformedParams,
+                };
+                have_pty_id = true;
+            } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+                if (kv.value != .boolean) return error.MalformedParams;
+                focus = kv.value.boolean;
+                have_focus = true;
+            }
+        }
+
+        if (!have_pty_id or !have_focus) return error.MalformedParams;
+
+        return .{ .pty_id = pty_id, .focus = focus };
+    }
+
     fn parseAttachPtyParams(params: msgpack.Value) !struct { pty_id: usize, macos_option_as_alt: key_encode.OptionAsAlt } {
         const pty_id = try parsePtyId(params);
         const macos_option_as_alt = if (params == .array and params.array.len >= 2)
@@ -3572,6 +3609,72 @@ test "prepareSpawnEnv" {
     try testing.expect(found_term);
     try testing.expect(found_colorterm);
     try testing.expect(found_existing);
+}
+
+test "parseBreakPaneParams - valid params" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 42 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+    const parsed = try Server.parseBreakPaneParams(.{ .map = &params });
+    try testing.expectEqual(@as(u32, 42), parsed.pty_id);
+    try testing.expectEqual(true, parsed.focus);
+
+    // pty_id can also arrive as a positive integer
+    var int_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .integer = 7 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
+    };
+    const int_parsed = try Server.parseBreakPaneParams(.{ .map = &int_params });
+    try testing.expectEqual(@as(u32, 7), int_parsed.pty_id);
+    try testing.expectEqual(false, int_parsed.focus);
+}
+
+test "parseBreakPaneParams - missing pty_id" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - missing focus" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 1 } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - wrong type for focus" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 1 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .string = "true" } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - wrong type for pty_id" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .string = "1" } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - non-map root" {
+    const testing = std.testing;
+
+    var arr = [_]msgpack.Value{ .{ .unsigned = 1 }, .{ .boolean = true } };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .array = &arr }));
 }
 
 test "parseAttachPtyParams" {
