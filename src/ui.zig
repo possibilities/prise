@@ -90,6 +90,12 @@ pub const UI = struct {
     rename_session_ctx: *anyopaque = undefined,
     delete_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
     delete_session_ctx: *anyopaque = undefined,
+    /// `prise.notify(method, params)` enables Lua to fire fire-and-forget
+    /// msgpack-RPC Notifications to the server. Wired by the App owning
+    /// this UI to its `Client.sendNotification`. Used by the broker
+    /// pattern's `prise.notify("break_pane_reply", {...})` reply path.
+    notify_callback: ?*const fn (ctx: *anyopaque, method: []const u8, params: msgpack.Value) anyerror!void = null,
+    notify_ctx: *anyopaque = undefined,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -266,6 +272,15 @@ pub const UI = struct {
         self.delete_session_callback = cb;
     }
 
+    pub fn setNotifyCallback(
+        self: *UI,
+        ctx: *anyopaque,
+        cb: *const fn (ctx: *anyopaque, method: []const u8, params: msgpack.Value) anyerror!void,
+    ) void {
+        self.notify_ctx = ctx;
+        self.notify_callback = cb;
+    }
+
     pub fn getNextSessionName(self: *UI) ![]const u8 {
         const home = std.posix.getenv("HOME") orelse return self.allocator.dupe(u8, AMORY_NAMES[0]);
 
@@ -388,6 +403,10 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(deleteSession));
         lua.setField(-2, "delete_session");
 
+        // Register notify (msgpack-RPC Notification emit; broker pattern)
+        lua.pushFunction(ziglua.wrap(notify));
+        lua.setField(-2, "notify");
+
         // Register create_text_input
         lua.pushFunction(ziglua.wrap(createTextInput));
         lua.setField(-2, "create_text_input");
@@ -493,6 +512,47 @@ pub const UI = struct {
         } else {
             lua.raiseErrorStr("Spawn callback not configured", .{});
         }
+        return 0;
+    }
+
+    /// `prise.notify(method, params)` — fire a fire-and-forget msgpack-RPC
+    /// Notification to the server. Wire envelope: `[2, method, params]`
+    /// (3-element, no msgid; broker pattern's enabling primitive).
+    ///
+    /// Lua signature: `prise.notify(method: string, params: table)`.
+    /// `params` is converted via `lua_event.luaToMsgpack` (the same
+    /// converter used by `pty:send_paste` and friends), then handed to
+    /// the App-side `notify_callback` which emits the wire bytes via
+    /// `Client.sendNotification`. Raises a Lua error if the callback is
+    /// not configured (set up at app init via `setNotifyCallback`).
+    fn notify(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch return 0;
+        lua.pop(1);
+
+        const method = lua.toString(1) catch {
+            lua.raiseErrorStr("prise.notify: method must be a string", .{});
+        };
+
+        const cb = ui.notify_callback orelse {
+            lua.raiseErrorStr("prise.notify: callback not configured", .{});
+        };
+
+        // Convert the params table at index 2 to msgpack. Caller may pass
+        // nil for params (rare; most notifications have a payload). The
+        // returned msgpack.Value owns its own allocations; we deinit it
+        // after the wire encode happens inside the callback.
+        var params: msgpack.Value = .nil;
+        if (!lua.isNoneOrNil(2)) {
+            params = lua_event.luaToMsgpack(lua, 2, ui.allocator) catch |err| {
+                lua.raiseErrorStr("prise.notify: failed to convert params: %s", .{@errorName(err).ptr});
+            };
+        }
+        defer params.deinit(ui.allocator);
+
+        cb(ui.notify_ctx, method, params) catch |err| {
+            lua.raiseErrorStr("prise.notify: send failed: %s", .{@errorName(err).ptr});
+        };
         return 0;
     }
 
