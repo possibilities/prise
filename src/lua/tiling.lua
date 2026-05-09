@@ -769,6 +769,69 @@ function M.classify_break_pane(pty_id)
     return "pty_not_found"
 end
 
+---Broker entrypoint for the break_pane RPC. The server picks one
+---attached client (lowest stable Client.id) as broker and asks it via
+---an `app.ui.update({type="break_pane_request",...})` event. We
+---classify, apply on "ok", and reply via `prise.notify("break_pane_reply",...)`.
+---
+---Defensive guard: the inner `M.update({type="break_pane",...})` call
+---is constructed with a clean two-field `data` table — only `pty_id`
+---and `focus`. We never pass through `source_session` or any other
+---field that would route through the `M.update :3317` cross-session
+---arm (which references nil-on-this-branch globals
+---`prise.remove_pty_from_session` / `prise.place_pty_in_session`).
+---That arm stays asleep when `event.data.source_session` is nil/empty.
+---
+---@param pty_id number
+---@param focus boolean
+---@param request_id number
+function M.handle_break_pane_request(pty_id, focus, request_id)
+    local verdict = M.classify_break_pane(pty_id)
+    local ok = verdict == "ok"
+
+    if ok then
+        -- Apply locally first so siblings see the broker's tile-tree
+        -- AFTER the mutation completes. Pass `data` as exactly two
+        -- fields — pty_id and focus — to keep the cross-session bomb
+        -- at tiling.lua:3317 asleep.
+        M.update({
+            type = "break_pane",
+            data = { pty_id = pty_id, focus = focus },
+        })
+    end
+
+    -- Reply to the server. Notification envelope is fire-and-forget —
+    -- no ack expected. The server correlates by request_id and
+    -- forwards the verdict to the originating CLI.
+    prise.notify("break_pane_reply", {
+        request_id = request_id,
+        ok = ok,
+        reason = verdict,
+    })
+end
+
+---Convergence entrypoint for non-broker clients. After the broker
+---applies the break_pane, the server fans out a `break_pane_applied`
+---broadcast to other attached clients so their tile-tree mirrors
+---catch up. We re-run the same mutation locally.
+---
+---Defensive guard: same as `handle_break_pane_request` — `data` is a
+---clean two-field table to keep the cross-session arm asleep.
+---
+---Idempotency: if `pty_id` is unknown to this client (e.g. attached
+---to a different session), `M.update`'s break_pane arm short-circuits
+---on `not src_tab` (with `source_session` nil) and returns false
+---without mutating state. No crash.
+---
+---@param pty_id number
+---@param focus boolean
+function M.handle_break_pane_applied(pty_id, focus)
+    M.update({
+        type = "break_pane",
+        data = { pty_id = pty_id, focus = focus },
+    })
+end
+
 ---@param node? Node
 ---@return Pane?
 local function get_first_leaf(node)
@@ -3768,6 +3831,17 @@ function M.update(event)
         update_cached_git_branch()
         prise.request_frame()
         prise.save() -- Auto-save on cwd change
+    elseif event.type == "break_pane_request" then
+        -- Server-asked-broker entry: classify + apply + reply via
+        -- prise.notify("break_pane_reply", ...). The handler builds the
+        -- inner break_pane data table from primitives only, keeping the
+        -- cross-session bomb at :3380 (formerly :3317) asleep.
+        M.handle_break_pane_request(event.data.pty_id, event.data.focus, event.data.request_id)
+    elseif event.type == "break_pane_applied" then
+        -- Convergence entry: re-apply the broker's break_pane locally
+        -- so this client's tile-tree mirror catches up. The broker is
+        -- excluded server-side, so this branch never fires on the broker.
+        M.handle_break_pane_applied(event.data.pty_id, event.data.focus)
     end
 end
 

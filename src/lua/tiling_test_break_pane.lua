@@ -106,6 +106,10 @@ package.loaded["prise"] = {
     list_sessions = function()
         return {}
     end,
+    -- Broker pattern's enabling primitive — fire-and-forget client→server
+    -- notification. Replaced inline by individual tests via the
+    -- `notify_calls` capture below to assert reply payload shape.
+    notify = function() end,
 }
 
 local tiling = require("tiling")
@@ -846,3 +850,252 @@ t.set_state({
 t.action_handlers.break_pane()
 s = t.get_state()
 assert(#s.tabs == 1, "commands Break Pane: nil focus is no-op, tab count unchanged")
+
+-- ========================================================================
+-- broker pattern: handle_break_pane_request + handle_break_pane_applied
+-- ========================================================================
+-- Lua-side half of fn-388-break-pane-rpc-broker-pattern. The server picks
+-- one attached client (lowest stable Client.id) as broker; that client
+-- runs handle_break_pane_request — classify + apply on "ok" + reply via
+-- prise.notify("break_pane_reply", ...). Other attached clients receive
+-- a fanout broadcast and re-apply via handle_break_pane_applied so
+-- their tile-tree mirror catches up.
+--
+-- Defensive guard contract: both handlers build the inner break_pane
+-- `data` table from primitives only — exactly { pty_id, focus }. The
+-- cross-session arm at tiling.lua:3380's `if not src_tab` branch
+-- references nil-on-feat/break-pane globals
+-- (prise.remove_pty_from_session / prise.place_pty_in_session) and only
+-- fires when event.data.source_session is a non-empty string. With a
+-- two-field clean data table the bomb stays asleep.
+
+-- === capture helper: replace prise.notify so we can assert the reply ===
+-- The tiling module captured `prise` via `local prise = require("prise")`
+-- at module load. We swap into the same shared mock table here so the
+-- tiling.lua call site sees our capture function.
+
+local prise_mock = package.loaded["prise"]
+local notify_calls = {}
+local original_notify = prise_mock.notify
+local function install_notify_capture()
+    notify_calls = {}
+    prise_mock.notify = function(method, params)
+        table.insert(notify_calls, { method = method, params = params })
+    end
+end
+local function restore_notify()
+    prise_mock.notify = original_notify
+end
+
+-- === handle_break_pane_request: happy path ("ok" verdict) ===
+
+install_notify_capture()
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+tiling.handle_break_pane_request(2, true, 42)
+s = t.get_state()
+assert(#s.tabs == 2, "broker happy: state mutated — pane broken into new tab")
+assert(s.tabs[2].root.id == 2, "broker happy: new tab root is the moved pane")
+assert(#notify_calls == 1, "broker happy: prise.notify called exactly once")
+assert(notify_calls[1].method == "break_pane_reply", "broker happy: method is break_pane_reply")
+assert(notify_calls[1].params.request_id == 42, "broker happy: request_id echoed verbatim")
+assert(notify_calls[1].params.ok == true, "broker happy: ok=true on successful classify")
+assert(notify_calls[1].params.reason == "ok", "broker happy: reason='ok'")
+restore_notify()
+
+-- === handle_break_pane_request: solo_pane refusal ===
+
+install_notify_capture()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(42), last_focused_id = 42 },
+    },
+    active_tab = 1,
+    focused_id = 42,
+    next_tab_id = 2,
+})
+tiling.handle_break_pane_request(42, true, 7)
+s = t.get_state()
+assert(#s.tabs == 1, "broker solo: state UNCHANGED (no apply on refusal)")
+assert(s.tabs[1].root.id == 42, "broker solo: surviving pane untouched")
+assert(#notify_calls == 1, "broker solo: prise.notify called exactly once")
+assert(notify_calls[1].method == "break_pane_reply", "broker solo: method is break_pane_reply")
+assert(notify_calls[1].params.request_id == 7, "broker solo: request_id echoed")
+assert(notify_calls[1].params.ok == false, "broker solo: ok=false on refusal")
+assert(notify_calls[1].params.reason == "solo_pane", "broker solo: reason='solo_pane'")
+restore_notify()
+
+-- === handle_break_pane_request: pty_not_found refusal ===
+
+install_notify_capture()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(1), last_focused_id = 1 },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+tiling.handle_break_pane_request(999, true, 13)
+s = t.get_state()
+assert(#s.tabs == 1, "broker not_found: state UNCHANGED")
+assert(s.tabs[1].root.id == 1, "broker not_found: surviving pane untouched")
+assert(#notify_calls == 1, "broker not_found: prise.notify called exactly once")
+assert(notify_calls[1].method == "break_pane_reply", "broker not_found: method")
+assert(notify_calls[1].params.request_id == 13, "broker not_found: request_id echoed")
+assert(notify_calls[1].params.ok == false, "broker not_found: ok=false")
+assert(notify_calls[1].params.reason == "pty_not_found", "broker not_found: reason='pty_not_found'")
+restore_notify()
+
+-- === handle_break_pane_request: defensive guard against cross-session bomb ===
+-- Wrap M.update to capture the event arg; verify data table has exactly
+-- two keys (pty_id, focus) and no source_session/cwd/tab_title.
+
+do
+    install_notify_capture()
+    local captured_event = nil
+    local original_update = tiling.update
+    tiling.update = function(event)
+        captured_event = event
+        return original_update(event)
+    end
+
+    t.set_state({
+        tabs = {
+            {
+                id = 1,
+                root = mock_split(10, "row", {
+                    mock_pane(1),
+                    mock_pane(2),
+                }),
+                last_focused_id = 1,
+            },
+        },
+        active_tab = 1,
+        focused_id = 1,
+        next_tab_id = 2,
+    })
+    tiling.handle_break_pane_request(2, true, 99)
+
+    tiling.update = original_update
+    restore_notify()
+
+    assert(captured_event ~= nil, "guard: M.update was called")
+    assert(captured_event.type == "break_pane", "guard: event.type is break_pane")
+    assert(captured_event.data ~= nil, "guard: event.data present")
+    assert(captured_event.data.pty_id == 2, "guard: pty_id passed through")
+    assert(captured_event.data.focus == true, "guard: focus passed through")
+    assert(captured_event.data.source_session == nil, "guard: NO source_session leaked")
+    assert(captured_event.data.cwd == nil, "guard: NO cwd leaked")
+    assert(captured_event.data.tab_title == nil, "guard: NO tab_title leaked")
+    -- Belt-and-suspenders: count the keys to catch any future field additions.
+    local key_count = 0
+    for _ in pairs(captured_event.data) do
+        key_count = key_count + 1
+    end
+    assert(key_count == 2, "guard: data has exactly two keys, got " .. tostring(key_count))
+end
+
+-- === handle_break_pane_applied: convergence happy path ===
+-- Non-broker client receives the broadcast and re-applies the same
+-- mutation. State mirrors what the broker did.
+
+t.set_state({
+    tabs = {
+        {
+            id = 1,
+            root = mock_split(10, "row", {
+                mock_pane(1),
+                mock_pane(2),
+            }),
+            last_focused_id = 1,
+        },
+    },
+    active_tab = 1,
+    focused_id = 1,
+    next_tab_id = 2,
+})
+tiling.handle_break_pane_applied(2, true)
+s = t.get_state()
+assert(#s.tabs == 2, "applied happy: state converged — new tab inserted")
+assert(s.tabs[2].root.id == 2, "applied happy: new tab root is the moved pane")
+assert(s.tabs[1].root.type == "pane", "applied happy: source tab collapsed to single pane")
+assert(s.tabs[1].root.id == 1, "applied happy: surviving pane is pane 1")
+
+-- === handle_break_pane_applied: pty unknown to this client (idempotent) ===
+-- Client B is attached to a different session and doesn't know pty_id
+-- from the broadcast. M.update's break_pane arm sees `not src_tab` and
+-- (with no source_session) falls through `return false` cleanly.
+
+do
+    t.set_state({
+        tabs = {
+            { id = 1, root = mock_pane(100), last_focused_id = 100 },
+        },
+        active_tab = 1,
+        focused_id = 100,
+        next_tab_id = 2,
+    })
+    -- pty_id 999 is not in any tab; should be a clean no-op.
+    local ok, err = pcall(tiling.handle_break_pane_applied, 999, true)
+    assert(ok, "applied unknown: no crash on pty unknown to client, err=" .. tostring(err))
+    s = t.get_state()
+    assert(#s.tabs == 1, "applied unknown: state untouched")
+    assert(s.tabs[1].root.id == 100, "applied unknown: surviving pane unchanged")
+end
+
+-- === handle_break_pane_applied: defensive guard ===
+-- Same defensive contract as handle_break_pane_request — clean two-field
+-- data table to keep the cross-session bomb asleep.
+
+do
+    local captured_event = nil
+    local original_update = tiling.update
+    tiling.update = function(event)
+        captured_event = event
+        return original_update(event)
+    end
+
+    t.set_state({
+        tabs = {
+            {
+                id = 1,
+                root = mock_split(10, "row", {
+                    mock_pane(1),
+                    mock_pane(2),
+                }),
+                last_focused_id = 1,
+            },
+        },
+        active_tab = 1,
+        focused_id = 1,
+        next_tab_id = 2,
+    })
+    tiling.handle_break_pane_applied(2, false)
+
+    tiling.update = original_update
+
+    assert(captured_event ~= nil, "applied guard: M.update was called")
+    assert(captured_event.type == "break_pane", "applied guard: event.type is break_pane")
+    assert(captured_event.data.pty_id == 2, "applied guard: pty_id")
+    assert(captured_event.data.focus == false, "applied guard: focus passed through")
+    assert(captured_event.data.source_session == nil, "applied guard: NO source_session")
+    local key_count = 0
+    for _ in pairs(captured_event.data) do
+        key_count = key_count + 1
+    end
+    assert(key_count == 2, "applied guard: exactly two keys, got " .. tostring(key_count))
+end
