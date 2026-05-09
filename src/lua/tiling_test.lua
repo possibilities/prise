@@ -1843,7 +1843,7 @@ setup_overlay_test({
     test_overlay = { key = "<leader>t", cmd = "htop", width = 80, height = 20 },
 })
 spawn_calls = {}
-t.toggle_overlay("test_overlay")
+tiling.set_overlay("test_overlay")
 st = t.get_state()
 assert(st.overlay_state.test_overlay.pending == true, "toggle spawn: sets pending")
 assert(#spawn_calls == 1, "toggle spawn: calls prise.spawn")
@@ -1854,7 +1854,7 @@ setup_overlay_test({
     shelled = { key = "<leader>w", cmd = "lazygit", shell = true, width = 80, height = 20 },
 })
 spawn_calls = {}
-t.toggle_overlay("shelled")
+tiling.set_overlay("shelled")
 assert(#spawn_calls == 1, "toggle shell opt-in: calls prise.spawn")
 assert(spawn_calls[1].cmd == "lazygit", "toggle shell opt-in: cmd not wrapped when shell = true")
 
@@ -1863,7 +1863,7 @@ setup_overlay_test({
     bare = { key = "<leader>b", width = 80, height = 20 },
 })
 spawn_calls = {}
-t.toggle_overlay("bare")
+tiling.set_overlay("bare")
 assert(#spawn_calls == 1, "toggle nil cmd: calls prise.spawn")
 assert(spawn_calls[1].cmd == nil, "toggle nil cmd: cmd stays nil (no exec prefix)")
 
@@ -1877,7 +1877,7 @@ setup_overlay_test({
     },
 })
 spawn_calls = {}
-t.toggle_overlay("argv_overlay")
+tiling.set_overlay("argv_overlay")
 assert(#spawn_calls == 1, "toggle argv: calls prise.spawn")
 assert(spawn_calls[1].cmd == nil, "toggle argv: cmd is nil")
 assert(type(spawn_calls[1].argv) == "table", "toggle argv: argv passed as table")
@@ -1893,9 +1893,9 @@ tab = st.tabs[1]
 tab.overlays = {
     test_vis = { pane = mock_pane(42), visible = true },
 }
-t.toggle_overlay("test_vis")
+tiling.set_overlay("test_vis")
 assert(tab.overlays.test_vis.visible == false, "toggle vis: hides visible overlay")
-t.toggle_overlay("test_vis")
+tiling.set_overlay("test_vis")
 assert(tab.overlays.test_vis.visible == true, "toggle vis: shows hidden overlay")
 
 -- Test: active_overlay_name tracks last toggled visible
@@ -1909,11 +1909,11 @@ tab.overlays = {
     ov_a = { pane = mock_pane(10), visible = false },
     ov_b = { pane = mock_pane(20), visible = false },
 }
-t.toggle_overlay("ov_a")
+tiling.set_overlay("ov_a")
 assert(st.active_overlay_name == "ov_a", "active overlay: set on toggle visible")
-t.toggle_overlay("ov_b")
+tiling.set_overlay("ov_b")
 assert(st.active_overlay_name == "ov_b", "active overlay: updated to latest")
-t.toggle_overlay("ov_b")
+tiling.set_overlay("ov_b")
 assert(st.active_overlay_name == nil, "active overlay: cleared on toggle hidden")
 
 -- Test: get_active_overlay returns active visible overlay
