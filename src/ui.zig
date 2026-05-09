@@ -1435,6 +1435,32 @@ pub const UI = struct {
         self.allocator.destroy(lookup_ctx);
     }
 
+    /// Paint tab-bar metadata (ids, titles, active tab, scroll offset) without
+    /// any pty binding. Used at session-switch derivation time so the tab bar
+    /// can swap old->new in a single frame before attach_pty completes. A
+    /// follow-up setStateFromJson call after attach rebinds live pty refs.
+    ///
+    /// Contract mirrors setStateFromJson's Lua-call mechanics, but invokes
+    /// `set_tab_shell` which takes only the decoded JSON table (no pty_lookup).
+    pub fn setTabShell(self: *UI, json: []const u8) !void {
+        _ = self.lua.getField(ziglua.registry_index, "prise_ui");
+        defer self.lua.pop(1);
+
+        _ = self.lua.getField(-1, "set_tab_shell");
+        if (self.lua.typeOf(-1) != .function) {
+            return error.NoSetTabShellFunction;
+        }
+
+        try jsonToLuaTable(self.lua, self.allocator, json);
+
+        self.lua.protectedCall(.{ .args = 1, .results = 0, .msg_handler = 0 }) catch |err| {
+            const msg = self.lua.toString(-1) catch "Unknown Lua error";
+            log.err("Lua set_tab_shell error: {s}", .{msg});
+            self.lua.pop(1);
+            return err;
+        };
+    }
+
     fn ptyLookupWrapper(lua: *ziglua.Lua) i32 {
         const LookupCtx = struct {
             ctx: *anyopaque,

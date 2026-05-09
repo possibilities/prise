@@ -166,7 +166,7 @@ A custom UI must return a table with:
 - **update(event)**: Handle input events
 - **view()**: Return widget tree to render
 - **get_state(cwd_lookup)**: Serialize state for persistence (optional)
-- **set_state(saved, pty_lookup)**: Restore state (optional)
+- **set_state(saved, pty_lookup)**: Restore state (optional). During session-switch derivation, **set_tab_shell(plan_json)** is called first to paint tab metadata (ids, titles, active tab, scroll offset) before PTY attach; a follow-up **set_state** call after **attach_pty** completes rebinds live pty refs.
 
 Custom UIs may also expose optional helpers used by configuration code:
 
