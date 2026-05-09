@@ -162,6 +162,27 @@ The **tab_bar** table configures the tab bar.
 **show_single_tab**
 :   Show the tab bar even with only one tab. Default: **false**
 
+When using a custom **tab_bar.render** function, returned segments may include
+**tab_index** to mark which tab they belong to. This lets hover and click
+regions match the rendered tab structure exactly.
+
+Example:
+
+```lua
+ui.setup({
+    tab_bar = {
+        render = function(tabs)
+            local segments = {}
+            for _, tab in ipairs(tabs) do
+                table.insert(segments, { text = " " .. tab.title, tab_index = tab.index })
+                table.insert(segments, { text = " x ", tab_index = tab.index })
+            end
+            return segments
+        end,
+    },
+})
+```
+
 # LAYOUTS
 
 The **layouts** table defines named layout presets for tabs and panes.
