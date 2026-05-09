@@ -1082,6 +1082,11 @@ fn buildRedrawMessageFromPty(
 
 const Client = struct {
     fd: posix.fd_t,
+    /// Per-process-lifetime stable id, assigned monotonically at accept-time
+    /// from `Server.next_client_id`. Used as the deterministic broker-pick key
+    /// for the client-broker RPC pattern (lowest id among attached clients).
+    /// Resets on server restart — clients re-attach and pick a new lowest.
+    id: usize = 0,
     server: *Server,
     // 4096 bytes is sufficient for typical RPC messages while staying
     // small enough for stack allocation. Larger messages are handled
@@ -2040,6 +2045,11 @@ const Server = struct {
     clients: std.ArrayList(*Client),
     ptys: std.AutoHashMap(usize, *Pty),
     next_pty_id: usize = 0,
+    /// Monotonic per-process-lifetime counter for `Client.id`. Bumped at
+    /// accept-time. Lowest assigned id among attached clients is the
+    /// deterministic broker for the client-broker RPC pattern (e.g.
+    /// break_pane). Resets on server restart.
+    next_client_id: usize = 0,
     accepting: bool = true,
     accept_task: ?io.Task = null,
     exit_on_idle: bool = false,
@@ -2680,15 +2690,17 @@ const Server = struct {
                 const client = try self.allocator.create(Client);
                 client.* = .{
                     .fd = client_fd,
+                    .id = self.next_client_id,
                     .server = self,
                     .msg_buffer = std.ArrayList(u8).empty,
                     .send_queue = std.ArrayList([]u8).empty,
                     .attached_ptys = std.ArrayList(usize).empty,
                     // .style_cache = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(self.allocator),
                 };
+                self.next_client_id += 1;
                 try self.clients.append(self.allocator, client);
                 std.debug.assert(self.clients.items.len <= LIMITS.CLIENTS_MAX);
-                std.log.debug("Total clients: {}", .{self.clients.items.len});
+                std.log.debug("Total clients: {} (assigned id={})", .{ self.clients.items.len, client.id });
 
                 // Start recv to detect disconnect
                 _ = try loop.recv(client_fd, &client.recv_buffer, .{
