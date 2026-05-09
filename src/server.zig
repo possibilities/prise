@@ -36,6 +36,44 @@ pub const LIMITS = struct {
     pub const COLOR_QUERY_MAX: usize = 32;
     pub const RESPONSE_QUEUE_MAX: usize = 64;
     pub const COLOR_QUERY_TIMEOUT_MS: i64 = 5000;
+    /// Defensive ceiling on in-flight client-broker RPC requests
+    /// (e.g. break_pane). Single-user case will never approach 64; the
+    /// limit guards against runaway state from a misbehaving caller.
+    pub const PENDING_MAX: usize = 64;
+    /// Default deadline for a pending broker-RPC: well above local UDS
+    /// RTT, well below "is it broken" user threshold. Sweep timer fires
+    /// `broker_timeout` to the originating CLI when exceeded.
+    pub const PENDING_DEADLINE_MS: i64 = 2000;
+    /// Cadence for the deadline-sweep timer that retires expired
+    /// pending entries. Bounded delay between deadline-exceeded and
+    /// timeout reply.
+    pub const PENDING_SWEEP_MS: u64 = 250;
+};
+
+/// In-flight client-broker RPC request awaiting a reply notification
+/// from the chosen broker client. Currently used only by `break_pane`,
+/// but the shape is method-agnostic — extend with method-specific
+/// fields as more brokered RPCs land.
+const PendingBreak = struct {
+    /// msgid of the original CLI request — needed to build the
+    /// matching Response to the originator when the broker replies
+    /// (or when the deadline sweep / removeClient retires the entry).
+    cli_msgid: u32,
+    /// The CLI client awaiting the reply. We may need to send a
+    /// Response (success/failure) to this client.
+    cli_client: *Client,
+    /// `Client.id` of the chosen broker. Used for matching against
+    /// `removeClient` (broker disconnected → reply `broker_timeout`).
+    broker_id: usize,
+    /// Wall-clock deadline (ms since epoch). Sweep timer compares
+    /// against `std.time.milliTimestamp()`.
+    deadline_ts: i64,
+    /// Pty id from the original request — replayed in the
+    /// `break_pane_applied` broadcast on success.
+    pty_id: u32,
+    /// Focus flag from the original request — replayed in the
+    /// `break_pane_applied` broadcast on success.
+    focus: bool,
 };
 
 var signal_write_fd: posix.fd_t = undefined;
@@ -2050,6 +2088,19 @@ const Server = struct {
     /// deterministic broker for the client-broker RPC pattern (e.g.
     /// break_pane). Resets on server restart.
     next_client_id: usize = 0,
+    /// In-flight client-broker RPC requests, keyed by request_id.
+    /// Capped at `LIMITS.PENDING_MAX`. Entries are dropped when the
+    /// broker replies, when the deadline-sweep timer expires the
+    /// request, or when either end disconnects.
+    pending: std.AutoHashMap(usize, PendingBreak),
+    /// Monotonic counter for the broker-RPC `request_id` field. Lives
+    /// in the notification payload (NOT the msgpack-RPC msgid) to
+    /// correlate the broker's reply back to the originating CLI.
+    next_request_id: usize = 0,
+    /// Handle on the re-arming deadline-sweep timer. `null` until the
+    /// first pending entry triggers timer arm; reset to `null` in the
+    /// timer callback before re-arming.
+    pending_sweep_timer: ?io.Task = null,
     accepting: bool = true,
     accept_task: ?io.Task = null,
     exit_on_idle: bool = false,
@@ -3191,6 +3242,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .socket_path = socket_path,
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .signal_pipe_fds = signal_pipe_fds,
         .start_time_ms = std.time.milliTimestamp(),
     };
@@ -3205,6 +3257,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         }
         server.clients.deinit(allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     // Start accepting connections
@@ -3253,11 +3306,13 @@ test "server lifecycle - shutdown when no clients" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
     defer server.clients.deinit(testing.allocator);
     defer server.ptys.deinit();
+    defer server.pending.deinit();
 
     server.accept_task = try loop.accept(100, .{
         .ptr = &server,
@@ -3286,6 +3341,7 @@ test "server lifecycle - accept client connection" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -3294,6 +3350,7 @@ test "server lifecycle - accept client connection" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3321,6 +3378,7 @@ test "server lifecycle - client disconnect triggers shutdown" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
@@ -3330,6 +3388,7 @@ test "server lifecycle - client disconnect triggers shutdown" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3363,6 +3422,7 @@ test "server lifecycle - multiple clients" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
@@ -3372,6 +3432,7 @@ test "server lifecycle - multiple clients" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3422,6 +3483,7 @@ test "server lifecycle - recv error triggers disconnect" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
@@ -3431,6 +3493,7 @@ test "server lifecycle - recv error triggers disconnect" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3727,6 +3790,7 @@ test "server - pty exit notification" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -3741,6 +3805,7 @@ test "server - pty exit notification" {
         server.clients.deinit(allocator);
         // PTY is now cleaned up by onPtyDirty when it exits, so just deinit the map
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     // Add a client
