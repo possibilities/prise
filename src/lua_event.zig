@@ -41,6 +41,17 @@ pub const CwdChangedInfo = struct {
     cwd: []const u8,
 };
 
+pub const BreakPaneRequestInfo = struct {
+    pty_id: u32,
+    focus: bool,
+    request_id: usize,
+};
+
+pub const BreakPaneAppliedInfo = struct {
+    pty_id: u32,
+    focus: bool,
+};
+
 pub const Event = union(enum) {
     vaxis: vaxis.Event,
     mouse: MouseEvent,
@@ -50,6 +61,14 @@ pub const Event = union(enum) {
     pty_exited: PtyExitedInfo,
     cwd_changed: CwdChangedInfo,
     init: void,
+    /// Broker-side entry point: server asks the chosen broker client
+    /// to classify + apply a break_pane and reply via prise.notify
+    /// ("break_pane_reply", ...). See fn-388-break-pane-rpc-broker-pattern.
+    break_pane_request: BreakPaneRequestInfo,
+    /// Convergence-side entry point: server tells non-broker clients
+    /// that a break_pane was applied; they re-run the same mutation
+    /// locally so their tile-tree mirror catches up.
+    break_pane_applied: BreakPaneAppliedInfo,
 };
 
 pub const SplitResizeEvent = struct {
@@ -110,7 +129,35 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
         .split_resize => |sr| pushSplitResizeEvent(lua, sr),
         .mouse => |m| pushMouseEvent(lua, m),
         .vaxis => |vaxis_event| pushVaxisEvent(lua, vaxis_event),
+        .break_pane_request => |info| pushBreakPaneRequestEvent(lua, info),
+        .break_pane_applied => |info| pushBreakPaneAppliedEvent(lua, info),
     }
+}
+
+fn pushBreakPaneRequestEvent(lua: *ziglua.Lua, info: BreakPaneRequestInfo) void {
+    _ = lua.pushString("break_pane_request");
+    lua.setField(-2, "type");
+
+    lua.createTable(0, 3);
+    lua.pushInteger(@intCast(info.pty_id));
+    lua.setField(-2, "pty_id");
+    lua.pushBoolean(info.focus);
+    lua.setField(-2, "focus");
+    lua.pushInteger(@intCast(info.request_id));
+    lua.setField(-2, "request_id");
+    lua.setField(-2, "data");
+}
+
+fn pushBreakPaneAppliedEvent(lua: *ziglua.Lua, info: BreakPaneAppliedInfo) void {
+    _ = lua.pushString("break_pane_applied");
+    lua.setField(-2, "type");
+
+    lua.createTable(0, 2);
+    lua.pushInteger(@intCast(info.pty_id));
+    lua.setField(-2, "pty_id");
+    lua.pushBoolean(info.focus);
+    lua.setField(-2, "focus");
+    lua.setField(-2, "data");
 }
 
 fn pushInitEvent(lua: *ziglua.Lua) void {
