@@ -2520,9 +2520,19 @@ const Server = struct {
         // the CLI is blocked on this Response.
         try cli_client.sendBreakPaneResponse(self.loop, cli_msgid, parsed.ok, parsed.reason);
 
-        // TODO(fn-388-...1 phase 8): on ok=true, fire
-        // sendBreakPaneApplied(broker_id, pty_id, focus) to fan out a
-        // convergence notification to non-broker attached clients.
+        // On ok=true, fan out `break_pane_applied` to non-broker
+        // attached clients so their tile-tree mirrors converge. Best
+        // effort: broadcast send errors do not roll back the CLI
+        // Response (which has already been queued).
+        if (parsed.ok) {
+            self.sendBreakPaneApplied(
+                entry.value.broker_id,
+                entry.value.pty_id,
+                entry.value.focus,
+            ) catch |err| {
+                log.warn("break_pane_reply: sendBreakPaneApplied failed: {}", .{err});
+            };
+        }
     }
 
     /// Handle the `break_pane` Request: pick a deterministic broker among
@@ -3099,6 +3109,50 @@ const Server = struct {
         });
 
         try broker.sendData(self.loop, msg_bytes);
+    }
+
+    /// Broadcast a `break_pane_applied` Notification to all attached
+    /// clients EXCEPT the broker. Mirrors `sendPtyExited`'s loop, but
+    /// gates on `attached_ptys.items.len > 0` (only attached UIs care)
+    /// and skips the broker (which already knows — it just applied
+    /// the change locally and reported `ok=true`).
+    ///
+    /// Wire envelope: `[2, "break_pane_applied", {pty_id, focus}]`.
+    /// Sibling clients use this to converge their tile-tree mirror
+    /// without having to refetch state.
+    ///
+    /// Best-effort per-client: a per-client send failure is logged
+    /// and the loop continues — one stuck client must not block
+    /// convergence on the others.
+    fn sendBreakPaneApplied(self: *Server, broker_id: usize, pty_id: u32, focus: bool) !void {
+        const map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{
+            .key = .{ .string = "pty_id" },
+            .value = .{ .unsigned = pty_id },
+        };
+        map_items[1] = .{
+            .key = .{ .string = "focus" },
+            .value = .{ .boolean = focus },
+        };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "break_pane_applied", params });
+        defer self.allocator.free(msg_bytes);
+
+        log.info("break_pane_applied: pty_id={} focus={} (excluding broker_id={})", .{
+            pty_id,
+            focus,
+            broker_id,
+        });
+
+        for (self.clients.items) |client| {
+            if (client.id == broker_id) continue;
+            if (client.attached_ptys.items.len == 0) continue;
+            client.sendData(self.loop, msg_bytes) catch |err| {
+                log.warn("break_pane_applied: send to client id={} failed: {}", .{ client.id, err });
+            };
+        }
     }
 
     /// Send redraw notification (bytes) to attached clients
@@ -4357,6 +4411,121 @@ test "handleBreakPaneReply - malformed payload silently dropped" {
     };
     try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &bad } });
     try testing.expectEqual(@as(usize, 0), server.pending.count());
+}
+
+test "handleBreakPaneReply - ok path broadcasts to non-broker attached clients" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Three attached clients: id=1 (broker, fd=201), id=2 (fd=202), id=3 (fd=203).
+    const ids = [_]usize{ 1, 2, 3 };
+    for (ids) |client_id| {
+        const c = try allocator.create(Client);
+        c.* = .{
+            .fd = @intCast(200 + @as(i32, @intCast(client_id))),
+            .id = client_id,
+            .server = &server,
+            .msg_buffer = std.ArrayList(u8).empty,
+            .send_queue = std.ArrayList([]u8).empty,
+            .attached_ptys = std.ArrayList(usize).empty,
+        };
+        try c.attached_ptys.append(allocator, 5);
+        try server.clients.append(allocator, c);
+    }
+
+    // CLI client (originator), unattached (acts as the requester).
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pre-populate a pending entry as if `handleBreakPane` wrote it,
+    // pointing at broker id=1 with pty_id=5, focus=true.
+    try server.pending.put(0, .{
+        .cli_msgid = 77,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 2000,
+        .pty_id = 5,
+        .focus = true,
+    });
+
+    // Broker fires ok=true reply for request_id=0.
+    var reply_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+
+    // Pending dropped, CLI got its ok=true Response.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+    const cli_msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(cli_msg_opt != null);
+    const cli_msg = cli_msg_opt.?;
+    defer cli_msg.deinit(allocator);
+    try testing.expect(cli_msg == .response);
+
+    // Sibling clients (id=2 fd=202, id=3 fd=203) each got a
+    // break_pane_applied Notification.
+    for ([_]posix.fd_t{ 202, 203 }) |sibling_fd| {
+        const sibling_msg_opt = try findPendingSendOnFd(allocator, &loop, sibling_fd);
+        try testing.expect(sibling_msg_opt != null);
+        const sibling_msg = sibling_msg_opt.?;
+        defer sibling_msg.deinit(allocator);
+        try testing.expect(sibling_msg == .notification);
+        try testing.expectEqualStrings("break_pane_applied", sibling_msg.notification.method);
+
+        var saw_pty_id = false;
+        var saw_focus = false;
+        try testing.expect(sibling_msg.notification.params == .map);
+        for (sibling_msg.notification.params.map) |kv| {
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                try testing.expectEqual(@as(u64, 5), kv.value.unsigned);
+                saw_pty_id = true;
+            } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+                try testing.expectEqual(true, kv.value.boolean);
+                saw_focus = true;
+            }
+        }
+        try testing.expect(saw_pty_id);
+        try testing.expect(saw_focus);
+    }
+
+    // Broker (id=1, fd=201) MUST NOT receive break_pane_applied.
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 201)) == null);
 }
 
 test "handleBreakPane - zero attached clients sends synchronous session_not_attached" {
