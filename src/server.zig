@@ -1232,19 +1232,20 @@ fn buildRedrawMessageFromPty(
 }
 
 const Client = struct {
-    /// Monotonic id assigned by the server at onAccept time. Stable for
-    /// the lifetime of the connection and never reused. Exposed to plugs
-    /// via the client_connected / client_disconnected / pty_attach /
-    /// pty_detach notifications and addressable through notify_plug_client.
-    /// Default is 0 so the hand-rolled Client literals in tests keep
-    /// compiling — the production path always overwrites it in onAccept.
-    id: u64 = 0,
-    fd: posix.fd_t,
-    /// Per-process-lifetime stable id, assigned monotonically at accept-time
-    /// from `Server.next_client_id`. Used as the deterministic broker-pick key
-    /// for the client-broker RPC pattern (lowest id among attached clients).
+    /// Monotonic id assigned by the server at onAccept time, sourced from
+    /// `Server.next_client_id`. Stable for the lifetime of the connection
+    /// and never reused. Two consumers:
+    ///   1. Plug lifecycle events: exposed to plugs via the
+    ///      client_connected / client_disconnected / pty_attach /
+    ///      pty_detach notifications and addressable through
+    ///      notify_plug_client.
+    ///   2. The deterministic broker-pick key for the client-broker RPC
+    ///      pattern (lowest id among attached clients).
     /// Resets on server restart — clients re-attach and pick a new lowest.
+    /// Default is 0 so hand-rolled Client literals in tests keep compiling —
+    /// the production path always overwrites it in onAccept.
     id: usize = 0,
+    fd: posix.fd_t,
     server: *Server,
     // 4096 bytes is sufficient for typical RPC messages while staying
     // small enough for stack allocation. Larger messages are handled
@@ -2401,10 +2402,14 @@ const Server = struct {
     ptys: std.AutoHashMap(usize, *Pty),
     next_pty_id: usize = 0,
     /// Monotonic per-process-lifetime counter for `Client.id`. Bumped at
-    /// accept-time. Lowest assigned id among attached clients is the
-    /// deterministic broker for the client-broker RPC pattern (e.g.
-    /// break_pane). Resets on server restart.
-    next_client_id: usize = 0,
+    /// accept-time. Two consumers:
+    ///   1. Plug lifecycle events: id is exposed to plugs via the
+    ///      client_connected / client_disconnected notifications.
+    ///   2. The deterministic broker-pick key for the client-broker RPC
+    ///      pattern (lowest id among attached clients drives e.g.
+    ///      break_pane). Resets on server restart. Starts at 1 so 0 can
+    ///      encode "unknown client" in payloads if ever needed.
+    next_client_id: usize = 1,
     /// In-flight client-broker RPC requests, keyed by request_id.
     /// Capped at `LIMITS.PENDING_MAX`. Entries are dropped when the
     /// broker replies, when the deadline-sweep timer expires the
@@ -2440,9 +2445,6 @@ const Server = struct {
     sweep_timer_task: ?io.Task = null,
     /// Set true during shutdown to gate restart timer callbacks.
     shutting_down: bool = false,
-    /// Monotonic allocator for Client.id. Starts at 1 so 0 can encode
-    /// "unknown client" in payloads if ever needed.
-    next_client_id: u64 = 1,
 
     const ParsedSpawnPty = struct {
         size: pty.Winsize,
@@ -3673,7 +3675,7 @@ const Server = struct {
     /// Send a single client_connected notification to one specific plug.
     /// Used by the register-time replay path so the new plug sees an event
     /// for every existing non-plug client without re-broadcasting.
-    fn sendClientConnectedTo(self: *Server, plug_client: *Client, client_id: u64) void {
+    fn sendClientConnectedTo(self: *Server, plug_client: *Client, client_id: usize) void {
         var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
             log.err("Failed to alloc client_connected replay: {}", .{err});
             return;
@@ -4009,7 +4011,7 @@ const Server = struct {
     fn handleNotifyPlugClient(self: *Server, params: msgpack.Value) !msgpack.Value {
         if (params != .map) return error.InvalidParams;
 
-        var client_id: ?u64 = null;
+        var client_id: ?usize = null;
         var method: ?[]const u8 = null;
         var notif_params: msgpack.Value = .nil;
 
@@ -4855,7 +4857,7 @@ const Server = struct {
     /// plugs under the given event name. Used for client_connected and
     /// client_disconnected. Allocation failures are logged and swallowed —
     /// one missed event does not warrant unwinding the caller.
-    fn forwardClientEvent(self: *Server, event_name: []const u8, client_id: u64) void {
+    fn forwardClientEvent(self: *Server, event_name: []const u8, client_id: usize) void {
         var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
             log.err("Failed to alloc {s} forward: {}", .{ event_name, err });
             return;
@@ -4876,7 +4878,7 @@ const Server = struct {
     /// Encode `{client_id, pty_id}` and forward it to subscribed plugs. Used
     /// for pty_attach and pty_detach — a plug subscribed to either gets the
     /// pair that lets it reconstruct which client is holding which pty.
-    fn forwardPtyClientEvent(self: *Server, event_name: []const u8, client_id: u64, pty_id: usize) void {
+    fn forwardPtyClientEvent(self: *Server, event_name: []const u8, client_id: usize, pty_id: usize) void {
         var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 2) catch |err| {
             log.err("Failed to alloc {s} forward: {}", .{ event_name, err });
             return;
@@ -9897,9 +9899,9 @@ test "next_client_id is monotonic and unique" {
     const third = server.next_client_id;
     server.next_client_id += 1;
 
-    try testing.expectEqual(@as(u64, 1), first);
-    try testing.expectEqual(@as(u64, 2), second);
-    try testing.expectEqual(@as(u64, 3), third);
+    try testing.expectEqual(@as(usize, 1), first);
+    try testing.expectEqual(@as(usize, 2), second);
+    try testing.expectEqual(@as(usize, 3), third);
     try testing.expect(first != second and second != third and first != third);
 }
 
