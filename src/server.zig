@@ -3205,6 +3205,8 @@ const Server = struct {
             return self.handleClearSelection(params);
         } else if (std.mem.eql(u8, method, "rename_tab")) {
             return self.handleRenameTab(client, params);
+        } else if (std.mem.eql(u8, method, "session_switch")) {
+            return try self.handleSessionSwitch(params);
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "unknown method") };
         }
@@ -3624,6 +3626,59 @@ const Server = struct {
 
         // Update timestamp
         pty_instance.last_render_time = std.time.milliTimestamp();
+    }
+
+    /// Handle session_switch RPC: find the client owning the given PTY and
+    /// send it a session_switch notification so it calls switchToSession.
+    fn handleSessionSwitch(self: *Server, params: msgpack.Value) !msgpack.Value {
+        if (params != .map) return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
+
+        var pty_id: ?usize = null;
+        var session: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .unsigned => |u| @intCast(u),
+                    .integer => |i| @intCast(i),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "session")) {
+                session = if (kv.value == .string) kv.value.string else null;
+            }
+        }
+
+        const target_pty_id = pty_id orelse return msgpack.Value{ .string = try self.allocator.dupe(u8, "missing pty_id") };
+        const target_session = session orelse return msgpack.Value{ .string = try self.allocator.dupe(u8, "missing session") };
+
+        // Find which client owns this PTY
+        var target_client: ?*Client = null;
+        for (self.clients.items) |c| {
+            for (c.attached_ptys.items) |pid| {
+                if (pid == target_pty_id) {
+                    target_client = c;
+                    break;
+                }
+            }
+            if (target_client != null) break;
+        }
+
+        const owner = target_client orelse return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not attached to any client") };
+
+        // Send session_switch notification to the owning client
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "session" }, .value = .{ .string = target_session } };
+
+        const notif_params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "session_switch", notif_params });
+        defer self.allocator.free(msg_bytes);
+
+        try owner.sendData(self.loop, msg_bytes);
+
+        log.info("Sent session_switch notification to client for PTY {} -> session '{s}'", .{ target_pty_id, target_session });
+        return msgpack.Value{ .boolean = true };
     }
 
     /// Build and send pty_exited notification to all clients
