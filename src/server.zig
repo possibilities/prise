@@ -3036,6 +3036,60 @@ const Server = struct {
     fn removeClient(self: *Server, client: *Client) void {
         std.log.debug("Removing client fd={}", .{client.fd});
 
+        // Sweep pending broker-RPC entries that mention `client`. A
+        // single pending entry matches at most one of these cases (the
+        // CLI and broker are distinct clients in the normal flow):
+        //
+        //   broker-side (broker_id == client.id): synthesise a
+        //     `broker_timeout` reply to the CLI before its 2s deadline,
+        //     since we know the broker is gone. Drop the entry.
+        //   cli-side  (cli_client == client):     the CLI socket is
+        //     already closing — no Response can be delivered. Drop
+        //     the entry without replying.
+        //
+        // Snapshot-then-iterate to avoid hashmap iterator invalidation
+        // while we mutate via `remove`. Per-CLI send failures are
+        // logged and the loop continues.
+        var to_drop = std.ArrayList(usize).empty;
+        defer to_drop.deinit(self.allocator);
+
+        var pending_it = self.pending.iterator();
+        while (pending_it.next()) |entry| {
+            if (entry.value_ptr.broker_id == client.id or
+                entry.value_ptr.cli_client == client)
+            {
+                to_drop.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    log.warn("removeClient: pending snapshot append failed: {}", .{err});
+                    break;
+                };
+            }
+        }
+
+        for (to_drop.items) |request_id| {
+            const entry = self.pending.fetchRemove(request_id) orelse continue;
+            const broker_gone = entry.value.broker_id == client.id;
+            const cli_gone = entry.value.cli_client == client;
+
+            if (broker_gone and !cli_gone) {
+                log.info("event=\"rpc.broker.disconnect\" request_id={} broker_id={}", .{
+                    request_id,
+                    entry.value.broker_id,
+                });
+                entry.value.cli_client.sendBreakPaneResponse(
+                    self.loop,
+                    entry.value.cli_msgid,
+                    false,
+                    "broker_timeout",
+                ) catch |err| {
+                    log.warn("removeClient: broker_timeout reply failed: {}", .{err});
+                };
+            } else {
+                // cli_gone (or both, in a pathological self-broker case
+                // — drop without replying since the CLI socket is gone).
+                log.info("event=\"rpc.broker.cli_disconnect\" request_id={}", .{request_id});
+            }
+        }
+
         // Remove client from any PTYs it was attached to (but don't kill them)
         for (client.attached_ptys.items) |pty_id| {
             if (self.ptys.get(pty_id)) |pty_instance| {
@@ -4704,6 +4758,194 @@ test "sweepPending - expired entries reply broker_timeout and drop" {
     }
     try testing.expect(saw_ok);
     try testing.expect(saw_reason);
+}
+
+test "removeClient - broker disconnect replies broker_timeout to CLI" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+        .exit_on_idle = false,
+    };
+    defer {
+        // Survivors only — `removeClient` already tore down the broker.
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Broker (id=1) and an unrelated CLI client (id=99).
+    const broker = try allocator.create(Client);
+    broker.* = .{
+        .fd = 201,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, broker);
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pending entry: broker_id=1, cli_client=cli — broker is the one
+    // about to disappear. Deadline is far in the future to prove the
+    // sweep is purely disconnect-driven, not deadline-driven.
+    try server.pending.put(0, .{
+        .cli_msgid = 55,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 9,
+        .focus = false,
+    });
+
+    server.removeClient(broker);
+
+    // Pending entry dropped.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+
+    // CLI received a broker_timeout Response.
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 55), msg.response.msgid);
+    try testing.expect(msg.response.result == .map);
+
+    var saw_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expectEqual(false, kv.value.boolean);
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("broker_timeout", kv.value.string);
+            saw_reason = true;
+        }
+    }
+    try testing.expect(saw_reason);
+}
+
+test "removeClient - cli disconnect drops pending without reply" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+        .exit_on_idle = false,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // CLI (id=99) and a separate broker that survives (id=1).
+    const broker = try allocator.create(Client);
+    broker.* = .{
+        .fd = 201,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, broker);
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    try server.pending.put(0, .{
+        .cli_msgid = 56,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 9,
+        .focus = false,
+    });
+
+    // Capture pending-send fds BEFORE removeClient so we can prove no
+    // spurious sends were queued by the sweep. cancelByFd will drop
+    // any send queued to the CLI's own fd, which we don't want here.
+    const before_count = blk: {
+        var n: usize = 0;
+        var it = loop.pending.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.kind == .send) n += 1;
+        }
+        break :blk n;
+    };
+
+    server.removeClient(cli);
+
+    // Pending entry dropped.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+
+    // No new send queued anywhere (the CLI socket is gone, so no
+    // Response is attempted; the broker is unrelated to this entry).
+    const after_count = blk: {
+        var n: usize = 0;
+        var it = loop.pending.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.kind == .send) n += 1;
+        }
+        break :blk n;
+    };
+    try testing.expectEqual(before_count, after_count);
 }
 
 test "handleBreakPane - zero attached clients sends synchronous session_not_attached" {
