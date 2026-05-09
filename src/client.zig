@@ -850,6 +850,17 @@ pub const App = struct {
     /// Lua's interpreter aborts in luaD_precall. See `keep_attached` path.
     pending_session_switch: ?[]const u8 = null,
 
+    /// Set by the requestFrame Lua binding when `prise.request_frame()` is
+    /// called from inside a ui.update pcall (tiling.lua dispatch, rename
+    /// handlers, break_pane, etc.). Drained from the outer event-loop tick
+    /// via drainPendingFrameRequest — we must not call scheduleRender
+    /// synchronously from the binding because scheduleRender fires render()
+    /// directly past its 8 ms throttle, which walks the widget tree from
+    /// the Lua pcall's stack and segfaults on any mid-teardown widget
+    /// (orphaned overlay after session switch, freed vaxis_input, stale
+    /// Positioned.child pointer).
+    pending_frame_request: bool = false,
+
     pub const PendingColorQuery = struct {
         pty_id: u32,
         target: ServerAction.ColorQueryTarget.Target,
@@ -1171,15 +1182,17 @@ pub const App = struct {
             }
         }.spawnCb);
 
-        // Register redraw callback
-        self.ui.setRedrawCallback(self, struct {
-            fn redrawCb(ctx: *anyopaque) void {
+        // Register queue-frame-request callback. The binding just sets the
+        // pending flag — drainPendingFrameRequest (run from onPipeRead /
+        // onRecv outside any outer ui.update pcall) is what actually calls
+        // scheduleRender. See pending_frame_request comment for why this
+        // cannot synchronously re-enter render.
+        self.ui.setQueueFrameRequestCallback(self, struct {
+            fn queueCb(ctx: *anyopaque) void {
                 const app_ptr: *App = @ptrCast(@alignCast(ctx));
-                app_ptr.scheduleRender() catch |err| {
-                    log.err("Failed to schedule render: {}", .{err});
-                };
+                app_ptr.pending_frame_request = true;
             }
-        }.redrawCb);
+        }.queueCb);
 
         // Register detach callback
         self.ui.setDetachCallback(self, struct {
@@ -1339,12 +1352,15 @@ pub const App = struct {
         // or recv_task's callback. Safe here because we're on onPipeRead's
         // stack, not recv_task's. Ordering matters: a pending session
         // switch must win over an incidental empty-state force-quit (the
-        // keep_attached path races these two against each other). See
-        // PR #112 and detachIfPending for the re-entrancy hazard these
-        // flags exist to avoid.
+        // keep_attached path races these two against each other). A
+        // deferred frame request is drained last so any render lands
+        // against the already-reconciled app state. See PR #112 and
+        // detachIfPending for the re-entrancy hazard these flags
+        // exist to avoid.
         app.switchSessionIfPending();
         app.forceQuitIfPending();
         app.detachIfPending();
+        app.drainPendingFrameRequest();
         if (app.state.should_quit) return;
 
         switch (completion.result) {
@@ -1377,6 +1393,10 @@ pub const App = struct {
                 if (i > 0) {
                     try app.pipe_buf.replaceRange(app.allocator, 0, i, &.{});
                 }
+
+                // Drain again before returning to the event loop — handleVaxisEvent
+                // may have called ui.update → prise.request_frame during this tick.
+                app.drainPendingFrameRequest();
 
                 // Keep reading unless we're quitting
                 if (!app.state.should_quit) {
@@ -1938,6 +1958,19 @@ pub const App = struct {
         }
     }
 
+    /// Runs a render scheduled by the requestFrame Lua binding, outside any
+    /// outer ui.update pcall. Called from the event-loop tick (onPipeRead /
+    /// onRecv) — we are no longer on a Lua pcall frame, so scheduleRender
+    /// can safely walk the widget tree. See `pending_frame_request`.
+    fn drainPendingFrameRequest(self: *App) void {
+        if (!self.pending_frame_request) return;
+        self.pending_frame_request = false;
+        if (self.state.should_quit) return;
+        self.scheduleRender() catch |err| {
+            log.err("drainPendingFrameRequest: scheduleRender failed: {}", .{err});
+        };
+    }
+
     fn onRenderTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
         _ = loop;
         const app = completion.userdataCast(App);
@@ -2278,6 +2311,14 @@ pub const App = struct {
         const app = completion.userdataCast(@This());
         defer _ = app.msg_arena.reset(.retain_capacity);
         const arena = app.msg_arena.allocator();
+
+        // Drain render requests queued during a previous tick's ui.update
+        // pcall (server-path events — pty_exited, cwd_changed — reach Lua
+        // handlers that may call prise.request_frame). Deferred because
+        // server message processing below also runs ui.update; we drain
+        // both on entry and before scheduling the next recv.
+        app.drainPendingFrameRequest();
+        if (app.state.should_quit) return;
 
         switch (completion.result) {
             .recv => |initial_bytes_read| {
@@ -2789,8 +2830,11 @@ pub const App = struct {
                 // past all Lua processing for the current batch and
                 // switchToSession does not touch recv_task — only
                 // forceQuitIfPending / detachIfPending cancel it, and those
-                // remain onPipeRead-only.
+                // remain onPipeRead-only. drainPendingFrameRequest lands
+                // after so any frame queued by a handler paints against
+                // the already-reconciled session state.
                 app.switchSessionIfPending();
+                app.drainPendingFrameRequest();
 
                 // Keep receiving unless we're quitting
                 if (!app.state.should_quit) {
