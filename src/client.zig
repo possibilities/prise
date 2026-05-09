@@ -218,6 +218,15 @@ pub const ServerAction = union(enum) {
     color_query: ColorQueryTarget,
     server_info: struct { pty_validity: i64 },
     copy_to_clipboard: []const u8,
+    // Broker-pattern notifications for the break_pane RPC. The server
+    // sends `break_pane_request` to the chosen broker client (lowest
+    // attached `Client.id`); the broker classifies + applies + replies
+    // via `prise.notify("break_pane_reply", ...)`. After the reply, the
+    // server fans out `break_pane_applied` to all OTHER attached clients
+    // so their tile-tree mirrors converge. See
+    // `.planctl/specs/fn-388-break-pane-rpc-broker-pattern.{1,2}.md`.
+    break_pane_request: struct { pty_id: u32, focus: bool, request_id: usize },
+    break_pane_applied: struct { pty_id: u32, focus: bool },
 
     pub const ColorQueryTarget = struct {
         pty_id: u32,
@@ -397,8 +406,79 @@ pub const ClientLogic = struct {
             return try handleCwdChanged(state, notif.params);
         } else if (std.mem.eql(u8, notif.method, "color_query")) {
             return parseColorQuery(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "break_pane_request")) {
+            return parseBreakPaneRequest(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "break_pane_applied")) {
+            return parseBreakPaneApplied(notif.params);
         }
         return .none;
+    }
+
+    /// Decode a `break_pane_request` notification payload from the server.
+    /// Required keys: `pty_id` (unsigned), `focus` (boolean), `request_id`
+    /// (unsigned). Missing or wrong-type fields → `.none`. The matching
+    /// shape is encoded server-side by `Server.sendBreakPaneRequest`.
+    fn parseBreakPaneRequest(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+
+        var pty_id: ?u32 = null;
+        var focus: ?bool = null;
+        var request_id: ?usize = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .unsigned => |u| @intCast(u),
+                    .integer => |i| @intCast(i),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+                if (kv.value == .boolean) focus = kv.value.boolean;
+            } else if (std.mem.eql(u8, kv.key.string, "request_id")) {
+                request_id = switch (kv.value) {
+                    .unsigned => |u| @intCast(u),
+                    .integer => |i| @intCast(i),
+                    else => null,
+                };
+            }
+        }
+
+        const pid = pty_id orelse return .none;
+        const f = focus orelse return .none;
+        const rid = request_id orelse return .none;
+
+        return .{ .break_pane_request = .{ .pty_id = pid, .focus = f, .request_id = rid } };
+    }
+
+    /// Decode a `break_pane_applied` notification payload from the server.
+    /// Required keys: `pty_id` (unsigned), `focus` (boolean). The matching
+    /// shape is encoded server-side by `Server.sendBreakPaneApplied`. The
+    /// broker is excluded from the broadcast set server-side, so non-broker
+    /// clients are the only consumers.
+    fn parseBreakPaneApplied(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+
+        var pty_id: ?u32 = null;
+        var focus: ?bool = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .unsigned => |u| @intCast(u),
+                    .integer => |i| @intCast(i),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+                if (kv.value == .boolean) focus = kv.value.boolean;
+            }
+        }
+
+        const pid = pty_id orelse return .none;
+        const f = focus orelse return .none;
+
+        return .{ .break_pane_applied = .{ .pty_id = pid, .focus = f } };
     }
 
     fn parseColorQuery(params: msgpack.Value) ServerAction {
@@ -978,6 +1058,14 @@ pub const App = struct {
             }
         }.switchCb);
 
+        // Register notify callback (broker-pattern enabling primitive)
+        self.ui.setNotifyCallback(self, struct {
+            fn notifyCb(ctx: *anyopaque, method: []const u8, params: msgpack.Value) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.sendNotification(method, params);
+            }
+        }.notifyCb);
+
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
         try self.handleVaxisEvent(.{ .winsize = ws });
@@ -1395,6 +1483,25 @@ pub const App = struct {
             };
             log.info("Surface initialized: {}x{}", .{ cols, rows });
         }
+    }
+
+    /// Emit a client→server msgpack-RPC Notification.
+    ///
+    /// Wire envelope: `[2, method, params]` — three elements, no msgid.
+    /// This is the broker pattern's enabling primitive for client→server
+    /// async sends (e.g. `break_pane_reply`). Distinct from `sendResize`,
+    /// which builds a 4-element Request `[0, msgid, method, params]`.
+    ///
+    /// Caller owns `params`. We encode by-value via msgpack and pass the
+    /// bytes to `sendDirect`; ownership of the wire bytes transfers to
+    /// the send pipeline. msgpack-RPC notifications are fire-and-forget;
+    /// no msgid is allocated.
+    pub fn sendNotification(self: *App, method: []const u8, params: msgpack.Value) !void {
+        const msg = try msgpack.encode(self.allocator, .{ 2, method, params });
+        defer self.allocator.free(msg);
+
+        try self.sendDirect(msg);
+        log.info("Sent notification method={s}", .{method});
     }
 
     pub fn sendResize(self: *App, pty_id: u32, rows: u16, cols: u16) !void {
@@ -2339,6 +2446,38 @@ pub const App = struct {
                             .color_query => |query| {
                                 try app.handleColorQuery(query);
                             },
+                            .break_pane_request => |info| {
+                                // Server-asked-broker: route into Lua
+                                // (`M.handle_break_pane_request`) via the
+                                // existing prise_ui.update dispatch. The
+                                // Lua side classifies + applies + replies
+                                // via `prise.notify("break_pane_reply",...)`.
+                                app.ui.update(.{
+                                    .break_pane_request = .{
+                                        .pty_id = info.pty_id,
+                                        .focus = info.focus,
+                                        .request_id = info.request_id,
+                                    },
+                                }) catch |err| {
+                                    log.err("Failed to update UI with break_pane_request: {}", .{err});
+                                };
+                            },
+                            .break_pane_applied => |info| {
+                                // Server-broadcast convergence: re-apply
+                                // the same break_pane mutation locally so
+                                // our tile-tree mirror catches up. Other
+                                // (non-broker) attached clients all see
+                                // this; the broker client itself is
+                                // excluded server-side.
+                                app.ui.update(.{
+                                    .break_pane_applied = .{
+                                        .pty_id = info.pty_id,
+                                        .focus = info.focus,
+                                    },
+                                }) catch |err| {
+                                    log.err("Failed to update UI with break_pane_applied: {}", .{err});
+                                };
+                            },
                             .server_info => {
                                 try app.onServerInfoReceived();
                             },
@@ -3166,6 +3305,104 @@ test "ClientLogic - processServerMessage" {
 
         const action = try ClientLogic.processServerMessage(&state, msg);
         try testing.expectEqual(std.meta.Tag(ServerAction).redraw, std.meta.activeTag(action));
+    }
+
+    // Test break_pane_request Notification — broker entry. Decode the
+    // {pty_id, focus, request_id} map and verify the ServerAction
+    // variant carries those fields verbatim.
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+
+        const map_items = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
+            .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+            .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 42 } },
+        };
+        const msg = rpc.Message{
+            .notification = .{
+                .method = "break_pane_request",
+                .params = .{ .map = &map_items },
+            },
+        };
+
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expectEqual(
+            std.meta.Tag(ServerAction).break_pane_request,
+            std.meta.activeTag(action),
+        );
+        try testing.expectEqual(@as(u32, 7), action.break_pane_request.pty_id);
+        try testing.expectEqual(true, action.break_pane_request.focus);
+        try testing.expectEqual(@as(usize, 42), action.break_pane_request.request_id);
+    }
+
+    // Test break_pane_request Notification — missing required field
+    // returns .none rather than crashing. Same shape minus request_id.
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+
+        const map_items = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
+            .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+        };
+        const msg = rpc.Message{
+            .notification = .{
+                .method = "break_pane_request",
+                .params = .{ .map = &map_items },
+            },
+        };
+
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expectEqual(std.meta.Tag(ServerAction).none, std.meta.activeTag(action));
+    }
+
+    // Test break_pane_applied Notification — convergence broadcast.
+    // Decode {pty_id, focus} and verify the ServerAction variant.
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+
+        const map_items = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 11 } },
+            .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
+        };
+        const msg = rpc.Message{
+            .notification = .{
+                .method = "break_pane_applied",
+                .params = .{ .map = &map_items },
+            },
+        };
+
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expectEqual(
+            std.meta.Tag(ServerAction).break_pane_applied,
+            std.meta.activeTag(action),
+        );
+        try testing.expectEqual(@as(u32, 11), action.break_pane_applied.pty_id);
+        try testing.expectEqual(false, action.break_pane_applied.focus);
+    }
+
+    // Test break_pane_applied Notification — wrong-type field returns
+    // .none. focus must be a boolean; pass an integer to verify the
+    // guard.
+    {
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+
+        const map_items = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 11 } },
+            .{ .key = .{ .string = "focus" }, .value = .{ .unsigned = 1 } },
+        };
+        const msg = rpc.Message{
+            .notification = .{
+                .method = "break_pane_applied",
+                .params = .{ .map = &map_items },
+            },
+        };
+
+        const action = try ClientLogic.processServerMessage(&state, msg);
+        try testing.expectEqual(std.meta.Tag(ServerAction).none, std.meta.activeTag(action));
     }
 }
 
