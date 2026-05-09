@@ -211,8 +211,9 @@ pub const ServerAction = union(enum) {
     send_attach: i64,
     spawn_pty_with_cwd: struct { cwd: ?[]const u8 },
     redraw: msgpack.Value,
-    attached: struct { new_pty_id: i64, old_pty_id: ?u32 = null },
+    attached: struct { new_pty_id: i64, old_pty_id: ?u32 = null, cwd: ?[]const u8 = null },
     pty_exited: struct { pty_id: u32, status: u32 },
+    pty_spawned: struct { pty_id: u32, cwd: []const u8, session: ?[]const u8 = null, tab: ?[]const u8 = null, title: ?[]const u8 = null },
     cwd_changed: struct { pty_id: u32, cwd: []const u8 },
     rename_tab: struct { pty_id: u32, title: []const u8 },
     detached,
@@ -295,13 +296,29 @@ pub const ClientLogic = struct {
                 .attach => |attach_info| {
                     state.pty_id = attach_info.pty_id;
                     state.attached = true;
-                    if (attach_info.cwd) |c| {
+                    // Server returns a map with pty_id and cwd; prefer the
+                    // server's live cwd over the client-side attach_info.cwd
+                    // (only populated on session restore).
+                    var server_cwd: ?[]const u8 = null;
+                    if (result == .map) {
+                        for (result.map) |kv| {
+                            if (kv.key != .string) continue;
+                            if (std.mem.eql(u8, kv.key.string, "cwd") and kv.value == .string) {
+                                server_cwd = kv.value.string;
+                            }
+                        }
+                    }
+                    const effective_cwd = server_cwd orelse attach_info.cwd;
+                    var cwd_for_event: ?[]const u8 = null;
+                    if (effective_cwd) |c| {
                         const owned_cwd = state.allocator.dupe(u8, c) catch return .{ .attached = .{ .new_pty_id = attach_info.pty_id } };
                         state.cwd_map.put(attach_info.pty_id, owned_cwd) catch {
                             state.allocator.free(owned_cwd);
+                            return .{ .attached = .{ .new_pty_id = attach_info.pty_id } };
                         };
+                        cwd_for_event = owned_cwd;
                     }
-                    return .{ .attached = .{ .new_pty_id = attach_info.pty_id } };
+                    return .{ .attached = .{ .new_pty_id = attach_info.pty_id, .cwd = cwd_for_event } };
                 },
                 .detach => .detached,
                 .get_server_info => handleServerInfoResult(state, result),
@@ -403,6 +420,8 @@ pub const ClientLogic = struct {
             return .{ .redraw = notif.params };
         } else if (std.mem.eql(u8, notif.method, "pty_exited")) {
             return parsePtyExited(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "pty_spawned")) {
+            return parsePtySpawned(notif.params);
         } else if (std.mem.eql(u8, notif.method, "cwd_changed")) {
             return try handleCwdChanged(state, notif.params);
         } else if (std.mem.eql(u8, notif.method, "color_query")) {
@@ -551,6 +570,38 @@ pub const ClientLogic = struct {
             else => 0,
         };
         return .{ .pty_exited = .{ .pty_id = pty_id, .status = status } };
+    }
+
+    fn parsePtySpawned(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+
+        var pty_id: ?u32 = null;
+        var cwd: []const u8 = "";
+        var session: ?[]const u8 = null;
+        var tab: ?[]const u8 = null;
+        var title: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "id")) {
+                pty_id = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "cwd") and kv.value == .string) {
+                cwd = kv.value.string;
+            } else if (std.mem.eql(u8, kv.key.string, "session") and kv.value == .string) {
+                session = kv.value.string;
+            } else if (std.mem.eql(u8, kv.key.string, "tab") and kv.value == .string) {
+                tab = kv.value.string;
+            } else if (std.mem.eql(u8, kv.key.string, "title") and kv.value == .string) {
+                title = kv.value.string;
+            }
+        }
+
+        const id = pty_id orelse return .none;
+        return .{ .pty_spawned = .{ .pty_id = id, .cwd = cwd, .session = session, .tab = tab, .title = title } };
     }
 
     fn handleCwdChanged(state: *ClientState, params: msgpack.Value) !ServerAction {
@@ -759,6 +810,7 @@ pub const App = struct {
 
     pending_attach_ids: ?[]u32 = null,
     pending_attach_count: usize = 0,
+    pending_attach_pty_id: ?u32 = null,
     session_json: ?[]const u8 = null,
     pending_attach_cwd: std.AutoHashMap(u32, []const u8) = undefined,
     // Maps old PTY IDs to new PTY IDs when spawning fresh PTYs due to validity mismatch
@@ -1099,6 +1151,23 @@ pub const App = struct {
                 try app_ptr.sendNotification(method, params);
             }
         }.notifyCb);
+
+        // Register create_session callback
+        self.ui.setCreateSessionCallback(self, struct {
+            fn createCb(ctx: *anyopaque, session_name: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.createSession(session_name);
+            }
+        }.createCb);
+
+        // Register attach_pty callback (deferred from Lua via prise.attach)
+        self.ui.queue_attach_pty_callback = struct {
+            fn attachCb(ctx: *anyopaque, pty_id: u32) void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                app_ptr.pending_attach_pty_id = pty_id;
+            }
+        }.attachCb;
+        self.ui.queue_attach_pty_ctx = @ptrCast(self);
 
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
@@ -2166,6 +2235,7 @@ pub const App = struct {
                                         app.ui.update(.{
                                             .pty_attach = .{
                                                 .id = pty_id,
+                                                .cwd = info.cwd orelse "",
                                                 .surface = surface,
                                                 .app = app,
                                                 .send_key_fn = struct {
@@ -2433,6 +2503,12 @@ pub const App = struct {
                                     app.deleteCurrentSession();
                                 }
                             },
+                            .pty_spawned => |info| {
+                                log.info("PTY {} spawned with cwd {s}", .{ info.pty_id, info.cwd });
+                                app.ui.update(.{ .pty_spawned = .{ .id = info.pty_id, .cwd = info.cwd, .session = info.session, .tab = info.tab, .title = info.title } }) catch |err| {
+                                    log.err("Failed to update UI with pty_spawned: {}", .{err});
+                                };
+                            },
                             .cwd_changed => |info| {
                                 log.debug("CWD changed for PTY {}: {s}", .{ info.pty_id, info.cwd });
                                 app.ui.update(.{ .cwd_changed = .{ .pty_id = info.pty_id, .cwd = info.cwd } }) catch |err| {
@@ -2536,6 +2612,23 @@ pub const App = struct {
                             .none => {},
                         }
 
+                        // Drain deferred attach from Lua prise.attach()
+                        if (app.pending_attach_pty_id) |pty_id| {
+                            app.pending_attach_pty_id = null;
+                            log.info("Draining deferred attach_pty for PTY {}", .{pty_id});
+                            const msgid = app.state.next_msgid;
+                            app.state.next_msgid += 1;
+                            try app.state.pending_requests.put(msgid, .{ .attach = .{ .pty_id = pty_id, .cwd = null } });
+                            app.send_buffer = try msgpack.encode(
+                                app.allocator,
+                                .{ 0, msgid, "attach_pty", .{ @as(i64, pty_id), "false" } },
+                            );
+                            _ = try l.send(app.fd, app.send_buffer.?, .{
+                                .ptr = app,
+                                .cb = onSendComplete,
+                            });
+                        }
+
                         // Remove consumed bytes from buffer
                         if (bytes_consumed > 0) {
                             try app.msg_buffer.replaceRange(app.allocator, 0, bytes_consumed, &.{});
@@ -2610,23 +2703,42 @@ pub const App = struct {
         }
         try self.appendSessionEnv(&env_array, self.allocator);
 
-        var num_params: usize = 4;
-        if (opts.cwd != null) num_params += 1;
-        if (opts.cmd != null) num_params += 1;
+        const has_cwd = opts.cwd != null;
+        const has_cmd = opts.cmd != null;
+        const has_argv = opts.argv != null;
+        const num_params: usize = 4 +
+            @as(usize, @intFromBool(has_cwd)) +
+            @as(usize, @intFromBool(has_cmd)) +
+            @as(usize, @intFromBool(has_argv));
         var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, num_params);
         defer self.allocator.free(map_items);
+
+        // Build a msgpack array from argv when present; freed after sending.
+        var argv_values: ?[]msgpack.Value = null;
+        defer if (argv_values) |v| self.allocator.free(v);
+        if (opts.argv) |argv| {
+            const values = try self.allocator.alloc(msgpack.Value, argv.len);
+            for (argv, 0..) |arg, i| {
+                values[i] = .{ .string = arg };
+            }
+            argv_values = values;
+        }
 
         map_items[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = opts.rows } };
         map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = opts.cols } };
         map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = opts.attach } };
         map_items[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
         var idx: usize = 4;
-        if (opts.cwd) |cwd| {
-            map_items[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+        if (opts.cwd) |cwd_val| {
+            map_items[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd_val } };
             idx += 1;
         }
         if (opts.cmd) |cmd| {
             map_items[idx] = .{ .key = .{ .string = "cmd" }, .value = .{ .string = cmd } };
+            idx += 1;
+        }
+        if (argv_values) |values| {
+            map_items[idx] = .{ .key = .{ .string = "argv" }, .value = .{ .array = values } };
         }
 
         const params = msgpack.Value{ .map = map_items };
@@ -2859,6 +2971,52 @@ pub const App = struct {
         self.vx = vaxis.Vaxis.init(self.allocator, .{}) catch return err;
         self.vx.enterAltScreen(writer) catch {};
         return err;
+    }
+
+    /// Create a new empty session and switch to it.
+    /// Writes a minimal session file, then exec's into the new session.
+    pub fn createSession(self: *App, name: []const u8) !void {
+        std.debug.assert(name.len > 0);
+
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        // Ensure directory exists
+        std.fs.makeDirAbsolute(state_dir) catch |e| {
+            if (e != error.PathAlreadyExists) {
+                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
+                std.fs.makeDirAbsolute(parent) catch |e2| {
+                    if (e2 != error.PathAlreadyExists) return e2;
+                };
+                std.fs.makeDirAbsolute(state_dir) catch |e2| {
+                    if (e2 != error.PathAlreadyExists) return e2;
+                };
+            }
+        };
+
+        var dir = try std.fs.openDirAbsolute(state_dir, .{});
+        defer dir.close();
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{name});
+        defer self.allocator.free(filename);
+
+        // Write minimal session JSON with pty_validity=0 to force fresh PTY spawning
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "/tmp";
+        var json_buf: [1024]u8 = undefined;
+        const json = std.fmt.bufPrint(&json_buf,
+            \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":"{s}"}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
+        , .{cwd}) catch return error.NameTooLong;
+
+        const file = try dir.createFile(filename, .{});
+        defer file.close();
+        try file.writeAll(json);
+
+        log.info("Created session file '{s}'", .{name});
+
+        // Switch to the new session (saves current + exec's into new)
+        try self.switchToSession(name);
     }
 
     pub fn deleteCurrentSession(self: *App) void {
@@ -3361,17 +3519,21 @@ test "ClientLogic - processServerMessage" {
         try testing.expectEqual(null, action.attached.old_pty_id);
     }
 
-    // Test Attach response (already have pty_id)
+    // Test Attach response (server returns map with pty_id and cwd)
     {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
         try state.pending_requests.put(2, .{ .attach = .{ .pty_id = 123, .cwd = null } });
 
+        var result_kv = [_]msgpack.Value.KeyValue{
+            .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 123 } },
+            .{ .key = .{ .string = "cwd" }, .value = .{ .string = "/home/user/project" } },
+        };
         const msg = rpc.Message{
             .response = .{
                 .msgid = 2,
                 .err = null,
-                .result = .{ .integer = 0 }, // Result of attach is typically success/pty_id
+                .result = .{ .map = &result_kv },
             },
         };
 
@@ -3379,6 +3541,10 @@ test "ClientLogic - processServerMessage" {
         try testing.expect(state.attached);
         try testing.expectEqual(std.meta.Tag(ServerAction).attached, std.meta.activeTag(action));
         try testing.expectEqual(123, action.attached.new_pty_id);
+        try testing.expect(action.attached.cwd != null);
+        try testing.expectEqualStrings("/home/user/project", action.attached.cwd.?);
+        // cwd_map seeded with server cwd — pty:cwd() will see this on reattach
+        try testing.expectEqualStrings("/home/user/project", state.cwd_map.get(123).?);
     }
 
     // Test Redraw Notification

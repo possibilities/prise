@@ -1,6 +1,8 @@
 local helpers = require("test_helpers")
 local mock_pane = helpers.mock_pane
 local mock_split = helpers.mock_split
+local mock_tab = helpers.mock_tab
+local mock_pty = helpers.mock_pty
 helpers.setup_prise_mock()
 
 local tiling = require("tiling")
@@ -252,3 +254,158 @@ do
     assert(st.tabs[1].root.id == 99, "pty_exited overlay-orphan: surviving tab is sibling")
     assert(overlay_pty._closed, "pty_exited overlay-orphan: overlay pane pty closed")
 end
+-- === spawn placement ===
+
+-- Get state upvalue from tiling.update
+local state_upvalue
+for i = 1, 100 do
+    local name, value = debug.getupvalue(tiling.update, i)
+    if name == "state" then
+        state_upvalue = value
+        break
+    end
+end
+assert(state_upvalue ~= nil, "spawn placement: state upvalue found")
+
+-- Test: pty_spawned with title queues pending rename (and creates new tab since tab is nil)
+-- Integration-surface: plug-system branch moves new_tab from state.pending_new_tab to
+-- state.pending_spawns[id].new_tab. Accept either model so the test passes both on
+-- feat/spawn-pty alone and on arthack-prod after plug-system lands.
+state_upvalue.pending_title_renames = {}
+state_upvalue.pending_new_tab = false
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
+tiling.update({ type = "pty_spawned", data = { id = 5, title = "editor" } })
+assert(state_upvalue.pending_title_renames[5] == "editor", "pty_spawned: title queues pending rename")
+assert(
+    state_upvalue.pending_new_tab == true
+        or (state_upvalue.pending_spawns[5] and state_upvalue.pending_spawns[5].new_tab == true),
+    "pty_spawned: nil tab creates new tab"
+)
+
+-- Test: pty_spawned with tab=<new> sets pending_new_tab
+state_upvalue.pending_new_tab = false
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
+tiling.update({ type = "pty_spawned", data = { id = 6, tab = "<new>" } })
+assert(
+    state_upvalue.pending_new_tab == true
+        or (state_upvalue.pending_spawns[6] and state_upvalue.pending_spawns[6].new_tab == true),
+    "pty_spawned: tab=<new> sets pending_new_tab"
+)
+
+-- Test: pty_spawned without placement fields is no-op
+state_upvalue.pending_new_tab = false
+state_upvalue.pending_title_renames = {}
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
+tiling.update({ type = "pty_spawned", data = { id = 7 } })
+assert(
+    state_upvalue.pending_new_tab == false
+        and (state_upvalue.pending_spawns[7] == nil or state_upvalue.pending_spawns[7].new_tab ~= true),
+    "pty_spawned: no placement fields, pending_new_tab unchanged"
+)
+assert(state_upvalue.pending_title_renames[7] == nil, "pty_spawned: no placement fields, no pending rename")
+
+-- === find_tab_by_title ===
+
+-- Test: find_tab_by_title returns correct index and tab when found
+state_upvalue.tabs = {
+    { id = 1, root = mock_pane(1), title = "alpha" },
+    { id = 2, root = mock_pane(2), title = "beta" },
+    { id = 3, root = mock_pane(3), title = "gamma" },
+}
+local idx, tab = t.find_tab_by_title("beta")
+assert(idx == 2, "find_tab_by_title: correct index")
+assert(tab ~= nil and tab.title == "beta", "find_tab_by_title: correct tab")
+
+-- Test: find_tab_by_title returns nil when not found
+idx = t.find_tab_by_title("nonexistent")
+assert(idx == nil, "find_tab_by_title: nil when not found")
+
+-- === pty_spawned with named tab ===
+
+-- Test: pty_spawned with known tab name activates that tab (no new tab)
+state_upvalue.tabs = {
+    { id = 1, root = mock_pane(1), title = "code", last_focused_id = 1 },
+    { id = 2, root = mock_pane(2), title = "logs", last_focused_id = 2 },
+}
+state_upvalue.active_tab = 1
+state_upvalue.pending_new_tab = false
+state_upvalue.pending_title_renames = {}
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
+tiling.update({ type = "pty_spawned", data = { id = 20, tab = "logs" } })
+assert(state_upvalue.active_tab == 2, "pty_spawned: known tab name activates tab")
+assert(
+    state_upvalue.pending_new_tab == false
+        and (state_upvalue.pending_spawns[20] == nil or state_upvalue.pending_spawns[20].new_tab ~= true),
+    "pty_spawned: known tab name does not create new tab"
+)
+
+-- Test: pty_spawned with unknown tab name creates new tab
+state_upvalue.tabs = {
+    { id = 1, root = mock_pane(1), title = "code", last_focused_id = 1 },
+}
+state_upvalue.active_tab = 1
+state_upvalue.pending_new_tab = false
+state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
+tiling.update({ type = "pty_spawned", data = { id = 21, tab = "unknown" } })
+assert(
+    state_upvalue.pending_new_tab == true
+        or (state_upvalue.pending_spawns[21] and state_upvalue.pending_spawns[21].new_tab == true),
+    "pty_spawned: unknown tab name creates new tab"
+)
+
+-- === pty_spawned with missing session ===
+
+-- Test: pty_spawned with session that doesn't exist calls prise.create_session
+-- and bails early. Earlier behaviour rewrote the current session in place
+-- (save + rename_session + clear tabs); the rewritten handler hands off to
+-- prise.create_session and returns without touching state. Assert the new
+-- contract.
+local mock_prise = package.loaded["prise"]
+local created_with = nil
+---@diagnostic disable: duplicate-set-field
+mock_prise.switch_session = function()
+    return false
+end
+mock_prise.create_session = function(name)
+    created_with = name
+end
+mock_prise.get_session_name = function()
+    return "default"
+end
+---@diagnostic enable: duplicate-set-field
+
+state_upvalue.tabs = { { id = 1, root = mock_pane(1), title = "old", last_focused_id = 1 } }
+state_upvalue.active_tab = 1
+state_upvalue.pending_new_tab = false
+state_upvalue.pending_title_renames = {}
+created_with = nil
+
+tiling.update({ type = "pty_spawned", data = { id = 30, session = "newsession", tab = "<new>" } })
+assert(
+    created_with == "newsession",
+    "pty_spawned: missing session calls prise.create_session with target name, got " .. tostring(created_with)
+)
+
+-- Restore mock defaults
+---@diagnostic disable: duplicate-set-field
+mock_prise.switch_session = function()
+    return true
+end
+mock_prise.create_session = function() end
+mock_prise.get_session_name = function()
+    return "test"
+end
+---@diagnostic enable: duplicate-set-field
+
+-- Test: pending title applied on pty_attach
+state_upvalue.tabs = { mock_tab(mock_pane(1)) }
+state_upvalue.active_tab = 1
+state_upvalue.focused_id = 1
+state_upvalue.pending_title_renames = { [10] = "my-title" }
+state_upvalue.pending_new_tab = false
+state_upvalue.pending_split = nil
+state_upvalue.pending_layout = nil
+state_upvalue.floating = { pending = false, visible = false, width = 100, height = 30 }
+tiling.update({ type = "pty_attach", data = { pty = mock_pty(10) } })
+assert(state_upvalue.tabs[1].title == "my-title", "pty_attach: pending title applied to tab")
+assert(state_upvalue.pending_title_renames[10] == nil, "pty_attach: pending rename cleared")

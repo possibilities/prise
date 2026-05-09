@@ -19,6 +19,7 @@ pub const CellSize = struct {
 
 pub const PtyAttachInfo = struct {
     id: u32,
+    cwd: []const u8 = "",
     surface: *Surface,
     app: *anyopaque,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
@@ -34,6 +35,14 @@ pub const PtyAttachInfo = struct {
 pub const PtyExitedInfo = struct {
     id: u32,
     status: u32,
+};
+
+pub const PtySpawnedInfo = struct {
+    id: u32,
+    cwd: []const u8,
+    session: ?[]const u8 = null,
+    tab: ?[]const u8 = null,
+    title: ?[]const u8 = null,
 };
 
 pub const CwdChangedInfo = struct {
@@ -64,6 +73,7 @@ pub const Event = union(enum) {
     paste: []const u8,
     pty_attach: PtyAttachInfo,
     pty_exited: PtyExitedInfo,
+    pty_spawned: PtySpawnedInfo,
     cwd_changed: CwdChangedInfo,
     rename_tab: RenameTabInfo,
     init: void,
@@ -130,6 +140,7 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
         .init => pushInitEvent(lua),
         .pty_attach => |info| pushPtyAttachEvent(lua, info),
         .pty_exited => |info| pushPtyExitedEvent(lua, info),
+        .pty_spawned => |info| pushPtySpawnedEvent(lua, info),
         .cwd_changed => |info| pushCwdChangedEvent(lua, info),
         .rename_tab => |info| pushRenameTabEvent(lua, info),
         .paste => |data| pushPasteEvent(lua, data),
@@ -177,7 +188,10 @@ fn pushPtyAttachEvent(lua: *ziglua.Lua, info: PtyAttachInfo) void {
     _ = lua.pushString("pty_attach");
     lua.setField(-2, "type");
 
-    lua.createTable(0, 1);
+    lua.createTable(0, 2);
+
+    _ = lua.pushString(info.cwd);
+    lua.setField(-2, "cwd");
 
     const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
     pty.* = .{
@@ -212,6 +226,30 @@ fn pushPtyExitedEvent(lua: *ziglua.Lua, info: PtyExitedInfo) void {
     lua.setField(-2, "id");
     lua.pushInteger(@intCast(info.status));
     lua.setField(-2, "status");
+    lua.setField(-2, "data");
+}
+
+fn pushPtySpawnedEvent(lua: *ziglua.Lua, info: PtySpawnedInfo) void {
+    _ = lua.pushString("pty_spawned");
+    lua.setField(-2, "type");
+
+    lua.createTable(0, 5);
+    lua.pushInteger(@intCast(info.id));
+    lua.setField(-2, "id");
+    _ = lua.pushString(info.cwd);
+    lua.setField(-2, "cwd");
+    if (info.session) |s| {
+        _ = lua.pushString(s);
+        lua.setField(-2, "session");
+    }
+    if (info.tab) |t| {
+        _ = lua.pushString(t);
+        lua.setField(-2, "tab");
+    }
+    if (info.title) |t| {
+        _ = lua.pushString(t);
+        lua.setField(-2, "title");
+    }
     lua.setField(-2, "data");
 }
 
