@@ -283,6 +283,7 @@ local POWERLINE_SYMBOLS = {
 ---@field macos_option_as_alt? "false"|"left"|"right"|"true" macOS Option key behavior (default: "false")
 ---@field layouts? table<string, PriseLayout> Named layout definitions
 ---@field default_layout? string Layout to apply on startup (if no session exists)
+---@field keep_attached? boolean Switch to another session when last pane exits (default: true)
 
 ---@class PriseConfig
 ---@field theme PriseTheme
@@ -294,6 +295,7 @@ local POWERLINE_SYMBOLS = {
 ---@field keybinds PriseKeybinds
 ---@field layouts table<string, PriseLayout>
 ---@field default_layout? string
+---@field keep_attached boolean
 
 -- Default configuration
 ---@type PriseConfig
@@ -381,6 +383,7 @@ local config = {
     macos_option_as_alt = "false",
     layouts = {},
     default_layout = nil,
+    keep_attached = true,
 }
 
 local merge_config = utils.merge_config
@@ -1351,6 +1354,28 @@ local function remove_pane_by_id(id)
             if state.clock_timer then
                 state.clock_timer:cancel()
                 state.clock_timer = nil
+            end
+            -- Try switching to another session instead of exiting
+            if config.keep_attached then
+                local sessions = prise.list_sessions() or {}
+                local current = prise.get_session_name()
+                -- Delete the departing session's saved state BEFORE the switch loop.
+                -- Placement-before-loop covers three cases: switch-success (survivor
+                -- client must not see the empty state on its next load), every
+                -- switch-fails case, and the fall-through to prise.exit() (the exit
+                -- callback's own deleteCurrentSession then becomes a safe no-op on
+                -- ENOENT, guaranteed by App.deleteSession's idempotent contract).
+                -- Without this, the Zig save branch in switchToSession re-creates the
+                -- file: surfaces.count() hasn't dropped yet because the async
+                -- pty_exited hasn't caught up, so the save thinks state is still live.
+                prise.delete_session(current)
+                for _, s in ipairs(sessions) do
+                    if s ~= current then
+                        if prise.switch_session(s) then
+                            return true
+                        end
+                    end
+                end
             end
             prise.exit()
             return true
