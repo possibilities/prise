@@ -103,3 +103,9 @@ test "lua tiling deserialize" {
     defer lua.deinit();
     try runLuaTest(lua, "src/lua/tiling_test_deserialize.lua");
 }
+
+test "lua tiling swap tab wrap" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_swap_tab_wrap.lua");
+}
