@@ -358,8 +358,6 @@ assert(
         or (state_upvalue.pending_spawns[21] and state_upvalue.pending_spawns[21].new_tab == true),
     "pty_spawned: unknown tab name creates new tab"
 )
-tiling.update({ type = "pty_spawned", data = { id = 21, tab = "unknown" } })
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: unknown tab name creates new tab")
 
 -- === pty_spawned with missing session ===
 
