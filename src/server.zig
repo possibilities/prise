@@ -3280,6 +3280,30 @@ const Server = struct {
         }
     }
 
+    /// Drain ALL in-flight broker-RPC requests, regardless of
+    /// deadline, with best-effort `broker_timeout` replies. Called
+    /// from `shutdown` BEFORE clients are removed: once the CLI
+    /// client's socket is closed, no Response can be queued on it.
+    ///
+    /// Best-effort means: per-CLI send failures are logged and the
+    /// drain continues. The map is cleared at the end so a second
+    /// shutdown call is a no-op.
+    fn drainPendingForShutdown(self: *Server) void {
+        var it = self.pending.iterator();
+        while (it.next()) |entry| {
+            log.info("event=\"rpc.broker.shutdown_drain\" request_id={}", .{entry.key_ptr.*});
+            entry.value_ptr.cli_client.sendBreakPaneResponse(
+                self.loop,
+                entry.value_ptr.cli_msgid,
+                false,
+                "broker_timeout",
+            ) catch |err| {
+                log.warn("drainPendingForShutdown: reply failed: {}", .{err});
+            };
+        }
+        self.pending.clearRetainingCapacity();
+    }
+
     /// Send redraw notification (bytes) to attached clients
     fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, msg: []const u8, target_client: ?*Client) !void {
         // Send to each client attached to this session
@@ -3497,6 +3521,14 @@ const Server = struct {
             task.cancel(self.loop) catch {};
             self.pending_sweep_timer = null;
         }
+
+        // Drain in-flight broker-RPC requests with best-effort
+        // `broker_timeout` replies BEFORE we tear down clients. Once
+        // a CLI client is removed, the loop can no longer queue a
+        // Response on its fd; replying first gives the CLI a clean
+        // exit instead of a 2s deadline-sweep wait that never fires.
+        // Send failures are logged and the drain continues.
+        self.drainPendingForShutdown();
 
         // Close all clients
         while (self.clients.items.len > 0) {
@@ -4852,6 +4884,111 @@ test "removeClient - broker disconnect replies broker_timeout to CLI" {
         }
     }
     try testing.expect(saw_reason);
+}
+
+test "drainPendingForShutdown - replies broker_timeout to all and clears" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+        .exit_on_idle = false,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Two distinct CLI clients with two pending broker-RPC entries.
+    const cli_a = try allocator.create(Client);
+    cli_a.* = .{
+        .fd = 401,
+        .id = 11,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli_a);
+
+    const cli_b = try allocator.create(Client);
+    cli_b.* = .{
+        .fd = 402,
+        .id = 12,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli_b);
+
+    try server.pending.put(0, .{
+        .cli_msgid = 71,
+        .cli_client = cli_a,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 5,
+        .focus = false,
+    });
+    try server.pending.put(1, .{
+        .cli_msgid = 72,
+        .cli_client = cli_b,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 6,
+        .focus = false,
+    });
+
+    server.drainPendingForShutdown();
+
+    // Pending fully cleared; both CLIs got broker_timeout Responses.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+
+    for ([_]struct { fd: posix.fd_t, msgid: u32 }{
+        .{ .fd = 401, .msgid = 71 },
+        .{ .fd = 402, .msgid = 72 },
+    }) |expect| {
+        const msg_opt = try findPendingSendOnFd(allocator, &loop, expect.fd);
+        try testing.expect(msg_opt != null);
+        const msg = msg_opt.?;
+        defer msg.deinit(allocator);
+        try testing.expect(msg == .response);
+        try testing.expectEqual(expect.msgid, msg.response.msgid);
+
+        var saw_reason = false;
+        for (msg.response.result.map) |kv| {
+            if (std.mem.eql(u8, kv.key.string, "ok")) {
+                try testing.expectEqual(false, kv.value.boolean);
+            } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+                try testing.expectEqualStrings("broker_timeout", kv.value.string);
+                saw_reason = true;
+            }
+        }
+        try testing.expect(saw_reason);
+    }
+
+    // Idempotent: a second drain on an empty map is a no-op.
+    server.drainPendingForShutdown();
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
 }
 
 test "removeClient - cli disconnect drops pending without reply" {
