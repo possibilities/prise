@@ -4823,10 +4823,16 @@ function M.update(event)
         local data = event.data
         prise.log.info("Lua: pty_spawned " .. data.id)
 
-        -- Cross-session placement: write PTY into target session file, don't attach
+        -- Cross-session placement: switch to target session, or create it if absent.
         if data.session then
             local current = prise.get_session_name()
             if current ~= data.session then
+                if not prise.switch_session(data.session) then
+                    -- Session doesn't exist — hand off to create_session; the new
+                    -- session's event loop will receive the PTY on attachment.
+                    prise.create_session(data.session)
+                    return
+                end
                 local ok = prise.place_pty_in_session(data.session, data.id, data.cwd, data.title)
                 if ok then
                     prise.log.info("Placed PTY " .. data.id .. " in session " .. data.session)
