@@ -21,6 +21,8 @@ const ParseResult = struct {
     attach_session: ?[]const u8 = null,
     /// Session name for a new session (user-specified)
     new_session_name: ?[]const u8 = null,
+    /// Create session without attaching (-d/--detached)
+    detached: bool = false,
 };
 
 const TabRenameContext = struct {
@@ -161,6 +163,20 @@ pub fn main() !void {
         return;
     }
 
+    if (result.detached) {
+        createDetachedSession(allocator, socket_path, result.new_session_name.?) catch |err| {
+            if (err == error.ServerNotRunning) {
+                try std.fs.File.stderr().writeAll(
+                    \\Server not running. Start with:
+                    \\    prise serve
+                    \\
+                );
+            }
+            return;
+        };
+        return;
+    }
+
     runClient(allocator, socket_path, result) catch |err| {
         var log_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 
@@ -227,6 +243,8 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?ParseResul
             } else {
                 result.new_session_name = try allocator.dupe(u8, name);
             }
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detached")) {
+            result.detached = true;
         } else if (std.mem.eql(u8, arg, "serve")) {
             initLogFile("server.log");
             try server.startServer(allocator, socket_path);
@@ -250,6 +268,11 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?ParseResul
             try printHelp();
             return error.UnknownCommand;
         }
+    }
+
+    if (result.detached and result.new_session_name == null) {
+        printSessionNameError("error: --detached requires -s/--session <name>\n");
+        return error.MissingArgument;
     }
 
     return result;
@@ -319,6 +342,7 @@ fn printHelp() !void {
         \\
         \\Options:
         \\  -s, --session <name>  Create a new session with the specified name
+        \\  -d, --detached        With -s, create session without attaching
         \\  -h, --help            Show this help message
         \\  -v, --version         Show version
         \\
@@ -867,16 +891,13 @@ fn deleteSession(allocator: std.mem.Allocator, name: []const u8) !void {
     try stdout.interface.print("Deleted session '{s}'.\n", .{name});
 }
 
-fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {
-    var buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
-    defer stdout.interface.flush() catch {};
-
+/// Connect to the prise server socket. Caller must close the returned fd.
+fn connectToServer(socket_path: []const u8) !posix.fd_t {
     const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
         log.err("Failed to create socket: {}", .{err});
         return error.SocketError;
     };
-    defer posix.close(sock);
+    errdefer posix.close(sock);
 
     var addr: posix.sockaddr.un = .{ .path = undefined };
     @memcpy(addr.path[0..socket_path.len], socket_path);
@@ -884,34 +905,202 @@ fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {
 
     posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
         if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            try stdout.interface.print("Server not running.\n", .{});
-            return;
+            std.fs.File.stderr().writeAll("Server not running.\n") catch {};
+            return error.ServerNotRunning;
         }
         return err;
     };
 
+    return sock;
+}
+
+/// Send an RPC request and decode the response.
+/// Skips any notification messages (type 2) that arrive before the response,
+/// since the server may broadcast notifications to all clients including
+/// the ephemeral connection used for this RPC.
+fn sendRpcRequest(allocator: std.mem.Allocator, sock: posix.fd_t, request: []const u8) !rpc.Message {
+    _ = try posix.write(sock, request);
+
+    var response_buf: [4096]u8 = undefined;
+    var buf_len: usize = 0;
+
+    while (true) {
+        const n = try posix.read(sock, response_buf[buf_len..]);
+        if (n == 0) return error.NoResponse;
+        buf_len += n;
+
+        // Process all complete messages in the buffer
+        while (buf_len > 0) {
+            const result = rpc.decodeMessageWithSize(allocator, response_buf[0..buf_len]) catch |err| switch (err) {
+                error.UnexpectedEndOfInput => break, // incomplete message, read more
+                else => return err,
+            };
+
+            if (result.message == .response) return result.message;
+
+            // Skip notification, shift remaining data
+            result.message.deinit(allocator);
+            const consumed = result.bytes_consumed;
+            const remaining = buf_len - consumed;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, response_buf[0..remaining], response_buf[consumed..buf_len]);
+            }
+            buf_len = remaining;
+        }
+    }
+}
+
+/// Fetch pty_validity from the server via get_server_info RPC.
+fn fetchPtyValidity(allocator: std.mem.Allocator, socket_path: []const u8) !i64 {
+    const sock = try connectToServer(socket_path);
+    defer posix.close(sock);
+
+    const request = try msgpack.encode(allocator, .{ 0, 1, "get_server_info", .{} });
+    defer allocator.free(request);
+
+    const msg = try sendRpcRequest(allocator, sock, request);
+    defer msg.deinit(allocator);
+
+    if (msg != .response) return error.InvalidResponse;
+    if (msg.response.err != null) return error.ServerError;
+    if (msg.response.result != .map) return error.InvalidResponse;
+
+    for (msg.response.result.map) |kv| {
+        if (kv.key == .string and std.mem.eql(u8, kv.key.string, "pty_validity")) {
+            if (kv.value == .integer) return kv.value.integer;
+            if (kv.value == .unsigned) return @intCast(kv.value.unsigned);
+        }
+    }
+
+    return error.InvalidResponse;
+}
+
+/// Spawn a detached PTY on the server via spawn_pty RPC.
+/// Sends the client's full environment and cwd so the spawned shell
+/// inherits PATH and other vars (matching spawnInitialPty behavior).
+fn spawnDetachedPty(allocator: std.mem.Allocator, socket_path: []const u8, session_name: []const u8) !u64 {
+    const sock = try connectToServer(socket_path);
+    defer posix.close(sock);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Collect client environment as "KEY=VALUE" strings
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+
+    var env_array = std.ArrayList(msgpack.Value).empty;
+    defer env_array.deinit(allocator);
+    var env_it = env_map.iterator();
+    while (env_it.next()) |entry| {
+        const env_str = try std.fmt.allocPrint(arena_alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+        try env_array.append(allocator, .{ .string = env_str });
+    }
+
+    // Add PRISE_SESSION so the spawned shell knows its session name
+    const session_env = try std.fmt.allocPrint(arena_alloc, "PRISE_SESSION={s}", .{session_name});
+    try env_array.append(allocator, .{ .string = session_env });
+
+    // Get client cwd
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = posix.getcwd(&cwd_buf) catch null;
+
+    const param_count: usize = if (cwd != null) 6 else 5;
+    var map_items = try allocator.alloc(msgpack.Value.KeyValue, param_count);
+    defer allocator.free(map_items);
+    map_items[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 24 } };
+    map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 80 } };
+    map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = false } };
+    map_items[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
+    map_items[4] = .{ .key = .{ .string = "session" }, .value = .{ .string = session_name } };
+    if (cwd) |c| {
+        map_items[5] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = c } };
+    }
+
+    const params = msgpack.Value{ .map = map_items };
+    const request = try msgpack.encode(allocator, .{ 0, 1, "spawn_pty", params });
+    defer allocator.free(request);
+
+    const msg = try sendRpcRequest(allocator, sock, request);
+    defer msg.deinit(allocator);
+
+    if (msg != .response) return error.InvalidResponse;
+    if (msg.response.err != null) return error.ServerError;
+
+    // spawn_pty returns unsigned pty_id on success, string on error
+    if (msg.response.result == .unsigned) return msg.response.result.unsigned;
+    if (msg.response.result == .string) {
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "error: {s}\n", .{msg.response.result.string}) catch return error.SpawnFailed;
+        std.fs.File.stderr().writeAll(text) catch {};
+        return error.SpawnFailed;
+    }
+
+    return error.InvalidResponse;
+}
+
+/// Write a minimal session JSON file for a single-pane detached session.
+fn writeNewSessionFile(allocator: std.mem.Allocator, name: []const u8, pty_validity: i64, pty_id: u64) !void {
+    const home = posix.getenv("HOME") orelse return error.NoHomeDirectory;
+    const sessions_dir = try std.fs.path.join(allocator, &.{ home, ".local", "state", "prise", "sessions" });
+    defer allocator.free(sessions_dir);
+
+    // Ensure sessions directory exists (same pattern as client.zig)
+    std.fs.makeDirAbsolute(sessions_dir) catch |err| {
+        if (err != error.PathAlreadyExists) {
+            const parent = try std.fs.path.join(allocator, &.{ home, ".local", "state", "prise" });
+            defer allocator.free(parent);
+            std.fs.makeDirAbsolute(parent) catch |e| {
+                if (e != error.PathAlreadyExists) return e;
+            };
+            std.fs.makeDirAbsolute(sessions_dir) catch |e| {
+                if (e != error.PathAlreadyExists) return e;
+            };
+        }
+    };
+
+    const json = try std.fmt.allocPrint(allocator,
+        \\{{"pty_validity":{d},"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":{d}}}}}],"active_tab":1}}
+    , .{ pty_validity, pty_id });
+    defer allocator.free(json);
+
+    const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{name});
+    defer allocator.free(filename);
+
+    const path = try std.fs.path.join(allocator, &.{ sessions_dir, filename });
+    defer allocator.free(path);
+
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(json);
+}
+
+/// Create a detached session: fetch server info, spawn PTY, write session file.
+fn createDetachedSession(allocator: std.mem.Allocator, socket_path: []const u8, name: []const u8) !void {
+    const pty_validity = try fetchPtyValidity(allocator, socket_path);
+    const pty_id = try spawnDetachedPty(allocator, socket_path, name);
+    try writeNewSessionFile(allocator, name, pty_validity, pty_id);
+
+    var buf: [256]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+    try stdout.interface.print("Created session '{s}'.\n", .{name});
+}
+
+fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const sock = try connectToServer(socket_path);
+    defer posix.close(sock);
+
     const request = try msgpack.encode(allocator, .{ 0, 1, "list_ptys", .{} });
     defer allocator.free(request);
 
-    _ = try posix.write(sock, request);
-
-    var response_buf: [16384]u8 = undefined;
-    const n = try posix.read(sock, &response_buf);
-    if (n == 0) {
-        try stdout.interface.print("No response from server.\n", .{});
-        return;
-    }
-
-    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch |err| {
-        log.err("Failed to decode response: {}", .{err});
-        return error.DecodeError;
-    };
+    const msg = try sendRpcRequest(allocator, sock, request);
     defer msg.deinit(allocator);
-
-    if (msg != .response) {
-        try stdout.interface.print("Unexpected response type.\n", .{});
-        return;
-    }
 
     if (msg.response.err) |err_val| {
         const err_str = if (err_val == .string) err_val.string else "unknown error";
@@ -974,46 +1163,14 @@ fn killPty(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32) !
     var stdout = std.fs.File.stdout().writer(&buf);
     defer stdout.interface.flush() catch {};
 
-    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
-        log.err("Failed to create socket: {}", .{err});
-        return error.SocketError;
-    };
+    const sock = try connectToServer(socket_path);
     defer posix.close(sock);
-
-    var addr: posix.sockaddr.un = .{ .path = undefined };
-    @memcpy(addr.path[0..socket_path.len], socket_path);
-    addr.path[socket_path.len] = 0;
-
-    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            try stdout.interface.print("Server not running.\n", .{});
-            return;
-        }
-        return err;
-    };
 
     const request = try msgpack.encode(allocator, .{ 0, 1, "close_pty", .{.{ "id", pty_id }} });
     defer allocator.free(request);
 
-    _ = try posix.write(sock, request);
-
-    var response_buf: [16384]u8 = undefined;
-    const n = try posix.read(sock, &response_buf);
-    if (n == 0) {
-        try stdout.interface.print("No response from server.\n", .{});
-        return;
-    }
-
-    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch |err| {
-        log.err("Failed to decode response: {}", .{err});
-        return error.DecodeError;
-    };
+    const msg = try sendRpcRequest(allocator, sock, request);
     defer msg.deinit(allocator);
-
-    if (msg != .response) {
-        try stdout.interface.print("Unexpected response type.\n", .{});
-        return;
-    }
 
     if (msg.response.err) |err_val| {
         const err_str = if (err_val == .string) err_val.string else "unknown error";
@@ -1454,6 +1611,40 @@ test "executeTabRename leaves session json unchanged on rejected RPC" {
     const updated = try readSessionFile(testing.allocator, sessions_dir.sessions_path, "demo");
     defer testing.allocator.free(updated);
     try expectSavedTabTitle(updated, "old");
+}
+
+// Note: parseArgs cannot be unit-tested without refactoring to accept
+// an argument iterator instead of calling std.process.argsWithAllocator.
+
+test "ParseResult defaults" {
+    const result: ParseResult = .{};
+    try std.testing.expect(result.detached == false);
+    try std.testing.expect(result.attach_session == null);
+    try std.testing.expect(result.new_session_name == null);
+}
+
+test "validateSessionName accepts valid names" {
+    try validateSessionName("my-session");
+    try validateSessionName("session_1");
+    try validateSessionName("abc123");
+    try validateSessionName("a");
+    try validateSessionName("A-Z_0-9");
+}
+
+test "validateSessionName rejects empty name" {
+    try std.testing.expectError(error.SessionNameEmpty, validateSessionName(""));
+}
+
+test "validateSessionName rejects names over 64 chars" {
+    const long_name = "a" ** 65;
+    try std.testing.expectError(error.SessionNameTooLong, validateSessionName(long_name));
+}
+
+test "validateSessionName rejects invalid characters" {
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has space"));
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has/slash"));
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has.dot"));
+    try std.testing.expectError(error.SessionNameInvalid, validateSessionName("has@at"));
 }
 
 test {
