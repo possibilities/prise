@@ -214,6 +214,7 @@ pub const ServerAction = union(enum) {
     attached: struct { new_pty_id: i64, old_pty_id: ?u32 = null },
     pty_exited: struct { pty_id: u32, status: u32 },
     cwd_changed: struct { pty_id: u32, cwd: []const u8 },
+    rename_tab: struct { pty_id: u32, title: []const u8 },
     detached,
     color_query: ColorQueryTarget,
     server_info: struct { pty_validity: i64 },
@@ -397,6 +398,8 @@ pub const ClientLogic = struct {
             return try handleCwdChanged(state, notif.params);
         } else if (std.mem.eql(u8, notif.method, "color_query")) {
             return parseColorQuery(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "rename_tab")) {
+            return parseRenameTab(notif.params);
         }
         return .none;
     }
@@ -500,6 +503,31 @@ pub const ClientLogic = struct {
         try state.cwd_map.put(pty_id, owned_cwd);
 
         return .{ .cwd_changed = .{ .pty_id = @intCast(pty_id), .cwd = cwd_str } };
+    }
+
+    fn parseRenameTab(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+
+        var pty_id: ?u32 = null;
+        var title: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "title")) {
+                title = if (kv.value == .string) kv.value.string else null;
+            }
+        }
+
+        if (pty_id != null and title != null) {
+            return .{ .rename_tab = .{ .pty_id = pty_id.?, .title = title.? } };
+        }
+        return .none;
     }
 
     pub fn processPipeMessage(state: *ClientState, value: msgpack.Value) !PipeAction {
@@ -1757,6 +1785,7 @@ pub const App = struct {
             const env_str = try std.fmt.allocPrint(arena_alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
             try env_array.append(self.allocator, .{ .string = env_str });
         }
+        try self.appendSessionEnv(&env_array, arena_alloc);
 
         const macos_option_as_alt = self.ui.getMacosOptionAsAlt();
         const param_count: usize = if (self.initial_cwd != null) 6 else 5;
@@ -1884,6 +1913,7 @@ pub const App = struct {
             const env_str = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
             try env_array.append(self.allocator, .{ .string = env_str });
         }
+        try self.appendSessionEnv(&env_array, self.allocator);
 
         const macos_option_as_alt = self.ui.getMacosOptionAsAlt();
         const param_count: usize = if (cwd != null) 6 else 5;
@@ -1901,6 +1931,12 @@ pub const App = struct {
         const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params_val });
         try self.sendDirect(msg);
         self.allocator.free(msg);
+    }
+
+    fn appendSessionEnv(self: *App, env_array: *std.ArrayList(msgpack.Value), string_allocator: std.mem.Allocator) !void {
+        const session_name = self.current_session_name orelse return;
+        const session_env = try std.fmt.allocPrint(string_allocator, "PRISE_SESSION={s}", .{session_name});
+        try env_array.append(self.allocator, .{ .string = session_env });
     }
 
     fn onSendComplete(_: *io.Loop, completion: io.Completion) anyerror!void {
@@ -2237,6 +2273,7 @@ pub const App = struct {
                                     const env_str = try std.fmt.allocPrint(app.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
                                     try env_array.append(app.allocator, .{ .string = env_str });
                                 }
+                                try app.appendSessionEnv(&env_array, app.allocator);
 
                                 // Build spawn_pty params with env and optional cwd
                                 const param_count: usize = if (info.cwd != null) 2 else 1;
@@ -2287,6 +2324,12 @@ pub const App = struct {
                                 log.debug("CWD changed for PTY {}: {s}", .{ info.pty_id, info.cwd });
                                 app.ui.update(.{ .cwd_changed = .{ .pty_id = info.pty_id, .cwd = info.cwd } }) catch |err| {
                                     log.err("Failed to update UI with cwd_changed: {}", .{err});
+                                };
+                            },
+                            .rename_tab => |info| {
+                                log.debug("Rename tab for PTY {}: {s}", .{ info.pty_id, info.title });
+                                app.ui.update(.{ .rename_tab = .{ .pty_id = info.pty_id, .title = info.title } }) catch |err| {
+                                    log.err("Failed to update UI with rename_tab: {}", .{err});
                                 };
                             },
                             .detached => {
@@ -2420,6 +2463,7 @@ pub const App = struct {
             const env_str = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
             try env_array.append(self.allocator, .{ .string = env_str });
         }
+        try self.appendSessionEnv(&env_array, self.allocator);
 
         var num_params: usize = 4;
         if (opts.cwd != null) num_params += 1;

@@ -178,7 +178,11 @@ local utils = require("utils")
 ---@field type "cwd_changed"
 ---@field data table
 
----@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent
+---@class RenameTabEvent
+---@field type "rename_tab"
+---@field data { pty_id: number, title: string }
+
+---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|RenameTabEvent
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -618,6 +622,9 @@ local find_node_path
 local function find_tab_for_pane(pane_id)
     for i, tab in ipairs(state.tabs) do
         if find_node_path(tab.root, pane_id) then
+            return i, tab
+        end
+        if tab.floating and tab.floating.pane and tab.floating.pane.id == pane_id then
             return i, tab
         end
     end
@@ -3393,6 +3400,19 @@ function M.update(event)
             prise.request_frame()
             prise.save() -- Auto-save on layout change
         end
+    elseif event.type == "rename_tab" then
+        local pty_id = event.data.pty_id
+        local title = event.data.title
+        local _, tab = find_tab_for_pane(pty_id)
+        if tab then
+            if title == "" then
+                tab.title = nil
+            else
+                tab.title = title
+            end
+            prise.save()
+            prise.request_frame()
+        end
     elseif event.type == "cwd_changed" then
         -- CWD changed for a PTY - update cached git branch
         update_cached_git_branch()
@@ -4477,6 +4497,7 @@ M._test = {
     is_pane = is_pane,
     is_split = is_split,
     collect_panes = collect_panes,
+    find_tab_for_pane = find_tab_for_pane,
     find_node_path = find_node_path,
     get_first_leaf = get_first_leaf,
     get_last_leaf = get_last_leaf,
