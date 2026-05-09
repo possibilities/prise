@@ -3155,6 +3155,77 @@ const Server = struct {
         }
     }
 
+    /// Sweep `pending` for expired entries and reply `broker_timeout`
+    /// to each originating CLI. Snapshot-then-iterate to avoid
+    /// hashmap iterator invalidation while we mutate via `remove`.
+    ///
+    /// "Expired" means `deadline_ts < now()`. The deadline is set to
+    /// `now() + LIMITS.PENDING_DEADLINE_MS` at `handleBreakPane` time.
+    /// Per-CLI send failures are logged and the loop continues — one
+    /// dead socket must not stall sweep of the others.
+    fn sweepPending(self: *Server) void {
+        const now = std.time.milliTimestamp();
+
+        // Snapshot the request_ids that are expired. We can't call
+        // sendBreakPaneResponse + remove inside the iterator because
+        // sendBreakPaneResponse may queue a send completion that
+        // mutates the loop, and remove invalidates the iterator.
+        var expired = std.ArrayList(usize).empty;
+        defer expired.deinit(self.allocator);
+
+        var it = self.pending.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.deadline_ts < now) {
+                expired.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    log.warn("sweepPending: append failed: {}", .{err});
+                    return;
+                };
+            }
+        }
+
+        for (expired.items) |request_id| {
+            const entry = self.pending.fetchRemove(request_id) orelse continue;
+            log.info("event=\"rpc.broker.timeout\" request_id={} broker_id={}", .{
+                request_id,
+                entry.value.broker_id,
+            });
+            entry.value.cli_client.sendBreakPaneResponse(
+                self.loop,
+                entry.value.cli_msgid,
+                false,
+                "broker_timeout",
+            ) catch |err| {
+                log.warn("sweepPending: sendBreakPaneResponse failed: {}", .{err});
+            };
+        }
+    }
+
+    /// Arm (or re-arm) the deadline-sweep timer at `PENDING_SWEEP_MS`.
+    /// Called once at `startServer`, then re-armed from the timer
+    /// callback. Idempotent: if a timer is already armed, no-op.
+    fn armPendingSweepTimer(self: *Server) !void {
+        if (self.pending_sweep_timer != null) return;
+        self.pending_sweep_timer = try self.loop.timeout(
+            LIMITS.PENDING_SWEEP_MS * std.time.ns_per_ms,
+            .{ .ptr = self, .cb = onPendingSweepTimer },
+        );
+    }
+
+    fn onPendingSweepTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        _ = loop;
+        const self = completion.userdataCast(Server);
+        // Clear the handle BEFORE sweep + re-arm so we don't dedup
+        // ourselves against a timer-id we've already consumed.
+        self.pending_sweep_timer = null;
+        self.sweepPending();
+        // Re-arm only while the server is still accepting. Past
+        // shutdown, the loop is draining; arming again would keep it
+        // alive past the shutdown signal.
+        if (self.accepting) {
+            try self.armPendingSweepTimer();
+        }
+    }
+
     /// Send redraw notification (bytes) to attached clients
     fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, msg: []const u8, target_client: ?*Client) !void {
         // Send to each client attached to this session
@@ -3363,6 +3434,14 @@ const Server = struct {
         if (self.accept_task) |*task| {
             task.cancel(self.loop) catch {};
             self.accept_task = null;
+        }
+
+        // Cancel the deadline-sweep timer so the loop can drain. The
+        // sweep callback also gates re-arm on `self.accepting`, so a
+        // race-fire here is safely a no-op.
+        if (self.pending_sweep_timer) |*task| {
+            task.cancel(self.loop) catch {};
+            self.pending_sweep_timer = null;
         }
 
         // Close all clients
@@ -3625,6 +3704,12 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .ptr = &server,
         .cb = Server.onSignal,
     });
+
+    // Arm the deadline-sweep timer: re-arms itself from its callback
+    // at `LIMITS.PENDING_SWEEP_MS` cadence to retire any expired
+    // pending broker-RPC entries (e.g. break_pane requests whose
+    // broker never replied).
+    try server.armPendingSweepTimer();
 
     // Run until server decides to exit
     try loop.run(.until_done);
@@ -4526,6 +4611,99 @@ test "handleBreakPaneReply - ok path broadcasts to non-broker attached clients" 
 
     // Broker (id=1, fd=201) MUST NOT receive break_pane_applied.
     try testing.expect((try findPendingSendOnFd(allocator, &loop, 201)) == null);
+}
+
+test "sweepPending - expired entries reply broker_timeout and drop" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 400,
+        .id = 7,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // One expired entry (deadline already past), one fresh entry that
+    // should survive the sweep.
+    try server.pending.put(0, .{
+        .cli_msgid = 11,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() - 1000,
+        .pty_id = 5,
+        .focus = false,
+    });
+    try server.pending.put(1, .{
+        .cli_msgid = 12,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 6,
+        .focus = false,
+    });
+
+    server.sweepPending();
+
+    // Expired entry dropped, fresh entry retained.
+    try testing.expectEqual(@as(usize, 1), server.pending.count());
+    try testing.expect(server.pending.get(0) == null);
+    try testing.expect(server.pending.get(1) != null);
+
+    // CLI received a broker_timeout Response for cli_msgid=11.
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 400);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 11), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var saw_ok = false;
+    var saw_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expectEqual(false, kv.value.boolean);
+            saw_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("broker_timeout", kv.value.string);
+            saw_reason = true;
+        }
+    }
+    try testing.expect(saw_ok);
+    try testing.expect(saw_reason);
 }
 
 test "handleBreakPane - zero attached clients sends synchronous session_not_attached" {
