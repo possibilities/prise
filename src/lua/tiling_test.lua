@@ -292,16 +292,6 @@ assert(
         or (state_upvalue.pending_spawns[6] and state_upvalue.pending_spawns[6].new_tab == true),
     "pty_spawned: tab=<new> sets pending_new_tab"
 )
-state_upvalue.pending_title_renames = {}
-state_upvalue.pending_new_tab = false
-tiling.update({ type = "pty_spawned", data = { id = 5, title = "editor" } })
-assert(state_upvalue.pending_title_renames[5] == "editor", "pty_spawned: title queues pending rename")
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: nil tab creates new tab")
-
--- Test: pty_spawned with tab=<new> sets pending_new_tab
-state_upvalue.pending_new_tab = false
-tiling.update({ type = "pty_spawned", data = { id = 6, tab = "<new>" } })
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: tab=<new> sets pending_new_tab")
 
 -- Test: pty_spawned without placement fields is no-op
 state_upvalue.pending_new_tab = false
