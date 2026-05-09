@@ -1349,6 +1349,22 @@ pub const UI = struct {
         return "false";
     }
 
+    pub fn getScreenDump(self: *UI) bool {
+        _ = self.lua.getField(ziglua.registry_index, "prise_ui");
+        defer self.lua.pop(1);
+
+        _ = self.lua.getField(-1, "get_screen_dump");
+        if (self.lua.typeOf(-1) != .function) {
+            self.lua.pop(1);
+            return false;
+        }
+
+        self.lua.call(.{ .args = 0, .results = 1 });
+        defer self.lua.pop(1);
+
+        return self.lua.toBoolean(-1);
+    }
+
     pub fn update(self: *UI, event: lua_event.Event) !void {
         _ = self.lua.getField(ziglua.registry_index, "prise_ui");
         defer self.lua.pop(1);

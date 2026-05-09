@@ -18,11 +18,55 @@ const log = std.log.scoped(.client);
 
 const MAX_PASTE_SIZE = 10 * 1024 * 1024; // 10 MiB
 const MAX_SESSION_JSON_SIZE = 1024 * 1024; // 1 MiB
+const MAX_SCREEN_DUMP_SIZE = 16 * 1024 * 1024; // 16 MiB max mmap file size
 
 fn nonEmptyCwd(cwd: ?[]const u8) ?[]const u8 {
     const value = cwd orelse return null;
     return if (value.len > 0) value else null;
 }
+
+/// Binary header for mmap-based screen dump files.
+/// Readers check seq before and after reading to detect mid-write tears.
+/// Binary header for mmap screen dump files. 32 bytes, little-endian.
+/// Layout:
+///   0..3   magic        u32  "PRIS" (0x50524953)
+///   4..5   version      u16  format version (1)
+///   6..7   _pad1        u16  alignment padding
+///   8..11  seq          u32  sequence counter (odd=writing, even=complete)
+///  12..13  cols         u16
+///  14..15  rows         u16
+///  16..17  cursor_row   u16
+///  18..19  cursor_col   u16
+///  20..23  text_len     u32  byte length of text region
+///  24..27  styles_offset u32 byte offset from file start to style blob
+///  28..31  _pad2        [4]u8
+pub const DumpHeader = extern struct {
+    magic: u32 = 0x50524953, // "PRIS"
+    version: u16 = 1,
+    _pad1: u16 = 0,
+    seq: u32 = 0,
+    cols: u16 = 0,
+    rows: u16 = 0,
+    cursor_row: u16 = 0,
+    cursor_col: u16 = 0,
+    text_len: u32 = 0,
+    styles_offset: u32 = 0,
+    _pad2: [4]u8 = .{0} ** 4,
+
+    comptime {
+        std.debug.assert(@sizeOf(DumpHeader) == 32);
+    }
+};
+
+/// State for a single per-PTY mmap dump file.
+const PtyDumpState = struct {
+    fd: posix.fd_t,
+    ptr: [*]align(std.heap.page_size_min) u8,
+    size: usize,
+    path_buf: [64]u8,
+    path_len: usize,
+    seq: u32 = 0,
+};
 
 pub const MsgId = enum(u16) {
     spawn_pty = 1,
@@ -952,6 +996,16 @@ pub const App = struct {
     /// Positioned.child pointer).
     pending_frame_request: bool = false,
 
+    // mmap screen dump state
+    screen_dump_enabled: bool = false,
+    screen_dump_fd: posix.fd_t = -1,
+    screen_dump_ptr: ?[*]align(std.heap.page_size_min) u8 = null,
+    screen_dump_size: usize = 0,
+    screen_dump_seq: u32 = 0,
+    screen_dump_path_buf: [64]u8 = undefined,
+    screen_dump_path_len: usize = 0,
+    pty_dump_states: std.AutoHashMap(u32, PtyDumpState),
+
     pub const PendingColorQuery = struct {
         pty_id: u32,
         target: ServerAction.ColorQueryTarget.Target,
@@ -987,6 +1041,7 @@ pub const App = struct {
             .state = ClientState.init(allocator),
             .pty_id_remap = std.AutoHashMap(u32, u32).init(allocator),
             .pending_color_queries = .empty,
+            .pty_dump_states = std.AutoHashMap(u32, PtyDumpState).init(allocator),
         };
         app.parser = .{};
 
@@ -1002,6 +1057,13 @@ pub const App = struct {
             },
         }
         log.info("Lua UI initialized", .{});
+
+        // Check if screen dump is enabled in config
+        if (app.ui.getScreenDump()) {
+            app.initScreenDump() catch |err| {
+                log.warn("Failed to init screen dump: {}", .{err});
+            };
+        }
 
         // Create pipe for TTY thread -> Main thread communication
         const fds = posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true }) catch |err| {
@@ -1090,6 +1152,10 @@ pub const App = struct {
         }
         if (self.hit_regions.len > 0) self.allocator.free(self.hit_regions);
         if (self.split_handles.len > 0) self.allocator.free(self.split_handles);
+
+        // Clean up mmap screen dump files
+        self.deinitScreenDump();
+
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
 
@@ -2103,6 +2169,386 @@ pub const App = struct {
         log.debug("render: complete", .{});
 
         self.last_render_time = std.time.milliTimestamp();
+
+        // Write mmap screen dumps if enabled
+        if (self.screen_dump_enabled) {
+            self.writeScreenDump() catch |err| {
+                log.warn("screen dump write failed: {}", .{err});
+            };
+            self.writePtyDumps() catch |err| {
+                log.warn("pty dump write failed: {}", .{err});
+            };
+        }
+    }
+
+    // --- mmap screen dump implementation ---
+
+    /// Return the current process PID.
+    ///
+    /// `std.posix` has no cross-platform getpid, so we route through the
+    /// linux-specific syscall wrapper on Linux (prise does not link libc)
+    /// and through `std.c.getpid` on Darwin (libSystem is always linked).
+    fn currentPid() posix.pid_t {
+        return switch (@import("builtin").os.tag) {
+            .linux => @intCast(std.os.linux.getpid()),
+            else => std.c.getpid(),
+        };
+    }
+
+    /// Format the session-wide mmap dump path.
+    ///
+    /// The path MUST include the PID, not just the UID. Two clients on the
+    /// same user cannot share a path: `createDumpFile` opens with `O_TRUNC`,
+    /// so a second opener truncates the first client's file to zero bytes
+    /// while it is still mmap'd. The next render writes past the new EOF,
+    /// which Darwin delivers as SIGBUS. Including PID keeps each client's
+    /// file isolated.
+    fn formatSessionDumpPath(buf: []u8, uid: posix.uid_t, pid: posix.pid_t) ![]u8 {
+        return std.fmt.bufPrint(buf, "/tmp/prise-screen-{d}-{d}", .{ uid, pid });
+    }
+
+    /// Format a per-PTY mmap dump path. Same per-PID uniqueness rules as
+    /// `formatSessionDumpPath`.
+    fn formatPtyDumpPath(buf: []u8, uid: posix.uid_t, pid: posix.pid_t, pty_id: u32) ![]u8 {
+        return std.fmt.bufPrint(buf, "/tmp/prise-pty-{d}-{d}-{d}", .{ uid, pid, pty_id });
+    }
+
+    fn initScreenDump(self: *App) !void {
+        const uid = posix.getuid();
+        const pid = App.currentPid();
+        const path = App.formatSessionDumpPath(&self.screen_dump_path_buf, uid, pid) catch return;
+        self.screen_dump_path_len = path.len;
+
+        const initial_size = std.heap.page_size_min; // one page to start
+        const fd = try self.createDumpFile(path);
+        errdefer posix.close(fd);
+
+        try posix.ftruncate(fd, @intCast(initial_size));
+
+        const ptr = try posix.mmap(
+            null,
+            initial_size,
+            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+
+        self.screen_dump_fd = fd;
+        self.screen_dump_ptr = ptr.ptr;
+        self.screen_dump_size = initial_size;
+        self.screen_dump_enabled = true;
+        log.info("screen dump enabled: {s}", .{path});
+    }
+
+    fn deinitScreenDump(self: *App) void {
+        // Clean up per-PTY dump files
+        var pty_it = self.pty_dump_states.iterator();
+        while (pty_it.next()) |entry| {
+            const state = entry.value_ptr;
+            self.cleanupDumpMmap(state.ptr, state.size, state.fd, state.path_buf[0..state.path_len]);
+        }
+        self.pty_dump_states.deinit();
+
+        // Clean up session dump file
+        if (self.screen_dump_ptr) |ptr| {
+            self.cleanupDumpMmap(ptr, self.screen_dump_size, self.screen_dump_fd, self.screen_dump_path_buf[0..self.screen_dump_path_len]);
+            self.screen_dump_ptr = null;
+            self.screen_dump_fd = -1;
+        }
+    }
+
+    fn createDumpFile(self: *App, path: []const u8) !posix.fd_t {
+        _ = self;
+        // Null-terminate for openZ
+        var path_z: [128]u8 = undefined;
+        if (path.len >= path_z.len) return error.PathTooLong;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+
+        return posix.openZ(
+            path_z[0..path.len :0],
+            .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true },
+            0o644,
+        );
+    }
+
+    fn cleanupDumpMmap(_: *App, ptr: [*]align(std.heap.page_size_min) u8, size: usize, fd: posix.fd_t, path: []const u8) void {
+        posix.munmap(@alignCast(ptr[0..size]));
+        posix.close(fd);
+        // Unlink the file — best effort
+        var path_z: [128]u8 = undefined;
+        if (path.len < path_z.len) {
+            @memcpy(path_z[0..path.len], path);
+            path_z[path.len] = 0;
+            posix.unlinkZ(path_z[0..path.len :0]) catch {};
+        }
+    }
+
+    /// Ensure the mmap region is large enough, remapping if needed.
+    fn ensureDumpSize(self: *App, fd: posix.fd_t, current_ptr: [*]align(std.heap.page_size_min) u8, current_size: usize, needed: usize) !struct { ptr: [*]align(std.heap.page_size_min) u8, size: usize } {
+        _ = self;
+        if (needed <= current_size) return .{ .ptr = current_ptr, .size = current_size };
+        if (needed > MAX_SCREEN_DUMP_SIZE) return error.DumpTooLarge;
+
+        // Round up to page boundary
+        const new_size = std.mem.alignForward(usize, needed, std.heap.page_size_min);
+
+        // Unmap old, resize file, remap
+        posix.munmap(@alignCast(current_ptr[0..current_size]));
+        try posix.ftruncate(fd, @intCast(new_size));
+
+        const new_ptr = try posix.mmap(
+            null,
+            new_size,
+            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+
+        return .{ .ptr = new_ptr.ptr, .size = new_size };
+    }
+
+    fn writeScreenDump(self: *App) !void {
+        const screen = &self.vx.screen;
+        if (screen.width == 0 or screen.height == 0) return;
+
+        const cols: usize = screen.width;
+        const rows: usize = screen.height;
+        const total_cells = cols * rows;
+
+        // Build text from screen cells
+        var text_buf = std.ArrayList(u8).empty;
+        defer text_buf.deinit(self.allocator);
+        try text_buf.ensureTotalCapacity(self.allocator, cols * rows + rows);
+
+        for (0..rows) |row| {
+            if (row > 0) try text_buf.append(self.allocator, '\n');
+            var col: u16 = 0;
+            while (col < screen.width) {
+                if (screen.readCell(col, @intCast(row))) |cell| {
+                    const g = cell.char.grapheme;
+                    const w: u16 = if (cell.char.width > 1) cell.char.width else 1;
+                    if (g.len > 0) {
+                        try text_buf.appendSlice(self.allocator, g);
+                    } else {
+                        try text_buf.append(self.allocator, ' ');
+                    }
+                    col += w;
+                } else {
+                    try text_buf.append(self.allocator, ' ');
+                    col += 1;
+                }
+            }
+        }
+
+        const text_len = text_buf.items.len;
+        const styles_size = total_cells * 8;
+        const styles_offset = @sizeOf(DumpHeader) + text_len;
+        const needed = styles_offset + styles_size;
+
+        // Ensure mmap is large enough
+        const result = try self.ensureDumpSize(self.screen_dump_fd, self.screen_dump_ptr.?, self.screen_dump_size, needed);
+        self.screen_dump_ptr = result.ptr;
+        self.screen_dump_size = result.size;
+
+        const buf = self.screen_dump_ptr.?;
+
+        // Increment seq — odd value signals write in progress
+        self.screen_dump_seq +%= 1;
+        const header: *DumpHeader = @ptrCast(@alignCast(buf));
+        header.* = .{
+            .seq = self.screen_dump_seq,
+            .cols = @intCast(cols),
+            .rows = @intCast(rows),
+            .cursor_row = screen.cursor.row,
+            .cursor_col = screen.cursor.col,
+            .text_len = @intCast(text_len),
+            .styles_offset = @intCast(styles_offset),
+        };
+
+        // Write text
+        @memcpy(buf[@sizeOf(DumpHeader)..][0..text_len], text_buf.items);
+
+        // Write styles
+        const style_base = buf[styles_offset..];
+        for (0..rows) |row| {
+            for (0..cols) |col| {
+                const offset = (row * cols + col) * 8;
+                if (screen.readCell(@intCast(col), @intCast(row))) |cell| {
+                    const fg = serializeColor(cell.style.fg);
+                    const bg = serializeColor(cell.style.bg);
+                    style_base[offset] = (@as(u8, bg.color_type) << 2) | @as(u8, fg.color_type);
+                    style_base[offset + 1] = fg.data[0];
+                    style_base[offset + 2] = fg.data[1];
+                    style_base[offset + 3] = fg.data[2];
+                    style_base[offset + 4] = bg.data[0];
+                    style_base[offset + 5] = bg.data[1];
+                    style_base[offset + 6] = bg.data[2];
+                    style_base[offset + 7] = packStyleAttrs(cell.style);
+                } else {
+                    @memset(style_base[offset..][0..8], 0);
+                }
+            }
+        }
+
+        // Final seq bump — even value signals write complete
+        self.screen_dump_seq +%= 1;
+        header.seq = self.screen_dump_seq;
+    }
+
+    fn writePtyDumps(self: *App) !void {
+        var surface_it = self.surfaces.iterator();
+        while (surface_it.next()) |entry| {
+            const pty_id = entry.key_ptr.*;
+            const surface = entry.value_ptr.*;
+            self.writeSinglePtyDump(pty_id, surface) catch |err| {
+                log.warn("pty dump write failed for pty {}: {}", .{ pty_id, err });
+            };
+        }
+    }
+
+    fn writeSinglePtyDump(self: *App, pty_id: u32, surface: *Surface) !void {
+        const front = surface.front;
+        const cols: usize = surface.cols;
+        const rows: usize = surface.rows;
+        if (cols == 0 or rows == 0) return;
+
+        const total_cells = cols * rows;
+
+        // Ensure we have a dump state for this PTY
+        const gop = try self.pty_dump_states.getOrPut(pty_id);
+        if (!gop.found_existing) {
+            // Create new mmap file for this PTY
+            var path_buf: [64]u8 = undefined;
+            const uid = posix.getuid();
+            const pid = App.currentPid();
+            const path = App.formatPtyDumpPath(&path_buf, uid, pid, pty_id) catch return;
+
+            const fd = try self.createDumpFile(path);
+            errdefer posix.close(fd);
+
+            const initial_size = std.heap.page_size_min;
+            try posix.ftruncate(fd, @intCast(initial_size));
+
+            const ptr = try posix.mmap(
+                null,
+                initial_size,
+                posix.PROT.READ | posix.PROT.WRITE,
+                .{ .TYPE = .SHARED },
+                fd,
+                0,
+            );
+
+            gop.value_ptr.* = .{
+                .fd = fd,
+                .ptr = ptr.ptr,
+                .size = initial_size,
+                .path_buf = path_buf,
+                .path_len = path.len,
+            };
+        }
+
+        var state = gop.value_ptr;
+
+        // Build text
+        var text_buf = std.ArrayList(u8).empty;
+        defer text_buf.deinit(self.allocator);
+        try text_buf.ensureTotalCapacity(self.allocator, cols * rows + rows);
+
+        for (0..rows) |row| {
+            if (row > 0) try text_buf.append(self.allocator, '\n');
+            var col: u16 = 0;
+            while (col < cols) {
+                if (front.readCell(col, @intCast(row))) |cell| {
+                    const g = cell.char.grapheme;
+                    const w: u16 = if (cell.char.width > 1) cell.char.width else 1;
+                    if (g.len > 0) {
+                        try text_buf.appendSlice(self.allocator, g);
+                    } else {
+                        try text_buf.append(self.allocator, ' ');
+                    }
+                    col += w;
+                } else {
+                    try text_buf.append(self.allocator, ' ');
+                    col += 1;
+                }
+            }
+        }
+
+        const text_len = text_buf.items.len;
+        const styles_size = total_cells * 8;
+        const styles_offset = @sizeOf(DumpHeader) + text_len;
+        const needed = styles_offset + styles_size;
+
+        // Ensure mmap is large enough
+        const resized = try self.ensureDumpSize(state.fd, state.ptr, state.size, needed);
+        state.ptr = resized.ptr;
+        state.size = resized.size;
+
+        const buf = state.ptr;
+
+        // Write header with odd seq (write in progress)
+        state.seq +%= 1;
+        const header: *DumpHeader = @ptrCast(@alignCast(buf));
+        header.* = .{
+            .seq = state.seq,
+            .cols = @intCast(cols),
+            .rows = @intCast(rows),
+            .cursor_row = surface.front_cursor_row,
+            .cursor_col = surface.front_cursor_col,
+            .text_len = @intCast(text_len),
+            .styles_offset = @intCast(styles_offset),
+        };
+
+        // Write text
+        @memcpy(buf[@sizeOf(DumpHeader)..][0..text_len], text_buf.items);
+
+        // Write styles
+        const style_base = buf[styles_offset..];
+        for (0..rows) |row| {
+            for (0..cols) |col| {
+                const offset = (row * cols + col) * 8;
+                if (front.readCell(@intCast(col), @intCast(row))) |cell| {
+                    const fg = serializeColor(cell.style.fg);
+                    const bg = serializeColor(cell.style.bg);
+                    style_base[offset] = (@as(u8, bg.color_type) << 2) | @as(u8, fg.color_type);
+                    style_base[offset + 1] = fg.data[0];
+                    style_base[offset + 2] = fg.data[1];
+                    style_base[offset + 3] = fg.data[2];
+                    style_base[offset + 4] = bg.data[0];
+                    style_base[offset + 5] = bg.data[1];
+                    style_base[offset + 6] = bg.data[2];
+                    style_base[offset + 7] = packStyleAttrs(cell.style);
+                } else {
+                    @memset(style_base[offset..][0..8], 0);
+                }
+            }
+        }
+
+        // Even seq — write complete
+        state.seq +%= 1;
+        header.seq = state.seq;
+    }
+
+    fn serializeColor(color: vaxis.Cell.Color) struct { color_type: u2, data: [3]u8 } {
+        return switch (color) {
+            .default => .{ .color_type = 0, .data = .{ 0, 0, 0 } },
+            .index => |idx| .{ .color_type = 1, .data = .{ idx, 0, 0 } },
+            .rgb => |rgb| .{ .color_type = 2, .data = rgb },
+        };
+    }
+
+    fn packStyleAttrs(style: vaxis.Cell.Style) u8 {
+        var attrs: u8 = 0;
+        if (style.bold) attrs |= 0x01;
+        if (style.dim) attrs |= 0x02;
+        if (style.italic) attrs |= 0x04;
+        if (style.reverse) attrs |= 0x08;
+        if (style.strikethrough) attrs |= 0x10;
+        if (style.ul_style != .off) attrs |= 0x20;
+        return attrs;
     }
 
     pub fn onConnected(l: *io.Loop, completion: io.Completion) anyerror!void {
@@ -4705,4 +5151,131 @@ test "extractPtyIdsFromJson dedupes repeated pane pty_ids" {
     try testing.expectEqual(@as(usize, 2), ids.len);
     try testing.expectEqual(@as(u32, 3), ids[0]);
     try testing.expectEqual(@as(u32, 5), ids[1]);
+}
+
+test "DumpHeader has correct size and field offsets" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 32), @sizeOf(DumpHeader));
+
+    // Verify field offsets match the documented binary layout
+    try testing.expectEqual(@as(usize, 0), @offsetOf(DumpHeader, "magic"));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(DumpHeader, "version"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(DumpHeader, "seq"));
+    try testing.expectEqual(@as(usize, 12), @offsetOf(DumpHeader, "cols"));
+    try testing.expectEqual(@as(usize, 14), @offsetOf(DumpHeader, "rows"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(DumpHeader, "cursor_row"));
+    try testing.expectEqual(@as(usize, 18), @offsetOf(DumpHeader, "cursor_col"));
+    try testing.expectEqual(@as(usize, 20), @offsetOf(DumpHeader, "text_len"));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(DumpHeader, "styles_offset"));
+}
+
+test "DumpHeader default values" {
+    const testing = std.testing;
+    const header: DumpHeader = .{};
+
+    try testing.expectEqual(@as(u32, 0x50524953), header.magic);
+    try testing.expectEqual(@as(u16, 1), header.version);
+    try testing.expectEqual(@as(u32, 0), header.seq);
+    try testing.expectEqual(@as(u16, 0), header.cols);
+}
+
+test "serializeColor round-trips color types" {
+    const testing = std.testing;
+
+    const default = App.serializeColor(.default);
+    try testing.expectEqual(@as(u2, 0), default.color_type);
+
+    const indexed = App.serializeColor(.{ .index = 42 });
+    try testing.expectEqual(@as(u2, 1), indexed.color_type);
+    try testing.expectEqual(@as(u8, 42), indexed.data[0]);
+
+    const rgb = App.serializeColor(.{ .rgb = .{ 0xFF, 0x80, 0x00 } });
+    try testing.expectEqual(@as(u2, 2), rgb.color_type);
+    try testing.expectEqual(@as(u8, 0xFF), rgb.data[0]);
+    try testing.expectEqual(@as(u8, 0x80), rgb.data[1]);
+    try testing.expectEqual(@as(u8, 0x00), rgb.data[2]);
+}
+
+test "packStyleAttrs encodes flags correctly" {
+    const testing = std.testing;
+
+    const empty: vaxis.Cell.Style = .{};
+    try testing.expectEqual(@as(u8, 0), App.packStyleAttrs(empty));
+
+    var bold: vaxis.Cell.Style = .{};
+    bold.bold = true;
+    try testing.expectEqual(@as(u8, 0x01), App.packStyleAttrs(bold));
+
+    var multi: vaxis.Cell.Style = .{};
+    multi.bold = true;
+    multi.italic = true;
+    multi.reverse = true;
+    try testing.expectEqual(@as(u8, 0x01 | 0x04 | 0x08), App.packStyleAttrs(multi));
+}
+
+test "formatSessionDumpPath differs by pid" {
+    const testing = std.testing;
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+
+    const uid: posix.uid_t = 1000;
+    const path_a = try App.formatSessionDumpPath(&buf_a, uid, 111);
+    const path_b = try App.formatSessionDumpPath(&buf_b, uid, 222);
+
+    // Pins the per-PID uniqueness invariant. Two clients on the same user
+    // must not share a path — the underlying file is opened with O_TRUNC,
+    // and a shared path produces SIGBUS on the first client's next render
+    // when the second client attaches.
+    try testing.expect(!std.mem.eql(u8, path_a, path_b));
+    try testing.expectEqualStrings("/tmp/prise-screen-1000-111", path_a);
+    try testing.expectEqualStrings("/tmp/prise-screen-1000-222", path_b);
+}
+
+test "formatPtyDumpPath differs by pid and pty_id" {
+    const testing = std.testing;
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    var buf_c: [64]u8 = undefined;
+
+    const uid: posix.uid_t = 1000;
+    const path_a = try App.formatPtyDumpPath(&buf_a, uid, 111, 7);
+    const path_b = try App.formatPtyDumpPath(&buf_b, uid, 222, 7);
+    const path_c = try App.formatPtyDumpPath(&buf_c, uid, 111, 8);
+
+    try testing.expect(!std.mem.eql(u8, path_a, path_b));
+    try testing.expect(!std.mem.eql(u8, path_a, path_c));
+    try testing.expectEqualStrings("/tmp/prise-pty-1000-111-7", path_a);
+    try testing.expectEqualStrings("/tmp/prise-pty-1000-222-7", path_b);
+    try testing.expectEqualStrings("/tmp/prise-pty-1000-111-8", path_c);
+}
+
+test "dump path formatters fit in 64-byte buffer at max values" {
+    const testing = std.testing;
+
+    // Widest plausible values: u32-max uid, i32-max pid, u32-max pty_id.
+    // This pins the buffer-size assumption baked into App.screen_dump_path_buf
+    // and PtyDumpState.path_buf ([64]u8) so a future widening of uid/pid/pty_id
+    // can't silently overflow and be truncated into a colliding path.
+    var session_buf: [64]u8 = undefined;
+    const session_path = try App.formatSessionDumpPath(
+        &session_buf,
+        std.math.maxInt(u32),
+        std.math.maxInt(i32),
+    );
+    try testing.expectEqualStrings(
+        "/tmp/prise-screen-4294967295-2147483647",
+        session_path,
+    );
+
+    var pty_buf: [64]u8 = undefined;
+    const pty_path = try App.formatPtyDumpPath(
+        &pty_buf,
+        std.math.maxInt(u32),
+        std.math.maxInt(i32),
+        std.math.maxInt(u32),
+    );
+    try testing.expectEqualStrings(
+        "/tmp/prise-pty-4294967295-2147483647-4294967295",
+        pty_path,
+    );
 }
