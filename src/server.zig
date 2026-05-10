@@ -1604,7 +1604,7 @@ const Client = struct {
         } else if (std.mem.eql(u8, notif.method, "color_response")) {
             try self.handleColorResponse(notif);
         } else if (std.mem.eql(u8, notif.method, "break_pane_reply")) {
-            try self.server.handleBreakPaneReply(notif);
+            try self.server.handleBreakPaneReply(self, notif);
         } else if (std.mem.eql(u8, notif.method, "session_file_changed")) {
             try self.handleSessionFileChanged(notif);
         } else if (std.mem.startsWith(u8, notif.method, "plug.")) {
@@ -2985,13 +2985,24 @@ const Server = struct {
     /// is logged under the stable event name `rpc.broker.late_reply`
     /// and silently dropped — never a panic. Malformed payload is
     /// logged + dropped.
-    fn handleBreakPaneReply(self: *Server, notif: rpc.Notification) !void {
+    ///
+    /// Defense-in-depth: a buggy client could send `break_pane_reply`
+    /// with a guessed `request_id` and either spoof `ok=true` (causing
+    /// a bogus `break_pane_applied` broadcast) or race the legitimate
+    /// broker. We require the dispatching client's id to match
+    /// `entry.broker_id`; on mismatch we log under the stable event
+    /// `rpc.broker.spoofed_reply` and leave the pending entry in place
+    /// so the real broker (or the deadline sweep) can still resolve it.
+    fn handleBreakPaneReply(self: *Server, self_client: *Client, notif: rpc.Notification) !void {
         const parsed = parseBreakPaneReplyParams(notif.params) catch |err| {
             log.warn("break_pane_reply: malformed payload: {}", .{err});
             return;
         };
 
-        const entry = self.pending.fetchRemove(parsed.request_id) orelse {
+        // Peek before removing: identity check must not consume the
+        // pending entry on mismatch — the legitimate broker still
+        // needs to resolve it.
+        const peek = self.pending.get(parsed.request_id) orelse {
             log.info("event=\"rpc.broker.late_reply\" request_id={} ok={}", .{
                 parsed.request_id,
                 parsed.ok,
@@ -2999,6 +3010,16 @@ const Server = struct {
             return;
         };
 
+        if (peek.broker_id != self_client.id) {
+            log.warn("event=\"rpc.broker.spoofed_reply\" request_id={} sender_id={} expected_broker_id={}", .{
+                parsed.request_id,
+                self_client.id,
+                peek.broker_id,
+            });
+            return;
+        }
+
+        const entry = self.pending.fetchRemove(parsed.request_id).?;
         const cli_client = entry.value.cli_client;
         const cli_msgid = entry.value.cli_msgid;
 
@@ -7229,6 +7250,19 @@ test "handleBreakPaneReply - non-ok refusal sends Response with reason" {
     };
     try server.clients.append(allocator, cli);
 
+    // Broker client (id=1) — must thread through `handleBreakPaneReply`
+    // so the new identity guard sees a matching `broker_id`.
+    const broker = try allocator.create(Client);
+    broker.* = .{
+        .fd = 301,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, broker);
+
     // Pre-populate a pending entry as if handleBreakPane wrote it.
     try server.pending.put(0, .{
         .cli_msgid = 77,
@@ -7245,7 +7279,7 @@ test "handleBreakPaneReply - non-ok refusal sends Response with reason" {
         .{ .key = .{ .string = "ok" }, .value = .{ .boolean = false } },
         .{ .key = .{ .string = "reason" }, .value = .{ .string = "solo_pane" } },
     };
-    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+    try server.handleBreakPaneReply(broker, .{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
 
     // Pending dropped, Response queued to CLI fd.
     try testing.expectEqual(@as(usize, 0), server.pending.count());
@@ -7306,12 +7340,25 @@ test "handleBreakPaneReply - unknown request_id silently dropped" {
         server.pending.deinit();
     }
 
+    // A sender client to thread through the call. With no pending
+    // entry registered the early-return fires before any identity check.
+    const sender = try allocator.create(Client);
+    sender.* = .{
+        .fd = 301,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, sender);
+
     // Spurious reply for a request_id that was never registered.
     var reply_params = [_]msgpack.Value.KeyValue{
         .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 999 } },
         .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
     };
-    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+    try server.handleBreakPaneReply(sender, .{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
 
     // No pending entries created; no spurious sends queued.
     try testing.expectEqual(@as(usize, 0), server.pending.count());
@@ -7342,16 +7389,36 @@ test "handleBreakPaneReply - malformed payload silently dropped" {
         .signal_pipe_fds = undefined,
     };
     defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
         server.clients.deinit(allocator);
         server.ptys.deinit();
         server.pending.deinit();
     }
 
+    // Sender client — parse-failure path returns before identity check.
+    const sender = try allocator.create(Client);
+    sender.* = .{
+        .fd = 301,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, sender);
+
     // Missing `ok` field — handler must not panic, must not send.
     var bad = [_]msgpack.Value.KeyValue{
         .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
     };
-    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &bad } });
+    try server.handleBreakPaneReply(sender, .{ .method = "break_pane_reply", .params = .{ .map = &bad } });
     try testing.expectEqual(@as(usize, 0), server.pending.count());
 }
 
@@ -7426,12 +7493,19 @@ test "handleBreakPaneReply - ok path broadcasts to non-broker attached clients" 
         .focus = true,
     });
 
-    // Broker fires ok=true reply for request_id=0.
+    // Broker fires ok=true reply for request_id=0. The broker is the
+    // first attached client (id=1, fd=201) — find it to thread through.
+    const broker = blk: {
+        for (server.clients.items) |c| {
+            if (c.id == 1) break :blk c;
+        }
+        unreachable;
+    };
     var reply_params = [_]msgpack.Value.KeyValue{
         .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
         .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
     };
-    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+    try server.handleBreakPaneReply(broker, .{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
 
     // Pending dropped, CLI got its ok=true Response.
     try testing.expectEqual(@as(usize, 0), server.pending.count());
@@ -7469,6 +7543,107 @@ test "handleBreakPaneReply - ok path broadcasts to non-broker attached clients" 
 
     // Broker (id=1, fd=201) MUST NOT receive break_pane_applied.
     try testing.expect((try findPendingSendOnFd(allocator, &loop, 201)) == null);
+}
+
+test "handleBreakPaneReply - spoofed reply from non-broker client is rejected" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Three attached clients: id=1 (legit broker, fd=201), id=2 (sibling, fd=202),
+    // id=3 (impostor, fd=203). The pending entry is broker_id=1, so a reply
+    // dispatched from id=2 or id=3 must be rejected.
+    const ids = [_]usize{ 1, 2, 3 };
+    for (ids) |client_id| {
+        const c = try allocator.create(Client);
+        c.* = .{
+            .fd = @intCast(200 + @as(i32, @intCast(client_id))),
+            .id = client_id,
+            .server = &server,
+            .msg_buffer = std.ArrayList(u8).empty,
+            .send_queue = std.ArrayList([]u8).empty,
+            .attached_ptys = std.ArrayList(usize).empty,
+        };
+        try c.attached_ptys.append(allocator, 5);
+        try server.clients.append(allocator, c);
+    }
+
+    // CLI client (originator, blocked on Response).
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pending entry expects the broker at id=1.
+    try server.pending.put(0, .{
+        .cli_msgid = 77,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 2000,
+        .pty_id = 5,
+        .focus = true,
+    });
+
+    // Find the impostor (id=3) — a foreign client that did NOT win the
+    // broker election but tries to spoof an ok=true reply.
+    const impostor = blk: {
+        for (server.clients.items) |c| {
+            if (c.id == 3) break :blk c;
+        }
+        unreachable;
+    };
+
+    var reply_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    try server.handleBreakPaneReply(impostor, .{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+
+    // Pending entry survived — the legitimate broker (or sweep) can
+    // still resolve it.
+    try testing.expectEqual(@as(usize, 1), server.pending.count());
+    try testing.expect(server.pending.get(0) != null);
+
+    // No Response queued to the CLI; the CLI is still blocked.
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 300)) == null);
+
+    // No `break_pane_applied` Notification queued to siblings or broker.
+    for ([_]posix.fd_t{ 201, 202, 203 }) |client_fd| {
+        try testing.expect((try findPendingSendOnFd(allocator, &loop, client_fd)) == null);
+    }
 }
 
 test "sweepPending - expired entries reply broker_timeout and drop" {
