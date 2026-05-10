@@ -1293,7 +1293,8 @@ const Client = struct {
         // If there's a pending send, queue this one
         if (self.send_buffer != null) {
             if (self.send_queue.items.len >= LIMITS.SEND_QUEUE_MAX) {
-                self.server.allocator.free(buf);
+                // errdefer above frees buf on the error return; do NOT
+                // free it here too or DebugAllocator panics on double-free.
                 return error.SendQueueFull;
             }
             try self.send_queue.append(self.server.allocator, buf);
@@ -8254,6 +8255,281 @@ test "handleBreakPane - broker-pick is lowest Client.id among attached" {
     defer broker2_msg.deinit(allocator);
     try testing.expect(broker2_msg == .notification);
     try testing.expectEqualStrings("break_pane_request", broker2_msg.notification.method);
+}
+
+test "handleBreakPane - sendBreakPaneRequest failure replies broker_timeout synchronously and drops pending" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Broker client (id=1, fd=201) attached to pty 5. Its send_buffer is
+    // pre-loaded so sendData will queue rather than send immediately, and
+    // its send_queue is pre-filled to LIMITS.SEND_QUEUE_MAX so the next
+    // sendData returns error.SendQueueFull — which is exactly the fault
+    // path handleBreakPane catches and converts to a synchronous
+    // broker_timeout reply.
+    const broker = try allocator.create(Client);
+    broker.* = .{
+        .fd = 201,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try broker.attached_ptys.append(allocator, 5);
+    broker.send_buffer = try allocator.dupe(u8, "in-flight");
+    var i: usize = 0;
+    while (i < LIMITS.SEND_QUEUE_MAX) : (i += 1) {
+        const buf = try allocator.dupe(u8, "queued");
+        try broker.send_queue.append(allocator, buf);
+    }
+    try server.clients.append(allocator, broker);
+
+    // CLI client (id=99, fd=300) — originator of the break_pane RPC,
+    // not attached so it's never the broker.
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 5 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+
+    try server.handleBreakPane(cli, 42, .{ .map = &params });
+
+    // Pending entry was written then dropped on the send failure — the
+    // CLI must not be left waiting for a reply that will never come.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+
+    // CLI received a synchronous broker_timeout Response.
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 42), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var saw_ok = false;
+    var saw_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expectEqual(false, kv.value.boolean);
+            saw_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("broker_timeout", kv.value.string);
+            saw_reason = true;
+        }
+    }
+    try testing.expect(saw_ok);
+    try testing.expect(saw_reason);
+
+    // Broker (fd=201) must NOT have a queued break_pane_request — the
+    // queue was full, the send failed, the request never landed.
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 201)) == null);
+}
+
+test "handleBreakPane - pending at PENDING_MAX replies broker_timeout without growing pending" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // One attached broker so broker-pick succeeds (we want to reach the
+    // PENDING_MAX gate, not bail at session_not_attached).
+    const broker = try allocator.create(Client);
+    broker.* = .{
+        .fd = 201,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try broker.attached_ptys.append(allocator, 5);
+    try server.clients.append(allocator, broker);
+
+    // CLI client.
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pre-fill pending to the cap. Entries point at the live cli/broker so
+    // the deinit path doesn't see dangling pointers; deadlines are far in
+    // the future so a stray sweep wouldn't drain them.
+    const future_deadline = std.time.milliTimestamp() + 60_000;
+    var i: usize = 0;
+    while (i < LIMITS.PENDING_MAX) : (i += 1) {
+        try server.pending.put(i, .{
+            .cli_msgid = @intCast(1000 + i),
+            .cli_client = cli,
+            .broker_id = 1,
+            .deadline_ts = future_deadline,
+            .pty_id = 5,
+            .focus = false,
+        });
+    }
+    server.next_request_id = LIMITS.PENDING_MAX;
+    try testing.expectEqual(@as(usize, LIMITS.PENDING_MAX), server.pending.count());
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 5 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+
+    try server.handleBreakPane(cli, 42, .{ .map = &params });
+
+    // Pending must NOT have grown — the cap is the whole point.
+    try testing.expectEqual(@as(usize, LIMITS.PENDING_MAX), server.pending.count());
+
+    // CLI received a synchronous broker_timeout Response.
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 42), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var saw_ok = false;
+    var saw_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expectEqual(false, kv.value.boolean);
+            saw_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("broker_timeout", kv.value.string);
+            saw_reason = true;
+        }
+    }
+    try testing.expect(saw_ok);
+    try testing.expect(saw_reason);
+
+    // Broker (fd=201) must NOT have a queued break_pane_request — we
+    // refused at the cap before reaching sendBreakPaneRequest.
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 201)) == null);
+}
+
+test "onPendingSweepTimer - does not re-arm when accepting=false" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Server is mid-shutdown: not accepting. The sweep callback must
+    // sweep once and then NOT re-arm — re-arming here would keep the
+    // io loop alive past the shutdown signal.
+    server.accepting = false;
+
+    // Construct a Completion as if the loop fired the timer. The
+    // callback only inspects `userdata` (cast to *Server) and ignores
+    // result/msg, so a synthetic .timer result is fine.
+    const completion = io.Completion{
+        .userdata = &server,
+        .msg = 0,
+        .callback = Server.onPendingSweepTimer,
+        .result = .{ .timer = {} },
+    };
+    try Server.onPendingSweepTimer(&loop, completion);
+
+    try testing.expect(server.pending_sweep_timer == null);
 }
 
 test "server - pty exit notification" {
