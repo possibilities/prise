@@ -4529,6 +4529,7 @@ function M.update(event)
 
         prise.save()
         prise.request_frame()
+        return true
     elseif event.type == "move_pane_to_session" then
         -- Move a pane out of its current tab AND out of the current session
         -- entirely, landing it in another session's saved state. Callers
