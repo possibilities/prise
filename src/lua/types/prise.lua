@@ -141,6 +141,18 @@ function prise.create_text_input() end
 ---@return integer
 function prise.gwidth(str) end
 
+---Slice a string by cell columns, walking grapheme clusters.
+---Uses the same `.unicode` width method as `prise.gwidth`.
+---A wide grapheme straddling either boundary is dropped and padded with
+---a space per covered boundary cell (never emits invalid UTF-8).
+---Returns "" when `start_cell < 0`, `end_cell <= start_cell`, or the
+---window starts past the string's total cell width.
+---@param str string
+---@param start_cell integer 0-based first cell to include
+---@param end_cell integer 0-based cell past the last included cell
+---@return string
+function prise.cell_substring(str, start_cell, end_cell) end
+
 ---Get the current time formatted as HH:MM
 ---@return string
 function prise.get_time() end
