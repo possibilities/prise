@@ -114,6 +114,21 @@ To disable:
 systemctl --user disable --now prise.service
 ```
 
+# TROUBLESHOOTING
+
+When the client or server crashes, prise writes a crash bundle under
+*~/.cache/prise/crash/<timestamp>-<role>/*.
+
+Each bundle includes:
+
+- **summary.json** - High-level crash metadata such as role, reason, socket path,
+  session name, and PTY identifiers when available
+- **events.log** - Recent recorded crash-context events
+- **client.log** - Tail of the client log, when present
+- **server.log** - Tail of the server log, when present
+- **session.json** - Saved session snapshot when the crashing client could
+  serialize its UI state
+
 # UI CONCEPTS
 
 ## Panes

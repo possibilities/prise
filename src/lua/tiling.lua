@@ -4842,10 +4842,7 @@ function M.update(event)
                 end
                 local tab_title = event.data and event.data.tab_title
                 prise.log.info(
-                    "break_pane: cross-session pre-remove pty="
-                        .. tostring(pty_id)
-                        .. " source="
-                        .. source_session
+                    "break_pane: cross-session pre-remove pty=" .. tostring(pty_id) .. " source=" .. source_session
                 )
                 local removed = prise.remove_pty_from_session(source_session, pty_id)
                 if not removed then
@@ -4880,10 +4877,7 @@ function M.update(event)
                     return false
                 end
                 prise.log.info(
-                    "break_pane: cross-session done pty="
-                        .. tostring(pty_id)
-                        .. " source="
-                        .. source_session
+                    "break_pane: cross-session done pty=" .. tostring(pty_id) .. " source=" .. source_session
                 )
                 -- Viewer's session is untouched — no save, no request_frame.
                 return true

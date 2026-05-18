@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const crash_context = @import("crash_context.zig");
 const io = @import("io.zig");
 const msgpack = @import("msgpack.zig");
 const rpc = @import("rpc.zig");
@@ -40,6 +41,8 @@ pub const std_options: std.Options = .{
     },
 };
 
+pub const panic = std.debug.FullPanic(panicHandler);
+
 var log_buffer: [4096]u8 = undefined;
 
 /// Write directly to the log file, bypassing std.log. Silent when log_file
@@ -48,6 +51,24 @@ fn logDirect(comptime format: []const u8, args: anytype) void {
     const file = log_file orelse return;
     const msg = std.fmt.bufPrint(&log_buffer, format ++ "\n", args) catch return;
     _ = file.write(msg) catch {};
+}
+
+fn panicHandler(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    var buf: [320]u8 = undefined;
+    const reason = std.fmt.bufPrint(&buf, "panic: {s}", .{msg}) catch "panic";
+
+    // Capture a stack trace into a fixed-size buffer so the crash bundle has
+    // something to symbolicate later. 32 frames is enough to identify most
+    // panic origins without inflating bundle size.
+    var addrs: [32]usize = undefined;
+    var trace: std.builtin.StackTrace = .{
+        .instruction_addresses = &addrs,
+        .index = 0,
+    };
+    if (first_trace_addr) |addr| std.debug.captureStackTrace(addr, &trace);
+
+    crash_context.writeBundle(reason, null, &trace);
+    std.debug.defaultPanic(msg, first_trace_addr);
 }
 
 fn fileLogFn(
@@ -702,6 +723,11 @@ fn runClient(allocator: std.mem.Allocator, socket_path: []const u8, args: ParseR
         return err;
     };
 
+    crash_context.init(.client, version);
+    defer crash_context.deinit();
+    crash_context.setSocketPath(socket_path);
+    crash_context.record("client run start", .{});
+
     initLogFile("client.log");
     log.info("Connecting to server at {s}", .{socket_path});
 
@@ -736,6 +762,10 @@ fn runClient(allocator: std.mem.Allocator, socket_path: []const u8, args: ParseR
         },
     };
     defer app.deinit();
+    errdefer |err| {
+        const reason = if (err == error.ConnectionRefused) "connection refused" else @errorName(err);
+        app.writeCrashBundle(reason);
+    }
 
     // Initialize TTY after App is in its final memory location
     // (tty writer holds pointer to tty_buffer)
@@ -1078,6 +1108,7 @@ fn writeNewSessionFile(allocator: std.mem.Allocator, name: []const u8, pty_valid
 
 /// Create a detached session: fetch server info, spawn PTY, write session file.
 fn createDetachedSession(allocator: std.mem.Allocator, socket_path: []const u8, name: []const u8) !void {
+    crash_context.record("detached session create name={s}", .{name});
     const pty_validity = try fetchPtyValidity(allocator, socket_path);
     const pty_id = try spawnDetachedPty(allocator, socket_path, name);
     try writeNewSessionFile(allocator, name, pty_validity, pty_id);
@@ -1285,6 +1316,7 @@ fn createMinimalSession(allocator: std.mem.Allocator, name: []const u8) !void {
 /// Send a session_switch RPC to the server, which notifies the client
 /// owning the given PTY to switch to the target session.
 fn requestNestedSessionSwitch(allocator: std.mem.Allocator, socket_path: []const u8, session_name: []const u8, pty_id: u32) !void {
+    crash_context.record("nested session switch target={s} pty_id={d}", .{ session_name, pty_id });
     const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
         log.err("Failed to create socket: {}", .{err});
         return error.SocketError;
@@ -1671,6 +1703,7 @@ test {
     _ = @import("keybind.zig");
     _ = @import("keybind_compiler.zig");
     _ = @import("keybind_matcher.zig");
+    _ = @import("crash_context.zig");
 
     if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {
         _ = @import("io/kqueue.zig");

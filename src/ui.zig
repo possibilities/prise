@@ -1509,7 +1509,6 @@ pub const UI = struct {
         };
     }
 
-
     /// Paint tab-bar metadata (ids, titles, active tab, scroll offset) without
     /// any pty binding. Used at session-switch derivation time so the tab bar
     /// can swap old->new in a single frame before attach_pty completes. A
