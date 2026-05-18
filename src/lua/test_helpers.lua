@@ -95,17 +95,17 @@ function M.setup_prise_mock()
         Terminal = function(opts)
             return { type = "terminal", pty = opts.pty }
         end,
-        Text = function(_)
-            return { type = "text" }
+        Text = function(opts)
+            return { type = "text", segments = opts }
         end,
-        Column = function(_)
-            return { type = "column" }
+        Column = function(opts)
+            return { type = "column", children = opts and opts.children or {} }
         end,
-        Row = function(_)
-            return { type = "row" }
+        Row = function(opts)
+            return { type = "row", children = opts and opts.children or {} }
         end,
-        Stack = function(_)
-            return { type = "stack" }
+        Stack = function(opts)
+            return { type = "stack", children = opts and opts.children or {} }
         end,
         Positioned = function(_)
             return { type = "positioned" }
