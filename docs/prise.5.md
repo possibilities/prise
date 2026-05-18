@@ -380,6 +380,12 @@ new PTY appears in the tiling UI:
 When any placement field is present, the tiling UI handles the **pty_spawned**
 event automatically: switching sessions, creating tabs, and renaming as needed.
 
+# TILING UI HELPERS
+
+**ui.get_theme()**
+:   Return the resolved theme table with defaults merged with user overrides
+    from **setup()**. Keys match the properties listed in the THEME section.
+
 # BUILT-IN ACTIONS
 
 The following actions can be used as values in the **keybinds** table.

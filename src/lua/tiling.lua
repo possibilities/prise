@@ -513,6 +513,12 @@ function M.get_macos_option_as_alt()
     return config.macos_option_as_alt or "false"
 end
 
+---Get the resolved theme (defaults merged with user overrides from setup())
+---@return PriseTheme
+function M.get_theme()
+    return config.theme
+end
+
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
 local PALETTE_WIDTH = 60 -- Total width of command palette
 local PALETTE_INNER_WIDTH = 56 -- Inner width (PALETTE_WIDTH - 4 for padding)
