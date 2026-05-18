@@ -85,3 +85,9 @@ test "lua tiling keep_attached" {
     defer lua.deinit();
     try runLuaTest(lua, "src/lua/tiling_test_keep_attached.lua");
 }
+
+test "lua tiling swap pane" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_swap_pane.lua");
+}
