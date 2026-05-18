@@ -298,12 +298,22 @@ const Pty = struct {
         self.joinAndFree(allocator);
     }
 
-    fn addClient(self: *Pty, allocator: std.mem.Allocator, client: *Client) !void {
+    /// Attach a client to this PTY. Returns true if the client was newly
+    /// added; false if the client was already attached (idempotent no-op).
+    /// Idempotency is load-bearing: a corrupt session file listing the same
+    /// pty_id in multiple tabs round-trips as duplicate attach_pty RPCs, and
+    /// returning an error here would land in the client's restore-failure
+    /// rollback rather than the success path. Tolerating the duplicate keeps
+    /// the server alive and the restore intact.
+    fn addClient(self: *Pty, allocator: std.mem.Allocator, client: *Client) !bool {
         // Precondition: PTY must be running to accept new clients
         std.debug.assert(self.running.load(.seq_cst));
-        // Precondition: client must not already be attached (no duplicates)
+
         for (self.clients.items) |c| {
-            std.debug.assert(c != client);
+            if (c == client) {
+                log.warn("addClient: client fd={} already attached to PTY (no-op)", .{client.fd});
+                return false;
+            }
         }
         // Precondition: must not exceed client limit
         std.debug.assert(self.clients.items.len < LIMITS.CLIENTS_MAX);
@@ -313,6 +323,14 @@ const Pty = struct {
 
         // Postcondition: client count increased by exactly one
         std.debug.assert(self.clients.items.len == prev_len + 1);
+        return true;
+    }
+
+    fn isClientAttached(self: *const Pty, client: *const Client) bool {
+        for (self.clients.items) |c| {
+            if (c == client) return true;
+        }
+        return false;
     }
 
     fn removeClient(self: *Pty, client: *Client) void {
@@ -2576,8 +2594,10 @@ const Server = struct {
 
         if (parsed.attach) {
             client.macos_option_as_alt = parsed.macos_option_as_alt;
-            try pty_instance.addClient(self.allocator, client);
-            try client.attached_ptys.append(self.allocator, pty_id);
+            const newly_attached = try pty_instance.addClient(self.allocator, client);
+            if (newly_attached) {
+                try client.attached_ptys.append(self.allocator, pty_id);
+            }
 
             log.info("Sending initial redraw for PTY {}", .{pty_id});
             const msg = try buildRedrawMessageFromPty(self.allocator, pty_instance, .full);
@@ -2833,9 +2853,13 @@ const Server = struct {
 
         client.macos_option_as_alt = parsed.macos_option_as_alt;
 
-        try pty_instance.addClient(self.allocator, client);
-        try client.attached_ptys.append(self.allocator, parsed.pty_id);
-        log.info("Client {} attached to PTY {}", .{ client.fd, parsed.pty_id });
+        const newly_attached = try pty_instance.addClient(self.allocator, client);
+        if (newly_attached) {
+            try client.attached_ptys.append(self.allocator, parsed.pty_id);
+            log.info("Client {} attached to PTY {}", .{ client.fd, parsed.pty_id });
+        } else {
+            log.info("Client {} attach_pty for PTY {} was no-op (already attached)", .{ client.fd, parsed.pty_id });
+        }
 
         const msg = try buildRedrawMessageFromPty(self.allocator, pty_instance, .full);
         defer self.allocator.free(msg);
@@ -6773,4 +6797,52 @@ test "bumpPastPanePtyIds returns input when tabs array contains no panes" {
     defer parsed.deinit();
     const tabs_val = parsed.value.object.get("tabs").?;
     try testing.expectEqual(@as(i64, 5), Server.bumpPastPanePtyIds(tabs_val, 5));
+}
+
+test "Pty.addClient is idempotent on duplicate attach" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var pty_inst: Pty = .{
+        .id = 1,
+        .process = .{ .master = -1, .slave = -1, .pid = 0 },
+        .clients = std.ArrayList(*Client).empty,
+        .running = std.atomic.Value(bool).init(true),
+        .terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 80, .rows = 24 }),
+        .allocator = allocator,
+        .title = std.ArrayList(u8).empty,
+        .title_dirty = false,
+        .cwd = std.ArrayList(u8).empty,
+        .cwd_dirty = false,
+        .pipe_fds = undefined,
+        .exit_pipe_fds = undefined,
+        .render_state = .empty,
+        .server_ptr = undefined,
+    };
+    defer {
+        pty_inst.terminal.deinit(allocator);
+        pty_inst.render_state.deinit(allocator);
+        pty_inst.clients.deinit(allocator);
+        pty_inst.title.deinit(allocator);
+        pty_inst.cwd.deinit(allocator);
+    }
+
+    var client: Client = .{
+        .fd = 42,
+        .server = undefined,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+
+    try testing.expect(!pty_inst.isClientAttached(&client));
+
+    const first = try pty_inst.addClient(allocator, &client);
+    try testing.expect(first);
+    try testing.expectEqual(@as(usize, 1), pty_inst.clients.items.len);
+    try testing.expect(pty_inst.isClientAttached(&client));
+
+    const second = try pty_inst.addClient(allocator, &client);
+    try testing.expect(!second);
+    try testing.expectEqual(@as(usize, 1), pty_inst.clients.items.len);
 }
