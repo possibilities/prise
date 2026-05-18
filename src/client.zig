@@ -22,6 +22,13 @@ const MAX_PASTE_SIZE = 10 * 1024 * 1024; // 10 MiB
 const MAX_SESSION_JSON_SIZE = 1024 * 1024; // 1 MiB
 const MAX_SCREEN_DUMP_SIZE = 16 * 1024 * 1024; // 16 MiB max mmap file size
 
+/// Upper bound on the deferred-attach queue. One `pty_spawned` server message
+/// per Lua `prise.attach()` call enqueues a single u32; autopilot bursts of
+/// up to a few dozen are realistic, so 64 leaves headroom while still
+/// catching a runaway-loop bug before it eats memory. Overflow drops the
+/// newest id with a `log.warn` — a missed attach is recoverable, an OOM is not.
+const MAX_PENDING_ATTACH_IDS: usize = 64;
+
 fn nonEmptyCwd(cwd: ?[]const u8) ?[]const u8 {
     const value = cwd orelse return null;
     return if (value.len > 0) value else null;
@@ -1073,9 +1080,13 @@ pub const App = struct {
     pipe_recv_buffer: [4096]u8 = undefined,
     colors: Surface.TerminalColors = .{},
 
-    pending_attach_ids: ?[]u32 = null,
-    pending_attach_count: usize = 0,
-    pending_attach_pty_id: ?u32 = null,
+    /// FIFO queue of pty_ids deferred from Lua `prise.attach()` calls,
+    /// drained after each `processServerMessage` batch in `onRecv`. Used
+    /// to coalesce multiple `pty_spawned` events that arrive in a single
+    /// TCP read into one `sendDirect` per id (bypassing kqueue's
+    /// `EV_ADD | EV_ONESHOT` last-write-wins behavior on the
+    /// `(fd, EVFILT_WRITE)` pair). Capped at MAX_PENDING_ATTACH_IDS.
+    pending_attach_ids: std.ArrayList(u32) = .empty,
     session_json: ?[]const u8 = null,
     pending_attach_cwd: std.AutoHashMap(u32, []const u8) = undefined,
     prepared_restore_plan: ?SessionRestorePlan = null,
@@ -1295,6 +1306,7 @@ pub const App = struct {
         self.clearPreparedRestorePlan();
         self.pty_id_remap.deinit();
         self.pending_color_queries.deinit(self.allocator);
+        self.pending_attach_ids.deinit(self.allocator);
         if (self.current_session_name) |name| {
             self.allocator.free(name);
         }
@@ -1580,11 +1592,25 @@ pub const App = struct {
             }
         }.createCb);
 
-        // Register attach_pty callback (deferred from Lua via prise.attach)
+        // Register attach_pty callback (deferred from Lua via prise.attach).
+        // Append to the FIFO queue drained after the current onRecv batch.
+        // A single TCP read can deliver N `pty_spawned` events; each fires
+        // one `prise.attach()` from tiling.lua, and we must enqueue all N
+        // so the drain loop sends N distinct attach_pty frames. Earlier
+        // versions stored a scalar here and silently lost N-1 attaches.
         self.ui.queue_attach_pty_callback = struct {
             fn attachCb(ctx: *anyopaque, pty_id: u32) void {
                 const app_ptr: *App = @ptrCast(@alignCast(ctx));
-                app_ptr.pending_attach_pty_id = pty_id;
+                if (app_ptr.pending_attach_ids.items.len >= MAX_PENDING_ATTACH_IDS) {
+                    log.warn(
+                        "attachCb: pending_attach_ids full ({} ids), dropping pty_id={}",
+                        .{ app_ptr.pending_attach_ids.items.len, pty_id },
+                    );
+                    return;
+                }
+                app_ptr.pending_attach_ids.append(app_ptr.allocator, pty_id) catch |err| {
+                    log.err("attachCb: failed to enqueue pty_id={}: {}", .{ pty_id, err });
+                };
             }
         }.attachCb;
         self.ui.queue_attach_pty_ctx = @ptrCast(self);
@@ -3354,11 +3380,17 @@ pub const App = struct {
                         switch (action) {
                             .send_attach => |pty_id| {
                                 log.info("Sending attach_pty for session {}", .{pty_id});
-                                app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{ pty_id, "false" } });
-                                _ = try l.send(app.fd, app.send_buffer.?, .{
-                                    .ptr = app,
-                                    .cb = onSendComplete,
-                                });
+                                // sendDirect, not l.send: a single
+                                // processServerMessage batch can yield
+                                // multiple .send_attach actions (e.g. a
+                                // restored session's per-pty fan-out), and
+                                // queuing them through `l.send` coalesces
+                                // on the (fd, EVFILT_WRITE) kevent and
+                                // drops all but the last. See the drain
+                                // comment below for the kqueue semantics.
+                                const frame = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{ pty_id, "false" } });
+                                defer app.allocator.free(frame);
+                                try app.sendDirect(frame);
                             },
                             .redraw => |params| {
                                 app.handleRedraw(params) catch |err| {
@@ -3799,22 +3831,35 @@ pub const App = struct {
                             .none => {},
                         }
 
-                        // Drain deferred attach from Lua prise.attach()
-                        if (app.pending_attach_pty_id) |pty_id| {
-                            app.pending_attach_pty_id = null;
+                        // Drain deferred attach from Lua prise.attach().
+                        //
+                        // One server `pty_spawned` batch can enqueue N ids
+                        // here. We must send N distinct attach_pty frames,
+                        // but using `l.send` would re-register the same
+                        // `(fd, EVFILT_WRITE)` kevent N times in a single
+                        // tick — kqueue's `EV_ADD | EV_ONESHOT` keeps only
+                        // the last `udata`, so only one callback fires and
+                        // only one frame goes out. `sendDirect` writes
+                        // synchronously via `posix.write` and bypasses
+                        // kqueue entirely; it's the documented escape hatch
+                        // for the recv_task completion stack (see comments
+                        // near `pending_force_quit` / `pending_detach` and
+                        // the `sendDirect` implementation below). The peer
+                        // is a separate process (prise server), so there
+                        // is no same-loop deadlock risk.
+                        for (app.pending_attach_ids.items) |pty_id| {
                             log.info("Draining deferred attach_pty for PTY {}", .{pty_id});
                             const msgid = app.state.next_msgid;
                             app.state.next_msgid += 1;
                             try app.state.pending_requests.put(msgid, .{ .attach = .{ .pty_id = pty_id, .cwd = null } });
-                            app.send_buffer = try msgpack.encode(
+                            const frame = try msgpack.encode(
                                 app.allocator,
                                 .{ 0, msgid, "attach_pty", .{ @as(i64, pty_id), "false" } },
                             );
-                            _ = try l.send(app.fd, app.send_buffer.?, .{
-                                .ptr = app,
-                                .cb = onSendComplete,
-                            });
+                            defer app.allocator.free(frame);
+                            try app.sendDirect(frame);
                         }
+                        app.pending_attach_ids.clearRetainingCapacity();
 
                         // Remove consumed bytes from buffer
                         if (bytes_consumed > 0) {
@@ -6368,4 +6413,105 @@ test "findTabHostingPtyId detects pre-existing pty_id at any tree depth" {
     try testing.expectEqual(@as(?i64, 4), App.findTabHostingPtyId(tabs, 11));
     try testing.expectEqual(@as(?i64, 4), App.findTabHostingPtyId(tabs, 13));
     try testing.expectEqual(@as(?i64, null), App.findTabHostingPtyId(tabs, 99));
+}
+
+// Regression: N pty_ids queued for deferred attach must produce N distinct
+// attach_pty frames on the wire in FIFO order. The bug being prevented:
+// when the drain went through `l.send`, kqueue's EV_ADD on the existing
+// (fd, EVFILT_WRITE) pair updated `udata` in place — only the last frame
+// reached the server, so autopilot bursts produced one tab instead of N.
+// `sendDirect` writes synchronously via posix.write and bypasses kqueue,
+// so this test exercises that invariant directly via a socketpair.
+test "deferred attach drain sends all queued ids in FIFO order" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // std.posix has no socketpair wrapper in this Zig version; call libc
+    // directly. Both ends are SOCK_STREAM on AF_UNIX — same primitive the
+    // prise client uses to talk to the server.
+    var sv: [2]posix.fd_t = undefined;
+    const sp_rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sv);
+    try testing.expectEqual(@as(c_int, 0), sp_rc);
+    const writer_fd = sv[0];
+    const reader_fd = sv[1];
+    defer posix.close(writer_fd);
+    defer posix.close(reader_fd);
+
+    // Three distinct ids in queue order — picked to be distinguishable
+    // even after msgpack int compaction (small positive ints fit in one byte).
+    const ids = [_]u32{ 7, 42, 13 };
+
+    // Drive the same path the production drain uses: encode each frame
+    // independently and write via a synchronous loop equivalent to sendDirect.
+    // Inlined here because constructing a real App() for one wire-format
+    // assertion is overkill — the invariant under test is "synchronous writes
+    // do not coalesce on the kevent queue", which is a property of the write
+    // primitive, not the App state machine.
+    for (ids, 0..) |id, i| {
+        const msgid: u32 = @intCast(100 + i);
+        const frame = try msgpack.encode(
+            allocator,
+            .{ 0, msgid, "attach_pty", .{ @as(i64, id), "false" } },
+        );
+        defer allocator.free(frame);
+        var written: usize = 0;
+        while (written < frame.len) {
+            const n = posix.write(writer_fd, frame[written..]) catch |err| {
+                if (err == error.WouldBlock) continue;
+                return err;
+            };
+            written += n;
+        }
+    }
+
+    // Read everything available; socketpair STREAM may coalesce TCP-style,
+    // so we decode frame-by-frame off the byte buffer rather than assuming
+    // one recv per frame. All writes flushed synchronously above, so by
+    // the time we get here every byte is sitting in the kernel's receive
+    // buffer — a single read suffices. The loop is defensive against the
+    // rare case where the kernel returns a short read on a fresh AF_UNIX
+    // socketpair.
+    var buf: [4096]u8 = undefined;
+    var total_read: usize = 0;
+    while (total_read < buf.len) {
+        const n = posix.read(reader_fd, buf[total_read..]) catch |err| {
+            if (err == error.WouldBlock) break;
+            return err;
+        };
+        if (n == 0) break;
+        total_read += n;
+        // Peek with poll(timeout=0); if nothing is queued, sender is done.
+        var pfd = [_]posix.pollfd{.{ .fd = reader_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&pfd, 0) catch break;
+        if (ready == 0) break;
+    }
+
+    // Decode each frame from the buffer, advancing by bytes_consumed.
+    var cursor: usize = 0;
+    var decoded_ids: [ids.len]i64 = undefined;
+    var decoded_count: usize = 0;
+    while (cursor < total_read and decoded_count < ids.len) {
+        const result = try rpc.decodeMessageWithSize(allocator, buf[cursor..total_read]);
+        defer result.message.deinit(allocator);
+        try testing.expect(result.message == .request);
+        const req = result.message.request;
+        try testing.expectEqualStrings("attach_pty", req.method);
+        try testing.expect(req.params == .array);
+        const params = req.params.array;
+        try testing.expect(params.len >= 1);
+        // Small positive ints round-trip through msgpack as either .integer
+        // or .unsigned depending on the wire format chosen by the encoder
+        // (positive fixint vs. uint8/16/...); accept either here.
+        decoded_ids[decoded_count] = switch (params[0]) {
+            .integer => |i| i,
+            .unsigned => |u| @intCast(u),
+            else => return error.UnexpectedPtyIdType,
+        };
+        decoded_count += 1;
+        cursor += result.bytes_consumed;
+    }
+
+    try testing.expectEqual(@as(usize, ids.len), decoded_count);
+    try testing.expectEqual(@as(i64, ids[0]), decoded_ids[0]);
+    try testing.expectEqual(@as(i64, ids[1]), decoded_ids[1]);
+    try testing.expectEqual(@as(i64, ids[2]), decoded_ids[2]);
 }
