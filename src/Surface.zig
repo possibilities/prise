@@ -623,6 +623,36 @@ pub fn render(self: *const Surface, win: vaxis.Window, focused: bool) void {
         }
     }
 
+    // Fill excess area when surface is smaller than window (e.g. non-owner
+    // client whose resize was rejected by the server). Uses the same
+    // unfocused dimming so the boundary is visually obvious.
+    if (self.cols < win.width or self.rows < win.height) {
+        const bg_rgb = self.resolveDefaultBg();
+        const dimmed_bg: vaxis.Cell.Color = .{ .rgb = TerminalColors.reduceContrast(bg_rgb, DIM_UNFOCUSED) };
+        const dim_cell: vaxis.Cell = .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{ .bg = dimmed_bg },
+        };
+
+        // Right strip: columns beyond surface width
+        if (self.cols < win.width) {
+            for (0..@min(self.rows, win.height)) |row| {
+                for (self.cols..win.width) |col| {
+                    win.writeCell(@intCast(col), @intCast(row), dim_cell);
+                }
+            }
+        }
+
+        // Bottom strip: rows beyond surface height (full width)
+        if (self.rows < win.height) {
+            for (self.rows..win.height) |row| {
+                for (0..win.width) |col| {
+                    win.writeCell(@intCast(col), @intCast(row), dim_cell);
+                }
+            }
+        }
+    }
+
     self.renderCursor(win, focused);
 }
 
