@@ -64,6 +64,7 @@
 ---@field get_state? fun(cwd_lookup: fun(id: number): string?): table Serialize UI state for persistence
 ---@field set_state? fun(saved: table?, pty_lookup: fun(id: number): Pty?) Restore UI state
 ---@field setup? fun(opts: table?) Configure the UI (optional)
+---@field get_focused_id? fun(): number? Return the raw pty_id of the focused pane (optional)
 
 local M = {}
 

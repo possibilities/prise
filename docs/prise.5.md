@@ -505,6 +505,41 @@ The tiling UI uses a leader key sequence. Press the leader key (default:
 
 The command palette (**Super+p**) provides fuzzy search for all commands.
 
+# TILING UI HELPERS
+
+The built-in tiling UI exposes helper methods that user configuration code can
+call directly.
+
+**ui.get_active_tab_info()**
+:   Return information about the active tab as a table with **index**,
+    **title**, and **pane_count**, or **nil** when no tab is active. The pane
+    count includes floating panes.
+
+**ui.get_focused_pane_index()**
+:   Return the 1-based index of the focused pane within the active tab, or
+    **nil** when no pane is focused.
+
+**ui.get_focused_id()**
+:   Return the raw pty_id of the focused pane, or **nil** when no pane is
+    focused. Complements **get_focused_pane_index** for callers that need
+    to reference the focused pane by its actual identifier rather than by
+    position within a tab.
+
+Example:
+
+```lua
+local ui = require("prise").tiling()
+
+local tab = ui.get_active_tab_info()
+if tab then
+    local pane_idx = ui.get_focused_pane_index()
+    local pane_id = ui.get_focused_id()
+    print(string.format("Tab %d: %s (pane %d/%d, pty=%s)",
+        tab.index, tab.title, pane_idx or 0, tab.pane_count,
+        tostring(pane_id)))
+end
+```
+
 # SEE ALSO
 
 [prise(1)](prise.1.html), [prise(7)](prise.7.html)
