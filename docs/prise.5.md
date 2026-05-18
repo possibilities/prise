@@ -162,20 +162,47 @@ The **tab_bar** table configures the tab bar.
 **show_single_tab**
 :   Show the tab bar even with only one tab. Default: **false**
 
-When using a custom **tab_bar.render** function, returned segments may include
-**tab_index** to mark which tab they belong to. This lets hover and click
-regions match the rendered tab structure exactly.
+**render**
+:   Optional custom renderer function. It receives **(tabs, screen_width,
+    theme)** and must return an array of segments compatible with
+    **prise.Text()**.
+
+**format_title**
+:   Optional function that formats automatically-derived tab titles before they
+    are passed to the renderer. Explicitly renamed tab titles are not reformatted.
+
+When **render** is provided, each tab entry includes:
+
+- **index** - 1-based tab index
+- **title** - Display title for the tab
+- **is_explicit_title** - True when the title was set explicitly
+- **is_active** - True for the active tab
+- **is_hovered** - True when the pointer is hovering over the tab
+- **is_close_hovered** - True when the pointer is hovering over the tab close button
+- **pane_count** - Number of panes in the tab
+- **is_zoomed** - True when the tab currently has a zoomed pane
+
+Returned segments may include **tab_index** to mark which tab they belong to.
+This lets hover and click regions match the rendered tab structure exactly.
 
 Example:
 
 ```lua
 ui.setup({
     tab_bar = {
-        render = function(tabs)
+        render = function(tabs, screen_width, theme)
             local segments = {}
             for _, tab in ipairs(tabs) do
-                table.insert(segments, { text = " " .. tab.title, tab_index = tab.index })
-                table.insert(segments, { text = " x ", tab_index = tab.index })
+                local label = string.format(" %d:%s (%d) ", tab.index, tab.title, tab.pane_count)
+                table.insert(segments, {
+                    text = label,
+                    tab_index = tab.index,
+                    style = {
+                        bg = tab.is_active and theme.bg4 or theme.bg2,
+                        fg = theme.fg_bright,
+                        bold = tab.is_zoomed,
+                    },
+                })
             end
             return segments
         end,
