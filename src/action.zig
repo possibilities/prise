@@ -25,6 +25,7 @@ pub const Action = union(enum) {
     // Pane management
     close_pane,
     toggle_zoom,
+    break_pane,
 
     // Tab management
     new_tab,
@@ -114,6 +115,7 @@ pub const Action = union(enum) {
             .focus_down => "Focus Down",
             .close_pane => "Close Pane",
             .toggle_zoom => "Toggle Zoom",
+            .break_pane => "Break Pane",
             .new_tab => "New Tab",
             .close_tab => "Close Tab",
             .rename_tab => "Rename Tab",
