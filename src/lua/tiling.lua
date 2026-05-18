@@ -115,6 +115,7 @@ local utils = require("utils")
 ---@field clock_timer? Timer
 ---@field pending_split? { direction: "row"|"col" }
 ---@field pending_new_tab? boolean
+---@field pending_title_renames table<number, string>
 ---@field next_split_id number
 ---@field palette PaletteState
 ---@field rename RenameState
@@ -141,6 +142,10 @@ local utils = require("utils")
 ---@class PtyExitedEvent
 ---@field type "pty_exited"
 ---@field data { id: number }
+
+---@class PtySpawnedEvent
+---@field type "pty_spawned"
+---@field data { id: number, cwd: string, session?: string, tab?: string, title?: string }
 
 ---@class KeyPressEvent
 ---@field type "key_press"
@@ -190,7 +195,7 @@ local utils = require("utils")
 ---@field type "move_pane_to_session"
 ---@field data { pty_id: number, session_name: string, cwd: string, tab_title?: string }
 
----@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|RenameTabEvent|BreakPaneEvent|MovePaneToSessionEvent
+---@alias Event PtyAttachEvent|PtySpawnedEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|RenameTabEvent|BreakPaneEvent|MovePaneToSessionEvent
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -404,6 +409,7 @@ local state = {
     clock_timer = nil,
     pending_split = nil,
     pending_new_tab = false,
+    pending_title_renames = {}, -- [pty_id] = title string from spawn placement
     next_split_id = 1,
     -- Command palette
     palette = {
@@ -718,6 +724,18 @@ local function find_tab_for_pane(pane_id)
             return i, tab
         end
         if tab.floating and tab.floating.pane and tab.floating.pane.id == pane_id then
+            return i, tab
+        end
+    end
+    return nil
+end
+
+---Find a tab by its title
+---@param title string
+---@return integer?, Tab?
+local function find_tab_by_title(title)
+    for i, tab in ipairs(state.tabs) do
+        if tab.title == title then
             return i, tab
         end
     end
@@ -3089,6 +3107,17 @@ function M.update(event)
         update_pty_focus(old_focused_id, state.focused_id)
         prise.request_frame()
         prise.save() -- Auto-save on pane added
+
+        -- Apply any queued title rename from spawn placement
+        local rename = state.pending_title_renames[new_pane.id]
+        if rename then
+            local _, tab = find_tab_for_pane(new_pane.id)
+            if tab then
+                tab.title = rename
+                prise.save()
+            end
+            state.pending_title_renames[new_pane.id] = nil
+        end
     elseif event.type == "key_press" then
         -- Handle command palette
         if state.palette.visible then
@@ -4034,6 +4063,46 @@ function M.update(event)
             return { ok = false, reason = "source_solo_destination_unreachable" }
         end
         return { ok = true, reason = "moved" }
+    elseif event.type == "pty_spawned" then
+        local data = event.data
+        prise.log.info("Lua: pty_spawned " .. data.id)
+
+        -- If placement fields present, auto-adopt this PTY
+        if data.session or data.tab or data.title then
+            -- 1. Session: switch or create
+            if data.session then
+                local current = prise.get_session_name()
+                if current ~= data.session then
+                    local ok = prise.switch_session(data.session)
+                    if not ok then
+                        -- Session doesn't exist — create and switch to it
+                        prise.create_session(data.session)
+                        return
+                    end
+                end
+            end
+
+            -- 2. Tab: find by name or create
+            if data.tab and data.tab ~= "<new>" then
+                local idx = find_tab_by_title(data.tab)
+                if idx then
+                    set_active_tab_index(idx)
+                else
+                    state.pending_new_tab = true
+                end
+            else
+                -- nil or "<new>" — always create a new tab
+                state.pending_new_tab = true
+            end
+
+            -- 3. Attach the PTY
+            prise.attach(data.id)
+
+            -- 4. Name the tab (for new tabs, or rename if title differs)
+            if data.title then
+                state.pending_title_renames[data.id] = data.title
+            end
+        end
     elseif event.type == "mouse" then
         local d = event.data
 
@@ -5715,6 +5784,7 @@ M._test = {
     get_state = function()
         return state
     end,
+    find_tab_by_title = find_tab_by_title,
 }
 
 return M

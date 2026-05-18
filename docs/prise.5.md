@@ -177,6 +177,10 @@ Each layout has:
 **pane**
 :   `{ type = "pane", cwd = "...", cmd = "...", ratio = 0.5 }`
 
+The **cmd** field can also be passed as a spawn option. The command is written
+to the PTY master immediately at spawn time. The kernel queues the bytes in
+the line discipline buffer; the shell consumes them on its first read.
+
 **split**
 :   `{ type = "split", direction = "horizontal"|"vertical", ratio = 0.5, children = { ... } }`
 
@@ -356,6 +360,23 @@ ui.setup({
 
 return ui
 ```
+
+# SPAWN PLACEMENT
+
+The **spawn_pty** RPC accepts optional placement fields that control where a
+new PTY appears in the tiling UI:
+
+**session**
+:   Target session name. If the current session differs, the UI switches first.
+
+**tab**
+:   Set to **"new"** to open the PTY in a new tab.
+
+**title**
+:   Explicit title for the tab containing the new PTY.
+
+When any placement field is present, the tiling UI handles the **pty_spawned**
+event automatically: switching sessions, creating tabs, and renaming as needed.
 
 # BUILT-IN ACTIONS
 

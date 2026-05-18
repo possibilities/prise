@@ -96,6 +96,10 @@ pub const UI = struct {
     /// pattern's `prise.notify("break_pane_reply", {...})` reply path.
     notify_callback: ?*const fn (ctx: *anyopaque, method: []const u8, params: msgpack.Value) anyerror!void = null,
     notify_ctx: *anyopaque = undefined,
+    create_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
+    create_session_ctx: *anyopaque = undefined,
+    queue_attach_pty_callback: ?*const fn (ctx: *anyopaque, pty_id: u32) void = null,
+    queue_attach_pty_ctx: *anyopaque = undefined,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -105,6 +109,9 @@ pub const UI = struct {
         attach: bool,
         cwd: ?[]const u8 = null,
         cmd: ?[]const u8 = null,
+        // argv bypasses the login shell entirely; the server execs these
+        // directly in the PTY child. Mutually exclusive with cmd.
+        argv: ?[]const []const u8 = null,
     };
 
     pub const InitError = struct {
@@ -281,6 +288,11 @@ pub const UI = struct {
         self.notify_callback = cb;
     }
 
+    pub fn setCreateSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void) void {
+        self.create_session_ctx = ctx;
+        self.create_session_callback = cb;
+    }
+
     pub fn getNextSessionName(self: *UI) ![]const u8 {
         const home = std.posix.getenv("HOME") orelse return self.allocator.dupe(u8, AMORY_NAMES[0]);
 
@@ -419,6 +431,14 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(switchSession));
         lua.setField(-2, "switch_session");
 
+        // Register attach (queue attach_pty from Lua)
+        lua.pushFunction(ziglua.wrap(luaAttach));
+        lua.setField(-2, "attach");
+
+        // Register create_session
+        lua.pushFunction(ziglua.wrap(createSession));
+        lua.setField(-2, "create_session");
+
         // Register log
         lua.createTable(0, 4);
 
@@ -504,6 +524,35 @@ pub const UI = struct {
 
             _ = lua.getField(1, "cmd");
             if (lua.isString(-1)) opts.cmd = lua.toString(-1) catch null;
+            lua.pop(1);
+
+            // argv is a Lua array of strings; collect into a temporary slice
+            // that lives for the duration of the spawn callback. The strings
+            // themselves remain valid because the source table is still on
+            // the Lua stack at index 1.
+            var argv_storage: ?[][]const u8 = null;
+            defer if (argv_storage) |buf| ui.allocator.free(buf);
+
+            _ = lua.getField(1, "argv");
+            if (lua.typeOf(-1) == .table) {
+                const len = lua.rawLen(-1);
+                if (len > 0) {
+                    const buf = ui.allocator.alloc([]const u8, len) catch {
+                        lua.raiseErrorStr("Failed to allocate argv", .{});
+                    };
+                    argv_storage = buf;
+                    for (0..len) |i| {
+                        _ = lua.getIndex(-1, @intCast(i + 1));
+                        if (lua.typeOf(-1) == .string) {
+                            buf[i] = lua.toString(-1) catch "";
+                        } else {
+                            buf[i] = "";
+                        }
+                        lua.pop(1);
+                    }
+                    opts.argv = buf;
+                }
+            }
             lua.pop(1);
 
             cb(ui.spawn_ctx, opts) catch |err| {
@@ -757,12 +806,70 @@ pub const UI = struct {
         log.info("switchSession: called with target_session='{s}'", .{target_session});
 
         if (ui.switch_session_callback) |cb| {
-            cb(ui.switch_session_ctx, target_session) catch |err| {
-                lua.raiseErrorStr("Failed to switch session: %s", .{@errorName(err).ptr});
+            cb(ui.switch_session_ctx, target_session) catch {
+                lua.pushBoolean(false);
+                return 1;
             };
             lua.pushBoolean(true);
         } else {
             log.warn("switchSession: no callback registered", .{});
+            lua.pushBoolean(false);
+        }
+        return 1;
+    }
+
+    fn luaAttach(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            log.warn("luaAttach: failed to get ui pointer", .{});
+            return 0;
+        };
+        lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+
+        const pty_id = lua.toInteger(1) catch {
+            log.warn("luaAttach: failed to get pty_id", .{});
+            return 0;
+        };
+
+        if (ui.queue_attach_pty_callback) |cb| {
+            cb(ui.queue_attach_pty_ctx, @intCast(pty_id));
+        } else {
+            log.warn("luaAttach: no callback registered", .{});
+        }
+        return 0;
+    }
+
+    fn createSession(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        lua.pop(1);
+
+        const session_name_lua = lua.toString(1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+
+        const session_name = ui.allocator.dupe(u8, session_name_lua) catch {
+            log.warn("createSession: failed to allocate session name", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        defer ui.allocator.free(session_name);
+
+        log.info("createSession: called with name='{s}'", .{session_name});
+
+        if (ui.create_session_callback) |cb| {
+            cb(ui.create_session_ctx, session_name) catch {
+                lua.pushBoolean(false);
+                return 1;
+            };
+            lua.pushBoolean(true);
+        } else {
+            log.warn("createSession: no callback registered", .{});
             lua.pushBoolean(false);
         }
         return 1;
