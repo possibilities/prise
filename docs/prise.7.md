@@ -190,6 +190,7 @@ A custom UI must return a table with:
 - **view()**: Return widget tree to render
 - **get_state(cwd_lookup)**: Serialize state for persistence (optional)
 - **set_state(saved, pty_lookup)**: Restore state (optional). During session-switch derivation, **set_tab_shell(plan_json)** is called first to paint tab metadata (ids, titles, active tab, scroll offset) before PTY attach; a follow-up **set_state** call after **attach_pty** completes rebinds live pty refs.
+- **set_state(saved, pty_lookup)**: Restore state (optional). During session-switch derivation, **set_tab_shell(plan_json)** is called first to paint tab metadata (ids, titles, active tab, scroll offset) before PTY attach; a follow-up **set_state** call after **attach_pty** completes rebinds live pty refs. During the transition window between **set_tab_shell** and **set_state**, **view()** renders the tab bar shell with an empty pane area rather than a full-screen placeholder, so chrome stays stable across the switch.
 
 Custom UIs may also expose optional helpers used by configuration code:
 
@@ -210,6 +211,14 @@ all-or-nothing); core still decides which side to show based on overflow,
 then splices the renderer's segment(s) verbatim. The `tab_bar` config's
 plain-string `gutter_left` / `gutter_right` fields drive the fallback when
 the renderer emits no gutter fields. See **prise**(5) for the full
+content separately from the windowed tab list. Core applies centered-focus
+windowing and cell-precise edge clipping to the `tabs` slot only; `prefix` and
+`suffix` are never clipped. Renderers can also emit themed gutter segments via
+optional `gutter_left` / `gutter_right` fields on the returned `TabBarLayout`
+(symmetric, all-or-nothing); core still decides which side to show based on
+overflow, then splices the renderer's segment(s) verbatim. The `tab_bar`
+config's plain-string `gutter_left` / `gutter_right` fields drive the fallback
+when the renderer emits no gutter fields. See **prise**(5) for the full
 `TabBarLayout` definition.
 
 # SEE ALSO

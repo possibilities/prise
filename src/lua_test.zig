@@ -98,6 +98,12 @@ test "lua tiling tab bar clean swap" {
     try runLuaTest(lua, "src/lua/tiling_test_tab_bar_clean_swap.lua");
 }
 
+test "lua tiling view transition shell" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_view_transition_shell.lua");
+}
+
 test "lua tiling tab bar state" {
     var lua = try setupLua(std.testing.allocator);
     defer lua.deinit();
