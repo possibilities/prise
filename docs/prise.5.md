@@ -537,7 +537,9 @@ The **spawn_pty** RPC accepts optional placement fields that control where a
 new PTY appears in the tiling UI:
 
 **session**
-:   Target session name. If the current session differs, the UI switches first.
+:   Target session name. The PTY is placed in the target session's saved-state
+    file (created if absent). The viewer is NOT switched — programmatic spawns
+    do not steal focus.
 
 **tab**
 :   Set to **"new"** to open the PTY in a new tab.
@@ -545,8 +547,16 @@ new PTY appears in the tiling UI:
 **title**
 :   Explicit title for the tab containing the new PTY.
 
+**focus**
+:   Boolean, default **false**. Only honored on same-session spawns. When
+    **true** and the **tab** field matches an existing tab title, the UI
+    switches the active tab to the spawned PTY's tab. When unset or false,
+    the PTY is attached without changing which tab the human is viewing.
+
 When any placement field is present, the tiling UI handles the **pty_spawned**
-event automatically: switching sessions, creating tabs, and renaming as needed.
+event automatically: creating tabs and renaming as needed. Cross-session
+placement is silent — the viewer never changes — so callers driving spawns
+from outside the human's current session can do so without disrupting focus.
 
 # TILING UI HELPERS
 
