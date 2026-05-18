@@ -409,3 +409,18 @@ state_upvalue.floating = { pending = false, visible = false, width = 100, height
 tiling.update({ type = "pty_attach", data = { pty = mock_pty(10) } })
 assert(state_upvalue.tabs[1].title == "my-title", "pty_attach: pending title applied to tab")
 assert(state_upvalue.pending_title_renames[10] == nil, "pty_attach: pending rename cleared")
+-- === get_theme ===
+
+-- Test: get_theme returns default theme without setup
+local theme = tiling.get_theme()
+assert(theme ~= nil, "get_theme: returns table")
+assert(theme.accent == "#89b4fa", "get_theme: default accent")
+assert(theme.bg1 == "#1e1e2e", "get_theme: default bg1")
+assert(theme.fg_bright == "#cdd6f4", "get_theme: default fg_bright")
+assert(theme.green == "#a6e3a1", "get_theme: default green")
+
+-- Test: get_theme returns merged theme after setup with overrides
+tiling.setup({ theme = { accent = "#ff0000" } })
+theme = tiling.get_theme()
+assert(theme.accent == "#ff0000", "get_theme: override applied")
+assert(theme.bg1 == "#1e1e2e", "get_theme: defaults preserved after override")
