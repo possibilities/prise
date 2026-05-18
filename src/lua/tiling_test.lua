@@ -190,3 +190,65 @@ assert(#item == 20, "format_palette_item: correct width")
 item = t.format_palette_item("Very Long Command Name", "C-x", 10)
 -- Width is too small, should use minimum padding of 2
 assert(item == "Very Long Command Name  C-x", "format_palette_item: minimum padding")
+
+-- === pty_exited on solo main-tree pane with floating: floating closed on tab drop ===
+
+do
+    local float_pty = helpers.mock_pty(55) ---@type any
+    float_pty._closed = false
+    float_pty.close = function()
+        float_pty._closed = true
+    end
+    local float_pane = { type = "pane", id = 55, pty = float_pty }
+    local tab1 = {
+        id = 1,
+        root = mock_pane(10),
+        last_focused_id = 10,
+    }
+    tab1.floating = { pane = float_pane, visible = true }
+    t.set_state({
+        tabs = {
+            tab1,
+            { id = 2, root = mock_pane(99), last_focused_id = 99 },
+        },
+        active_tab = 2,
+        focused_id = 99,
+        next_tab_id = 3,
+    })
+    tiling.update({ type = "pty_exited", data = { id = 10 } })
+    local st = t.get_state()
+    assert(#st.tabs == 1, "pty_exited float-orphan: source tab dropped")
+    assert(st.tabs[1].root.id == 99, "pty_exited float-orphan: surviving tab is sibling")
+    assert(float_pty._closed, "pty_exited float-orphan: floating pane pty closed")
+end
+
+-- === pty_exited on solo main-tree pane with overlay: overlay closed on tab drop ===
+
+do
+    local overlay_pty = helpers.mock_pty(66) ---@type any
+    overlay_pty._closed = false
+    overlay_pty.close = function()
+        overlay_pty._closed = true
+    end
+    local overlay_pane = { type = "pane", id = 66, pty = overlay_pty }
+    local tab1 = {
+        id = 1,
+        root = mock_pane(20),
+        last_focused_id = 20,
+    }
+    tab1.overlays = { tools = { pane = overlay_pane, visible = true } }
+    t.set_state({
+        tabs = {
+            tab1,
+            { id = 2, root = mock_pane(99), last_focused_id = 99 },
+        },
+        active_tab = 2,
+        focused_id = 99,
+        next_tab_id = 3,
+    })
+    tiling.update({ type = "pty_exited", data = { id = 20 } })
+    local st = t.get_state()
+    assert(#st.tabs == 1, "pty_exited overlay-orphan: source tab dropped")
+    assert(st.tabs[1].root.id == 99, "pty_exited overlay-orphan: surviving tab is sibling")
+    assert(overlay_pty._closed, "pty_exited overlay-orphan: overlay pane pty closed")
+end
