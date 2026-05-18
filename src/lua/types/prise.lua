@@ -97,7 +97,10 @@ function prise.exit() end
 ---@param opts? SpawnOptions
 function prise.spawn(opts) end
 
----Request a frame redraw
+---Request a frame redraw. The render is scheduled, not synchronous: the
+---call returns immediately and the client drains the request on its next
+---event-loop tick. Safe to call from inside tiling dispatch handlers and
+---other Lua code that runs inside a `ui.update` pcall.
 function prise.request_frame() end
 
 ---Detach from the current session
