@@ -91,3 +91,9 @@ test "lua tiling swap pane" {
     defer lua.deinit();
     try runLuaTest(lua, "src/lua/tiling_test_swap_pane.lua");
 }
+
+test "lua tiling tab bar clean swap" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test_tab_bar_clean_swap.lua");
+}
