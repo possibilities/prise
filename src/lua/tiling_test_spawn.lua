@@ -62,7 +62,9 @@ assert(idx == nil, "find_tab_by_title: nil when not found")
 
 -- === pty_spawned with named tab ===
 
--- Test: pty_spawned with known tab name activates that tab (no new tab)
+-- Test: pty_spawned with known tab name registers no-focus spawn but does NOT
+-- switch to the tab unless data.focus == true. Programmatic spawns must not
+-- steal focus from whatever tab the human is currently in.
 state.tabs = {
     { id = 1, root = mock_pane(1), title = "code", last_focused_id = 1 },
     { id = 2, root = mock_pane(2), title = "logs", last_focused_id = 2 },
@@ -71,10 +73,21 @@ state.active_tab = 1
 state.pending_spawns = {}
 state.pending_title_renames = {}
 tiling.update({ type = "pty_spawned", data = { id = 20, tab = "logs" } })
-assert(state.active_tab == 2, "pty_spawned: known tab name activates tab")
+assert(state.active_tab == 1, "pty_spawned: known tab name does NOT switch active tab without focus=true")
 assert(
     state.pending_spawns[20] ~= nil and state.pending_spawns[20].new_tab == false,
-    "pty_spawned: known tab name does not create new tab"
+    "pty_spawned: known tab name still records pending spawn with new_tab=false"
+)
+assert(state.pending_spawns[20].no_focus == true, "pty_spawned: unset focus yields no_focus=true on pending spawn")
+
+-- Test: pty_spawned with focus=true switches to the matched tab
+state.active_tab = 1
+state.pending_spawns = {}
+tiling.update({ type = "pty_spawned", data = { id = 24, tab = "logs", focus = true } })
+assert(state.active_tab == 2, "pty_spawned: focus=true switches to matched named tab")
+assert(
+    state.pending_spawns[24] ~= nil and state.pending_spawns[24].no_focus == false,
+    "pty_spawned: focus=true yields no_focus=false on pending spawn"
 )
 
 -- Test: pty_spawned with unknown tab name creates new tab

@@ -325,7 +325,9 @@ assert(idx == nil, "find_tab_by_title: nil when not found")
 
 -- === pty_spawned with named tab ===
 
--- Test: pty_spawned with known tab name activates that tab (no new tab)
+-- Test: pty_spawned with known tab name registers no-focus spawn but does NOT
+-- switch to the tab unless data.focus == true. Programmatic spawns must not
+-- steal focus from whatever tab the human is currently in.
 state_upvalue.tabs = {
     { id = 1, root = mock_pane(1), title = "code", last_focused_id = 1 },
     { id = 2, root = mock_pane(2), title = "logs", last_focused_id = 2 },
@@ -333,17 +335,27 @@ state_upvalue.tabs = {
 state_upvalue.active_tab = 1
 state_upvalue.pending_new_tab = false
 state_upvalue.pending_title_renames = {}
-state_upvalue.pending_spawns = state_upvalue.pending_spawns or {}
+state_upvalue.pending_spawns = {}
 tiling.update({ type = "pty_spawned", data = { id = 20, tab = "logs" } })
-assert(state_upvalue.active_tab == 2, "pty_spawned: known tab name activates tab")
+assert(state_upvalue.active_tab == 1, "pty_spawned: known tab name does NOT switch active tab without focus=true")
 assert(
-    state_upvalue.pending_new_tab == false
-        and (state_upvalue.pending_spawns[20] == nil or state_upvalue.pending_spawns[20].new_tab ~= true),
-    "pty_spawned: known tab name does not create new tab"
+    state_upvalue.pending_spawns[20] ~= nil and state_upvalue.pending_spawns[20].new_tab == false,
+    "pty_spawned: known tab name still records pending spawn with new_tab=false"
 )
-tiling.update({ type = "pty_spawned", data = { id = 20, tab = "logs" } })
-assert(state_upvalue.active_tab == 2, "pty_spawned: known tab name activates tab")
-assert(state_upvalue.pending_new_tab == false, "pty_spawned: known tab name does not create new tab")
+assert(
+    state_upvalue.pending_spawns[20].no_focus == true,
+    "pty_spawned: unset focus yields no_focus=true on pending spawn"
+)
+
+-- Test: pty_spawned with focus=true switches to the matched tab
+state_upvalue.active_tab = 1
+state_upvalue.pending_spawns = {}
+tiling.update({ type = "pty_spawned", data = { id = 22, tab = "logs", focus = true } })
+assert(state_upvalue.active_tab == 2, "pty_spawned: focus=true switches to matched named tab")
+assert(
+    state_upvalue.pending_spawns[22] ~= nil and state_upvalue.pending_spawns[22].no_focus == false,
+    "pty_spawned: focus=true yields no_focus=false on pending spawn"
+)
 
 -- Test: pty_spawned with unknown tab name creates new tab
 state_upvalue.tabs = {
@@ -359,21 +371,28 @@ assert(
     "pty_spawned: unknown tab name creates new tab"
 )
 
--- === pty_spawned with missing session ===
+-- === cross-session placement is silent ===
 
--- Test: pty_spawned with session that doesn't exist calls prise.create_session
--- and bails early. Earlier behaviour rewrote the current session in place
--- (save + rename_session + clear tabs); the rewritten handler hands off to
--- prise.create_session and returns without touching state. Assert the new
--- contract.
+-- Test: pty_spawned for a different session writes the PTY into that session's
+-- saved-state file (via place_pty_in_session) and does NOT switch the viewer
+-- (no switch_session, no create_session). place_pty_in_session itself handles
+-- the missing-session-file case via writeNewSessionFile on the Zig side, so
+-- the Lua handler no longer needs a create_session fallback.
 local mock_prise = package.loaded["prise"]
-local created_with = nil
+local place_calls = {}
+local switch_calls = {}
+local create_calls = {}
 ---@diagnostic disable: duplicate-set-field
-mock_prise.switch_session = function()
+mock_prise.place_pty_in_session = function(session, pty_id, cwd, title)
+    table.insert(place_calls, { session = session, pty_id = pty_id, cwd = cwd, title = title })
+    return true
+end
+mock_prise.switch_session = function(name)
+    table.insert(switch_calls, name)
     return false
 end
 mock_prise.create_session = function(name)
-    created_with = name
+    table.insert(create_calls, name)
 end
 mock_prise.get_session_name = function()
     return "default"
@@ -384,16 +403,25 @@ state_upvalue.tabs = { { id = 1, root = mock_pane(1), title = "old", last_focuse
 state_upvalue.active_tab = 1
 state_upvalue.pending_new_tab = false
 state_upvalue.pending_title_renames = {}
-created_with = nil
+place_calls = {}
+switch_calls = {}
+create_calls = {}
 
 tiling.update({ type = "pty_spawned", data = { id = 30, session = "newsession", tab = "<new>" } })
+assert(#place_calls == 1, "cross-session: place_pty_in_session called exactly once")
 assert(
-    created_with == "newsession",
-    "pty_spawned: missing session calls prise.create_session with target name, got " .. tostring(created_with)
+    place_calls[1].session == "newsession",
+    "cross-session: place_pty_in_session called with target session, got " .. tostring(place_calls[1].session)
 )
+assert(place_calls[1].pty_id == 30, "cross-session: place_pty_in_session called with target pty_id")
+assert(#switch_calls == 0, "cross-session: switch_session NOT called (no focus steal)")
+assert(#create_calls == 0, "cross-session: create_session NOT called (place_pty_in_session handles missing file)")
 
 -- Restore mock defaults
 ---@diagnostic disable: duplicate-set-field
+mock_prise.place_pty_in_session = function()
+    return true
+end
 mock_prise.switch_session = function()
     return true
 end
