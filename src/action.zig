@@ -22,6 +22,12 @@ pub const Action = union(enum) {
     focus_up,
     focus_down,
 
+    // Focus movement (wrapping)
+    focus_left_wrap,
+    focus_right_wrap,
+    focus_up_wrap,
+    focus_down_wrap,
+
     // Pane management
     close_pane,
     toggle_zoom,
@@ -113,6 +119,10 @@ pub const Action = union(enum) {
             .focus_right => "Focus Right",
             .focus_up => "Focus Up",
             .focus_down => "Focus Down",
+            .focus_left_wrap => "Focus Left (Wrap)",
+            .focus_right_wrap => "Focus Right (Wrap)",
+            .focus_up_wrap => "Focus Up (Wrap)",
+            .focus_down_wrap => "Focus Down (Wrap)",
             .close_pane => "Close Pane",
             .toggle_zoom => "Toggle Zoom",
             .break_pane => "Break Pane",
@@ -164,6 +174,7 @@ test "action from string" {
     try std.testing.expectEqual(@as(Action, .floating_toggle), Action.fromString("floating_toggle").?);
     try std.testing.expectEqual(@as(Action, .floating_increase_size), Action.fromString("floating_increase_size").?);
     try std.testing.expectEqual(@as(Action, .floating_decrease_size), Action.fromString("floating_decrease_size").?);
+    try std.testing.expectEqual(@as(Action, .focus_left_wrap), Action.fromString("focus_left_wrap").?);
     try std.testing.expect(Action.fromString("invalid_action") == null);
 }
 
