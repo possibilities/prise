@@ -3996,15 +3996,28 @@ const Server = struct {
         try new_pane_obj.put("pty_id", .{ .integer = file_pty_id });
         try new_pane_obj.put("cwd", .{ .string = cwd });
 
+        // ratio belongs on children, not on the split node. On a Row/Column,
+        // node.ratio means "size THIS subtree at ratio of parent space"
+        // (widget.zig layoutColumnImpl Pass 2), not "split children at ratio."
+        // For 50/50: omit ratio on both children so Pass 3 divides space equally
+        // among nil-ratio non-intrinsic children. For asymmetric splits: write
+        // spec.ratio onto children[0] (original pane) and 1-spec.ratio onto
+        // children[1] (new pane). Mirrors tiling.lua:1222-1228.
+        const is_equal_split = @abs(spec.ratio - 0.5) < 1e-9;
+        var first_child = original_pane;
+        if (!is_equal_split) {
+            try first_child.object.put("ratio", .{ .float = spec.ratio });
+            try new_pane_obj.put("ratio", .{ .float = 1.0 - spec.ratio });
+        }
+
         var children = std.json.Array.init(arena);
-        try children.append(original_pane);
+        try children.append(first_child);
         try children.append(.{ .object = new_pane_obj });
 
         var split_obj = std.json.ObjectMap.init(arena);
         try split_obj.put("type", .{ .string = "split" });
         try split_obj.put("split_id", .{ .integer = split_node_id });
         try split_obj.put("direction", .{ .string = spec.direction.toString() });
-        try split_obj.put("ratio", .{ .float = spec.ratio });
         try split_obj.put("children", .{ .array = children });
 
         root_val.* = .{ .object = split_obj };
@@ -6540,13 +6553,14 @@ test "splitTargetPaneInTabs promotes single-pane root into a stacked split" {
     // After mutation: tab 1's root is a split with two pane children, the
     // first being the original pane (id=1, pty_id=7) and the second the
     // new pane (id=99, pty_id=42). The split itself has split_id=88,
-    // direction="col", ratio=0.5. last_focused_id moved to 99.
+    // direction="col". No ratio key on the split node — for the 50/50 default
+    // both children carry nil ratio so layoutColumnImpl Pass 3 splits equally.
     const tab_obj = tabs_val.array.items[0].object;
     const root_obj = tab_obj.get("root").?.object;
     try testing.expectEqualStrings("split", root_obj.get("type").?.string);
     try testing.expectEqual(@as(i64, 88), root_obj.get("split_id").?.integer);
     try testing.expectEqualStrings("col", root_obj.get("direction").?.string);
-    try testing.expectEqual(@as(f64, 0.5), root_obj.get("ratio").?.float);
+    try testing.expect(root_obj.get("ratio") == null);
 
     const children = root_obj.get("children").?.array.items;
     try testing.expectEqual(@as(usize, 2), children.len);
@@ -6704,7 +6718,51 @@ test "splitTargetPaneInTabs honors direction=row and a non-default ratio" {
 
     const root_obj = tabs_val.array.items[0].object.get("root").?.object;
     try testing.expectEqualStrings("row", root_obj.get("direction").?.string);
-    try testing.expectEqual(@as(f64, 0.7), root_obj.get("ratio").?.float);
+    // ratio lives on children, not on the split node.
+    try testing.expect(root_obj.get("ratio") == null);
+    const children = root_obj.get("children").?.array.items;
+    try testing.expect(std.math.approxEqAbs(f64, children[0].object.get("ratio").?.float, 0.7, 1e-9));
+    try testing.expect(std.math.approxEqAbs(f64, children[1].object.get("ratio").?.float, 0.3, 1e-9));
+}
+
+test "splitTargetPaneInTabs asymmetric ratio: children carry r and 1-r, split node has no ratio" {
+    const testing = std.testing;
+    const json =
+        \\{
+        \\  "tabs": [
+        \\    {"id": 1, "root": {"type": "pane", "id": 1, "pty_id": 7, "cwd": "/tmp"}, "last_focused_id": 1}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const tabs_val = parsed.value.object.getPtr("tabs").?;
+    const spec: Server.SplitSpec = .{
+        .target_pty_id = 7,
+        .direction = .col,
+        .ratio = 0.7,
+    };
+
+    _ = try Server.splitTargetPaneInTabs(
+        parsed.arena.allocator(),
+        tabs_val,
+        spec,
+        99,
+        88,
+        "/home/user",
+        42,
+    );
+
+    const root_obj2 = tabs_val.array.items[0].object.get("root").?.object;
+    // The split node itself must not carry a ratio key.
+    try testing.expect(root_obj2.get("ratio") == null);
+    const kids = root_obj2.get("children").?.array.items;
+    try testing.expectEqual(@as(usize, 2), kids.len);
+    // children[0] is the original pane, gets spec.ratio.
+    try testing.expect(std.math.approxEqAbs(f64, kids[0].object.get("ratio").?.float, 0.7, 1e-9));
+    // children[1] is the new pane, gets 1.0 - spec.ratio.
+    try testing.expect(std.math.approxEqAbs(f64, kids[1].object.get("ratio").?.float, 0.3, 1e-9));
 }
 
 test "bumpPastPanePtyIds returns input when tabs array contains no panes" {

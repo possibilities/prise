@@ -182,7 +182,9 @@ to the PTY master immediately at spawn time. The kernel queues the bytes in
 the line discipline buffer; the shell consumes them on its first read.
 
 **split**
-:   `{ type = "split", direction = "horizontal"|"vertical", ratio = 0.5, children = { ... } }`
+:   `{ type = "split", direction = "horizontal"|"vertical", children = { ... } }`
+
+Ratios live on children, not on the split node. A child with no ratio gets an equal share of remaining space (Pass 3). A child with `ratio = r` is sized at `r * available` (Pass 2). For an asymmetric 70/30 split: set `ratio = 0.7` on `children[1]` and `ratio = 0.3` on `children[2]`. For an equal split, omit ratio on all children.
 
 **floating**
 :   Optional floating pane for a tab. `{ pane = { ... }, visible = true, width = 120, height = 40 }`
