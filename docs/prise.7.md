@@ -48,6 +48,28 @@ client connections. Sessions are stored in *~/.local/share/prise/sessions/*.
 **prise session rename** *old* *new*
 :   Rename a session
 
+# ENVIRONMENT
+
+The following environment variables are set for processes spawned inside prise.
+They are used by commands such as **prise tab rename** when they are invoked
+from within an existing pane.
+
+**PRISE_PTY**
+:   Numeric PTY identifier for the current pane.
+
+**PRISE_PTY_VALIDITY**
+:   Server instance identifier used to reject stale tab-rename requests after a
+    server restart.
+
+**PRISE_SOCKET**
+:   Override path for the prise server socket.
+
+**PRISE_SESSION**
+:   Current session name. When set, **prise tab rename** also persists the tab
+    title into the session state on disk.
+
+To clear an explicit tab title, run **prise tab rename ""** from inside prise.
+
 Sessions are visible to Lua code (via **prise.list_sessions()**) immediately
 upon creation, before the autosave timer writes them to disk.
 
