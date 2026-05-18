@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-05-18T21:00:13Z",
+  "depends_on": [],
+  "epic": "fn-1-fix-concurrent-attach-pty-dispatch",
+  "id": "fn-1-fix-concurrent-attach-pty-dispatch.1",
+  "priority": null,
+  "target_repo": "/Users/mike/src/possibilities--prise",
+  "title": "fix attach_pty drain coalescing in client.zig",
+  "updated_at": "2026-05-18T21:01:41Z"
+}
