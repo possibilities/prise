@@ -5407,65 +5407,80 @@ local function build_tab_bar_custom()
     state.tab_regions = {}
     state.tab_close_regions = {}
 
-    -- Calculate actual segment positions
-    local segment_positions = {}
+    -- Check if custom renderer annotated segments with tab_index
+    local has_annotations = false
     for _, seg in ipairs(original_segments) do
-        local width = prise.gwidth(seg.text)
-        table.insert(segment_positions, {
-            start_x = x_pos,
-            end_x = x_pos + width,
-        })
-        x_pos = x_pos + width
+        if seg.tab_index then
+            has_annotations = true
+            break
+        end
     end
 
-    -- Map segments to tabs
-    -- Common pattern: custom renderers output alternating tab/separator segments
-    -- Try to detect this pattern and map accordingly
-    local tab_count = #tab_infos
-    local segment_count = #original_segments
-
-    if segment_count >= tab_count then
-        -- Assume segments are ordered: tab1, sep, tab2, sep, ..., tabN
-        -- Or just: tab1, tab2, ..., tabN if no separators
-        local segments_per_tab = segment_count / tab_count
-        local is_alternating = (segments_per_tab >= 1.5 and segments_per_tab <= 2.5)
-
-        if is_alternating then
-            -- Likely pattern: tab, separator, tab, separator, ...
-            for tab_idx = 1, tab_count do
-                local seg_idx = (tab_idx - 1) * 2 + 1
-                if seg_idx <= segment_count then
-                    local tab_start = segment_positions[seg_idx].start_x
-                    -- Include separator in the clickable region if it exists
-                    local sep_seg_idx = seg_idx + 1
-                    local tab_end
-                    if sep_seg_idx <= segment_count and tab_idx < tab_count then
-                        -- Include separator
-                        tab_end = segment_positions[sep_seg_idx].end_x
-                    else
-                        -- Last tab, no separator
-                        tab_end = segment_positions[seg_idx].end_x
-                    end
-
-                    table.insert(state.tab_regions, {
-                        start_x = tab_start,
-                        end_x = tab_end,
-                        tab_index = tab_idx,
-                    })
-                end
+    if has_annotations then
+        -- Use explicit annotations — renderer knows its own structure
+        local ax_pos = 0
+        for _, seg in ipairs(original_segments) do
+            local width = prise.gwidth(seg.text)
+            if seg.tab_index then
+                table.insert(state.tab_regions, {
+                    start_x = ax_pos,
+                    end_x = ax_pos + width,
+                    tab_index = seg.tab_index,
+                })
             end
-        else
-            -- Fallback: divide segments proportionally
-            for tab_idx = 1, tab_count do
-                local first_seg = math.floor((tab_idx - 1) * segment_count / tab_count) + 1
-                local last_seg = math.floor(tab_idx * segment_count / tab_count)
+            ax_pos = ax_pos + width
+        end
+    else
+        -- Fallback: existing heuristic for unannotated renderers
+        local segment_positions = {}
+        for _, seg in ipairs(original_segments) do
+            local width = prise.gwidth(seg.text)
+            table.insert(segment_positions, {
+                start_x = x_pos,
+                end_x = x_pos + width,
+            })
+            x_pos = x_pos + width
+        end
 
-                if first_seg <= segment_count then
-                    table.insert(state.tab_regions, {
-                        start_x = segment_positions[first_seg].start_x,
-                        end_x = segment_positions[math.min(last_seg, segment_count)].end_x,
-                        tab_index = tab_idx,
-                    })
+        local tab_count = #tab_infos
+        local segment_count = #original_segments
+
+        if segment_count >= tab_count then
+            local segments_per_tab = segment_count / tab_count
+            local is_alternating = (segments_per_tab >= 1.5 and segments_per_tab <= 2.5)
+
+            if is_alternating then
+                for tab_idx = 1, tab_count do
+                    local seg_idx = (tab_idx - 1) * 2 + 1
+                    if seg_idx <= segment_count then
+                        local tab_start = segment_positions[seg_idx].start_x
+                        local sep_seg_idx = seg_idx + 1
+                        local tab_end
+                        if sep_seg_idx <= segment_count and tab_idx < tab_count then
+                            tab_end = segment_positions[sep_seg_idx].end_x
+                        else
+                            tab_end = segment_positions[seg_idx].end_x
+                        end
+
+                        table.insert(state.tab_regions, {
+                            start_x = tab_start,
+                            end_x = tab_end,
+                            tab_index = tab_idx,
+                        })
+                    end
+                end
+            else
+                for tab_idx = 1, tab_count do
+                    local first_seg = math.floor((tab_idx - 1) * segment_count / tab_count) + 1
+                    local last_seg = math.floor(tab_idx * segment_count / tab_count)
+
+                    if first_seg <= segment_count then
+                        table.insert(state.tab_regions, {
+                            start_x = segment_positions[first_seg].start_x,
+                            end_x = segment_positions[math.min(last_seg, segment_count)].end_x,
+                            tab_index = tab_idx,
+                        })
+                    end
                 end
             end
         end
@@ -5940,6 +5955,7 @@ M._test = {
     get_last_leaf = get_last_leaf,
     format_palette_item = format_palette_item,
     build_custom_tab_infos = build_custom_tab_infos,
+    build_tab_bar_custom = build_tab_bar_custom,
     close_tab = close_tab,
     remove_pane_by_id = remove_pane_by_id,
     set_active_tab_index = set_active_tab_index,
@@ -5972,5 +5988,21 @@ M._test = {
         return state.focused_id
     end,
 }
+
+M._test.build_tab_bar_custom = build_tab_bar_custom
+M._test.set_state = function(test_state)
+    state.tabs = test_state.tabs or {}
+    state.active_tab = test_state.active_tab or 1
+    state.next_tab_id = test_state.next_tab_id or (#state.tabs + 1)
+    state.focused_id = test_state.focused_id
+    state.zoomed_pane_id = test_state.zoomed_pane_id
+    state.hovered_tab = nil
+    state.hovered_close_tab = nil
+    state.tab_regions = {}
+    state.tab_close_regions = {}
+end
+M._test.get_state = function()
+    return state
+end
 
 return M
