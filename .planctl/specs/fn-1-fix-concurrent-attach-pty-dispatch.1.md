@@ -73,5 +73,5 @@ The regression test needs a real socketpair, not a mock loop. Template: `src/io/
 - [ ] Autopilot at 4x concurrency produces 4 tabs (manual smoke test)
 
 ## Done summary
-
+replace pending_attach_pty_id scalar with std.ArrayList(u32); drain all ids via sendDirect in onRecv; fix .send_attach arm; regression test passes (3 ids → 3 frames FIFO)
 ## Evidence

@@ -1,10 +1,16 @@
 {
+  "bundles": [],
   "created_at": "2026-05-18T21:00:13Z",
   "depends_on": [],
   "epic": "fn-1-fix-concurrent-attach-pty-dispatch",
   "id": "fn-1-fix-concurrent-attach-pty-dispatch.1",
   "priority": null,
+  "snippets": [],
   "target_repo": "/Users/mike/src/possibilities--prise",
+  "tier": "xhigh",
   "title": "fix attach_pty drain coalescing in client.zig",
-  "updated_at": "2026-05-18T21:01:41Z"
+  "updated_at": "2026-05-18T21:46:41Z",
+  "work_review_status": "unknown",
+  "work_reviewed_at": null,
+  "worker_done_at": "2026-05-18T21:46:41Z"
 }
