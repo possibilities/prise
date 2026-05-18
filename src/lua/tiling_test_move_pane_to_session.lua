@@ -168,6 +168,8 @@ local t = tiling._test
 local function reset_captures()
     place_calls = {}
     place_return = true
+    remove_calls = {} ---@diagnostic disable-line:lowercase-global
+    remove_return = true ---@diagnostic disable-line:lowercase-global
     warn_calls = {}
     save_calls = 0
     delete_calls = {}
@@ -175,8 +177,6 @@ local function reset_captures()
     switch_calls = {}
     session_name_return = "test"
     list_sessions_return = {}
-    remove_calls = {}
-    remove_return = true
 end
 
 -- === Happy path: 2-pane tab, move one, source tab survives ===
@@ -942,3 +942,208 @@ local cross_solo_state = t.get_state()
 assert(#cross_solo_state.tabs == 1, "cross_solo: viewer's state.tabs untouched")
 assert(save_calls == 0, "cross_solo: prise.save NOT flushed (file-based arm)")
 assert(#switch_calls == 0, "cross_solo: viewer did not switch sessions")
+
+-- === Cross-session: remove fails first — bail out, no place call ===
+
+reset_captures()
+remove_return = false ---@diagnostic disable-line:lowercase-global
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local remove_fail_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 42,
+        session_name = "dest",
+        cwd = "/tmp/dest",
+        tab_title = "rfail",
+        source_session = "alpha",
+    },
+})
+assert(type(remove_fail_ret) == "table", "remove-fail: returns a table (widened)")
+assert(remove_fail_ret.ok == false, "remove-fail: ok=false when remove fails")
+assert(
+    remove_fail_ret.reason == "cross_session_remove_failed",
+    "remove-fail: reason=cross_session_remove_failed, got " .. tostring(remove_fail_ret.reason)
+)
+assert(#remove_calls == 1, "remove-fail: remove was attempted")
+assert(#place_calls == 0, "remove-fail: place NOT called after remove failure")
+assert(#warn_calls == 1, "remove-fail: one warning logged")
+assert(warn_calls[1]:find("cross-session remove failed", 1, true), "remove-fail: warning mentions cross-session remove")
+assert(warn_calls[1]:find("pty=42", 1, true), "remove-fail: warning mentions pty")
+assert(warn_calls[1]:find("source=alpha", 1, true), "remove-fail: warning mentions source session")
+
+-- === Cross-session: remove succeeds but place fails — orphan, widened-return-false ===
+
+reset_captures()
+place_return = false
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local place_fail_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 42,
+        session_name = "dest",
+        cwd = "/tmp/dest",
+        tab_title = "pfail",
+        source_session = "alpha",
+    },
+})
+assert(type(place_fail_ret) == "table", "place-fail: returns a table (widened)")
+assert(place_fail_ret.ok == false, "place-fail: ok=false when place fails after remove")
+assert(
+    place_fail_ret.reason == "cross_session_place_failed",
+    "place-fail: reason=cross_session_place_failed, got " .. tostring(place_fail_ret.reason)
+)
+assert(#remove_calls == 1, "place-fail: remove was called")
+assert(#place_calls == 1, "place-fail: place was attempted after remove success")
+assert(#warn_calls == 1, "place-fail: one warning logged")
+assert(warn_calls[1]:find("cross-session place failed", 1, true), "place-fail: warning mentions cross-session place")
+assert(warn_calls[1]:find("orphaned after remove", 1, true), "place-fail: warning notes orphan state")
+
+-- === Cross-session back-compat: absent source_session keeps old no-op behavior ===
+
+reset_captures()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local no_source_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 42, -- not in viewer state
+        session_name = "dest",
+        cwd = "/tmp/dest",
+        tab_title = "nosrc",
+        -- source_session intentionally omitted
+    },
+})
+assert(type(no_source_ret) == "table", "no-source: returns a table (widened)")
+assert(no_source_ret.ok == false, "no-source: ok=false when source_session absent")
+assert(
+    no_source_ret.reason == "absent_from_viewer",
+    "no-source: reason=absent_from_viewer, got " .. tostring(no_source_ret.reason)
+)
+assert(#remove_calls == 0, "no-source: remove NOT called when source_session missing")
+assert(#place_calls == 0, "no-source: place NOT called when source_session missing")
+
+-- === Cross-session back-compat: empty source_session treated as absent ===
+
+reset_captures()
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local empty_source_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 42,
+        session_name = "dest",
+        cwd = "/tmp/dest",
+        tab_title = "emptysrc",
+        source_session = "",
+    },
+})
+assert(type(empty_source_ret) == "table", "empty-source: returns a table (widened)")
+assert(empty_source_ret.ok == false, "empty-source: ok=false on empty source_session")
+assert(
+    empty_source_ret.reason == "absent_from_viewer",
+    "empty-source: reason=absent_from_viewer, got " .. tostring(empty_source_ret.reason)
+)
+assert(#remove_calls == 0, "empty-source: remove NOT called on empty source_session")
+assert(#place_calls == 0, "empty-source: place NOT called on empty source_session")
+
+-- === Viewer on destination — in-memory place ===
+-- get_session_name returns the dest session: place must mutate state.tabs
+-- in-memory and NOT call place_pty_in_session.
+
+reset_captures()
+session_name_return = "bravo"
+t.set_state({
+    -- Viewer is on "bravo"; the pane we're moving lives in alpha's saved JSON.
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local viewer_on_dest_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 42, -- not in viewer state
+        session_name = "bravo",
+        cwd = "/home/user/code/bravo",
+        tab_title = "moved",
+        source_session = "alpha",
+    },
+})
+assert(type(viewer_on_dest_ret) == "table", "viewer-on-dest: returns a table (widened)")
+assert(viewer_on_dest_ret.ok == true, "viewer-on-dest: ok=true")
+assert(viewer_on_dest_ret.reason == "moved", "viewer-on-dest: reason=moved")
+assert(#remove_calls == 1, "viewer-on-dest: remove_pty_from_session called once")
+assert(remove_calls[1].session_name == "alpha", "viewer-on-dest: remove targets source")
+assert(remove_calls[1].pty_id == 42, "viewer-on-dest: remove gets correct pty_id")
+assert(#place_calls == 0, "viewer-on-dest: place_pty_in_session NOT called (in-memory path)")
+assert(save_calls == 1, "viewer-on-dest: prise.save() called once")
+local vod_state = t.get_state()
+assert(#vod_state.tabs == 2, "viewer-on-dest: new tab appended to state.tabs")
+assert(vod_state.tabs[2].root.pty_id == 42, "viewer-on-dest: new tab root has pty_id (fn-8 spec shape)") ---@diagnostic disable-line:undefined-field
+assert(vod_state.tabs[2].root.cwd == "/home/user/code/bravo", "viewer-on-dest: new tab root has cwd") ---@diagnostic disable-line:undefined-field
+assert(vod_state.tabs[2].root.id == nil, "viewer-on-dest: new tab root has no id field (fn-8 spec shape)")
+assert(vod_state.tabs[2].title == "moved", "viewer-on-dest: new tab has correct title")
+assert(vod_state.next_tab_id == 3, "viewer-on-dest: next_tab_id bumped")
+
+-- === Viewer on unrelated session — file-based place ===
+-- get_session_name returns neither source nor dest: place must use the
+-- file-based path (place_pty_in_session called) and NOT mutate state.tabs.
+
+reset_captures()
+session_name_return = "charlie"
+t.set_state({
+    tabs = {
+        { id = 1, root = mock_pane(500), last_focused_id = 500 },
+    },
+    active_tab = 1,
+    focused_id = 500,
+    next_tab_id = 2,
+})
+local viewer_unrelated_ret = tiling.update({
+    type = "move_pane_to_session",
+    data = {
+        pty_id = 42,
+        session_name = "bravo",
+        cwd = "/home/user/code/bravo",
+        tab_title = "moved",
+        source_session = "alpha",
+    },
+})
+assert(type(viewer_unrelated_ret) == "table", "viewer-unrelated: returns a table (widened)")
+assert(viewer_unrelated_ret.ok == true, "viewer-unrelated: ok=true")
+assert(viewer_unrelated_ret.reason == "moved", "viewer-unrelated: reason=moved")
+assert(#remove_calls == 1, "viewer-unrelated: remove_pty_from_session called once")
+assert(#place_calls == 1, "viewer-unrelated: place_pty_in_session called (file-based path)")
+assert(place_calls[1].session_name == "bravo", "viewer-unrelated: place targets dest session")
+assert(place_calls[1].pty_id == 42, "viewer-unrelated: place gets correct pty_id")
+assert(save_calls == 0, "viewer-unrelated: prise.save() NOT called (file-based path)")
+local vu_state = t.get_state()
+assert(#vu_state.tabs == 1, "viewer-unrelated: state.tabs NOT mutated")

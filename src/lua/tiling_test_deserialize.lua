@@ -273,3 +273,43 @@ st = get_state()
 assert(st.tabs[1].root.id == 7, "no remap: pane id stays 7")
 assert(st.focused_id == 7, "no remap: focused_id stays 7")
 assert(st.tabs[1].last_focused_id == 7, "no remap: last_focused_id stays 7")
+
+-- === Multi-tab deserialization with per-tab remapping ===
+
+local saved_multi_tab = {
+    tabs = {
+        {
+            id = 1,
+            root = { type = "pane", id = 10, pty_id = 10 },
+            last_focused_id = 10,
+        },
+        {
+            id = 2,
+            root = { type = "pane", id = 20, pty_id = 20 },
+            last_focused_id = 20,
+        },
+    },
+    active_tab = 1,
+    next_tab_id = 3,
+    focused_id = 10,
+    next_split_id = 1,
+}
+
+local function multi_tab_remap(pty_id)
+    if pty_id == 10 then
+        return mock_pty(100)
+    elseif pty_id == 20 then
+        return mock_pty(200)
+    end
+    return nil
+end
+
+tiling.set_state(saved_multi_tab, multi_tab_remap)
+st = get_state()
+
+assert(#st.tabs == 2, "multi-tab remap: both tabs restored")
+assert(st.tabs[1].root.id == 100, "multi-tab remap: tab 1 pane id is 100")
+assert(st.tabs[2].root.id == 200, "multi-tab remap: tab 2 pane id is 200")
+assert(st.tabs[1].last_focused_id == 100, "multi-tab remap: tab 1 last_focused_id is 100")
+assert(st.tabs[2].last_focused_id == 200, "multi-tab remap: tab 2 last_focused_id is 200")
+assert(st.focused_id == 100, "multi-tab remap: focused_id is 100")

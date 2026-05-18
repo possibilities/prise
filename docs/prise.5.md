@@ -6,10 +6,15 @@ prise - configuration file
 
 *~/.config/prise/init.lua*
 
+*~/.config/prise/prise.toml*
+
 # DESCRIPTION
 
-Prise is configured through a Lua file at **~/.config/prise/init.lua**. This
-file must return a UI table that implements the prise UI interface.
+Prise is configured through two files. The Lua file at
+**~/.config/prise/init.lua** must return a UI table that implements the prise
+UI interface. The optional TOML file at **~/.config/prise/prise.toml** declares
+plug processes that the server should spawn and supervise at startup; see
+**PLUGS** below.
 
 If no configuration file is present, prise uses the default tiling UI.
 
@@ -709,6 +714,80 @@ end
 
 ui.execute_action("close_tab")
 ```
+
+# PLUGS
+
+The optional **~/.config/prise/prise.toml** file declares plug processes that
+the server should spawn and supervise at startup. Each plug is described by a
+**[[plug]]** array-of-tables block. The server reads the file once during
+startup, before it begins accepting client connections, and registers each
+declared plug with its existing managed-plug machinery (the same machinery used
+by the **spawn_plug** RPC).
+
+Each **[[plug]]** block accepts the following keys:
+
+**name**
+:   Plug name. String. Required. Maximum 64 bytes. Must not contain slashes
+    or whitespace. Names must be unique across all blocks.
+
+**cmd**
+:   Command to execute. Array of strings. Required. The first element must
+    be an absolute path; **PATH** lookup is intentionally not performed
+    because the server inherits a minimal environment under launchd. Maximum
+    64 elements.
+
+**restart**
+:   Whether to respawn the plug if it exits. Boolean. Optional. Default
+    **false**.
+
+**restart_delay_ms**
+:   Delay in milliseconds before the server respawns a crashed plug.
+    Integer. Optional. Default **1000**. Must be non-negative.
+
+Example:
+
+```toml
+[[plug]]
+name = "control-plug"
+cmd = ["/usr/local/bin/control-plug"]
+restart = true
+restart_delay_ms = 500
+```
+
+## Startup semantics
+
+The server reads **prise.toml** after binding the listening socket and before
+enqueuing the accept task. If the file does not exist, the server starts with
+no config-declared plugs. Any other read or parse error — malformed TOML,
+unknown keys inside a **[[plug]]** block, non-absolute **cmd[0]**, empty
+**cmd**, duplicate **name**, oversized **name** — is fatal: the server logs a
+**FATAL** message naming the file and the error and exits with non-zero
+status. Under launchd the **ThrottleInterval** (10s default) acts as the
+circuit breaker against tight crash loops.
+
+A **[[plug]]** block whose binary cannot be spawned (for example, because the
+absolute path does not exist) does not take the server down. The server
+emits a single **WARN** line of the form:
+
+```
+plug spawn failed name=<name> cmd0=<cmd[0]> error=<error_name>
+```
+
+and continues to the next block. The server stays up.
+
+## Crash respawn
+
+When a config-declared plug crashes, the server applies the same restart
+policy used by the **spawn_plug** RPC: if **restart** is true, the server
+waits **restart_delay_ms** and respawns the plug, regenerating the
+**PRISE_PLUG_TOKEN**. Restart attempts are unbounded.
+
+## RPC interaction
+
+A plug name declared in **prise.toml** is owned by the server. Any
+**spawn_plug** RPC against a config-owned name is rejected with
+**PlugConfigOwned**. The TOML declaration is the single source of truth for
+that name's command, restart policy, and lifecycle.
 
 # SEE ALSO
 

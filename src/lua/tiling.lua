@@ -115,6 +115,7 @@ local utils = require("utils")
 ---@field clock_timer? Timer
 ---@field pending_split? { direction: "row"|"col" }
 ---@field pending_new_tab? boolean
+---@field pending_spawns table<number, { new_tab: boolean, no_focus: boolean }>
 ---@field pending_title_renames table<number, string>
 ---@field next_split_id number
 ---@field palette PaletteState
@@ -145,7 +146,7 @@ local utils = require("utils")
 
 ---@class PtySpawnedEvent
 ---@field type "pty_spawned"
----@field data { id: number, cwd: string, session?: string, tab?: string, title?: string }
+---@field data { id: number, cwd: string, session?: string, tab?: string, title?: string, focus?: boolean }
 
 ---@class KeyPressEvent
 ---@field type "key_press"
@@ -446,7 +447,8 @@ local state = {
     timer = nil,
     clock_timer = nil,
     pending_split = nil,
-    pending_new_tab = false,
+    pending_new_tab = false, -- keyboard-initiated new tab (PTY ID not yet known)
+    pending_spawns = {}, -- [pty_id] = { new_tab = bool, no_focus = bool }
     pending_title_renames = {}, -- [pty_id] = title string from spawn placement
     next_split_id = 1,
     -- Command palette
@@ -1694,6 +1696,15 @@ local function serialize_node(node, cwd_lookup)
         return nil
     end
     if is_pane(node) then
+        if node.pty == nil then
+            return {
+                type = "pane",
+                id = node.id,
+                pty_id = node.pty_id,
+                cwd = node.cwd,
+                ratio = node.ratio,
+            }
+        end
         local pty_id = node.pty:id()
         ---@type string?
         local cwd = nil
@@ -3432,9 +3443,15 @@ function M.update(event)
             return
         end
 
-        if state.pending_new_tab then
+        local spawn_opts = state.pending_spawns[new_pane.id]
+        local spawn_no_focus = spawn_opts and spawn_opts.no_focus
+        state.pending_spawns[new_pane.id] = nil
+
+        local new_tab_requested = (spawn_opts and spawn_opts.new_tab) or state.pending_new_tab
+        state.pending_new_tab = false
+
+        if new_tab_requested then
             -- Create a new tab with this pane
-            state.pending_new_tab = false
             local tab_id = state.next_tab_id
             state.next_tab_id = tab_id + 1
             ---@type Tab
@@ -3444,7 +3461,9 @@ function M.update(event)
                 last_focused_id = new_pane.id,
             }
             table.insert(state.tabs, new_tab)
-            set_active_tab_index(#state.tabs)
+            if not spawn_no_focus then
+                set_active_tab_index(#state.tabs)
+            end
         elseif #state.tabs == 0 then
             -- First terminal - create first tab
             local tab_id = state.next_tab_id
@@ -3488,6 +3507,10 @@ function M.update(event)
 
             state.focused_id = new_pane.id
             state.pending_split = nil
+        end
+        -- Skip focus change for programmatic spawns (no focus steal)
+        if spawn_no_focus then
+            state.focused_id = old_focused_id
         end
         update_pty_focus(old_focused_id, state.focused_id)
         prise.request_frame()
@@ -4454,38 +4477,37 @@ function M.update(event)
         local data = event.data
         prise.log.info("Lua: pty_spawned " .. data.id)
 
-        -- If placement fields present, auto-adopt this PTY
-        if data.session or data.tab or data.title then
-            -- 1. Session: switch or create
-            if data.session then
-                local current = prise.get_session_name()
-                if current ~= data.session then
-                    local ok = prise.switch_session(data.session)
-                    if not ok then
-                        -- Session doesn't exist — create and switch to it
-                        prise.create_session(data.session)
-                        return
-                    end
+        -- Cross-session placement: write PTY into target session file, don't attach
+        if data.session then
+            local current = prise.get_session_name()
+            if current ~= data.session then
+                local ok = prise.place_pty_in_session(data.session, data.id, data.cwd, data.title)
+                if ok then
+                    prise.log.info("Placed PTY " .. data.id .. " in session " .. data.session)
                 end
+                prise.request_frame()
+                return
             end
+        end
 
-            -- 2. Tab: find by name or create
-            if data.tab and data.tab ~= "<new>" then
+        -- Same-session placement (or no session field)
+        if data.tab or data.title or data.focus ~= nil or data.session then
+            local new_tab = true
+            if data.tab and data.tab ~= "new" then
                 local idx = find_tab_by_title(data.tab)
                 if idx then
                     set_active_tab_index(idx)
-                else
-                    state.pending_new_tab = true
+                    new_tab = false
                 end
-            else
-                -- nil or "<new>" — always create a new tab
-                state.pending_new_tab = true
             end
 
-            -- 3. Attach the PTY
+            state.pending_spawns[data.id] = {
+                new_tab = new_tab,
+                no_focus = data.focus ~= true,
+            }
+
             prise.attach(data.id)
 
-            -- 4. Name the tab (for new tabs, or rename if title differs)
             if data.title then
                 state.pending_title_renames[data.id] = data.title
             end
@@ -6848,6 +6870,7 @@ M._test = {
     build_custom_tab_infos = build_custom_tab_infos,
     build_tab_bar_custom = build_tab_bar_custom,
     close_tab = close_tab,
+    move_focus = move_focus,
     remove_pane_by_id = remove_pane_by_id,
     set_active_tab_index = set_active_tab_index,
     compute_focus_window = compute_focus_window,
@@ -6904,6 +6927,7 @@ M._test = {
     get_focused_id = function()
         return state.focused_id
     end,
+    serialize_node = serialize_node,
 }
 
 M._test.build_tab_bar_custom = build_tab_bar_custom
