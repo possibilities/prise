@@ -194,6 +194,7 @@ A custom UI must return a table with:
 Custom UIs may also expose optional helpers used by configuration code:
 
 - **execute_action(name)**: Run a built-in action handler by name
+- **set_overlay(name, enabled?)**: Show/hide/toggle a named overlay; returns `(true)` or `(false, err_msg)`
 - **setup(opts)**: Apply UI-specific configuration before the UI is returned
 
 The built-in tiling UI's `tab_bar.render` returns a structured layout with

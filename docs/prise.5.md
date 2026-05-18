@@ -317,26 +317,99 @@ ui.setup({
 })
 ```
 
-# FLOATING PANE
+# OVERLAYS
 
-The **floating** table configures the floating terminal pane.
+Overlays are named terminal panes that float above the tiling layout. Each
+overlay is toggled independently, has its own keybind, and spawns a configured
+command on first open. The classic **floating** pane is the built-in overlay
+named `floating` — setting `ui.setup({ floating = { ... } })` just configures
+that one.
+
+## Overlay config fields
+
+**key**
+:   Keybind to toggle this overlay (e.g. `"<leader>g"`). Auto-registered.
+
+**cmd**
+:   Command to run. By default wrapped in `exec` so the overlay auto-dismisses
+    when the command exits. Must be an external binary — shell builtins and
+    compound statements need `shell = true`.
+
+**argv**
+:   Direct argv for exec, bypassing the login shell. Eliminates the
+    shell-prompt flash during overlay startup. Mutually exclusive with **cmd**.
+
+**shell**
+:   If true, spawn a persistent login shell with **cmd** typed into it. The
+    overlay stays up after **cmd** exits until the shell itself exits.
+    Default **false**.
 
 **width**
-:   Width in columns. Default: **100**
+:   Width in columns (number) or a percentage string like **"60%"** that
+    tracks `screen_cols` on terminal resize. Percentages must be integers
+    between **10** and **100**. Default: **"60%"**.
 
 **height**
-:   Height in rows. Default: **30**
+:   Height in rows (number) or a percentage string like **"70%"** that
+    tracks `screen_rows`. Same bounds as **width**. Default: **"70%"**.
 
-Example:
+**anchor**
+:   Position anchor. Default **"center"**.
+
+**x**, **y**
+:   Explicit position offsets (cells).
+
+**border**, **border_color**
+:   Per-overlay border style and color overrides.
+
+Percentage sizes are clamped to the absolute bounds of the overlay resize
+range (width 40–200 cells, height 10–50 cells), so `"100%"` on an oversized
+terminal still produces a readable overlay rather than covering the whole
+screen.
+
+## Example
 
 ```lua
 ui.setup({
-    floating = {
-        width = 120,
-        height = 40,
+    overlays = {
+        -- Classic floating terminal, half the screen
+        floating = {
+            key = "<leader>f",
+            width = "50%",
+            height = "50%",
+        },
+        -- Lazygit as an overlay, fullscreen-ish
+        lazygit = {
+            key = "<leader>g",
+            cmd = "lazygit",
+            width = "90%",
+            height = "90%",
+        },
+        -- htop in a fixed 120x40 cell box
+        procs = {
+            key = "<leader>h",
+            cmd = "htop",
+            width = 120,
+            height = 40,
+        },
     },
 })
 ```
+
+For backwards compatibility, `ui.setup({ floating = { width = ..., height = ... } })`
+continues to work — it's translated into the `floating` overlay entry. The
+**floating** table also accepts percentage strings.
+
+## Resizing
+
+Two action pairs nudge overlay dimensions interactively:
+
+- **floating_increase_size** / **floating_decrease_size** step the overlay by
+  5 columns × 2 rows. Using these drops percent-tracking: the overlay
+  becomes cell-mode and stops following terminal resizes.
+- **floating_increase_pct** / **floating_decrease_pct** step the overlay's
+  percentage by 5%. Using these on a cell-mode overlay upconverts it by
+  computing its current percentage of the screen and stepping from there.
 
 # MACOS OPTION KEY
 
@@ -576,16 +649,29 @@ Zoom state is remembered per tab and restored when you switch back to that tab.
 **command_palette**
 :   Open the command palette
 
-## Floating Pane
+## Overlays
 
 **floating_toggle**
-:   Toggle the floating terminal pane
+:   Toggle the floating terminal pane (the built-in `floating` overlay).
+    Custom overlays registered via `ui.setup({ overlays = ... })` get their
+    own keybind-bound action automatically.
 
 **floating_increase_size**
-:   Increase floating pane size
+:   Step the active overlay by +5 columns × +2 rows (absolute cell mode).
+    Drops percent-tracking if active.
 
 **floating_decrease_size**
-:   Decrease floating pane size
+:   Step the active overlay by -5 columns × -2 rows (absolute cell mode).
+    Drops percent-tracking if active.
+
+**floating_increase_pct**
+:   Step the active overlay's width and height percentages by +5 each.
+    Upconverts a cell-mode overlay to percent-mode by computing the current
+    percentage of the screen.
+
+**floating_decrease_pct**
+:   Step the active overlay's width and height percentages by -5 each.
+    Same upconvert behavior as **floating_increase_pct**.
 
 # DEFAULT KEYBINDS
 
@@ -644,10 +730,16 @@ The tiling UI uses a leader key sequence. Press the leader key (default:
 :   Open layout picker
 
 **+**
-:   Increase floating pane size
+:   Increase floating pane size (absolute cells)
 
 **-**
-:   Decrease floating pane size
+:   Decrease floating pane size (absolute cells)
+
+**)**
+:   Increase floating pane size (percent of screen)
+
+**(**
+:   Decrease floating pane size (percent of screen)
 
 The command palette (**Super+p**) provides fuzzy search for all commands.
 
