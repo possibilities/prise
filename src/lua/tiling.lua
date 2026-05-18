@@ -4222,6 +4222,286 @@ function M.update(event)
             prise.save()
             prise.request_frame()
         end
+    elseif event.type == "break_pane" then
+        -- Move a pane out of its current tab into a brand-new tab of its own.
+        -- Dumb primitive: no "which pane should break?" policy lives here —
+        -- callers decide. Focus follows the moved pane if (and only if) the
+        -- source tab is the currently active tab AND the caller did not opt
+        -- out via data.focus = false; otherwise the operation is silent with
+        -- no focus steal.
+        --
+        -- Cross-session extension: when event.data.source_session is provided
+        -- and the pane is not found in state.tabs (viewer is on a different
+        -- session), the destination is the SOURCE session itself — the new
+        -- tab lands in the source session's saved JSON via the file-based
+        -- pair (prise.remove_pty_from_session + prise.place_pty_in_session).
+        -- The viewer's session.tabs is NOT mutated. Matrix-wins per fn-45.
+        --
+        -- Returns true on success, false on partial failure (remove succeeded
+        -- but place failed — pane orphaned). No rollback — log warn and return
+        -- false, mirroring the move primitive's stance.
+        --
+        -- Placement policy (same-session branch below): the new tab is
+        -- inserted immediately to the RIGHT of the focused tab
+        -- (state.active_tab), not appended to the end. Anchor is normalized
+        -- via max(1, min(#tabs, active_tab or 1)) with an explicit empty-tabs
+        -- → index 1 branch.
+        --
+        -- For the cross-session arm: placement is server-side via
+        -- appendTabToSessionFile, which appends at the end of source's tabs[].
+        -- For B5's setup (1 tab, active_tab=1) this matches the matrix's
+        -- normalize(active_tab)+1 expectation.
+        --
+        -- keep in sync with partner handler on feat/break-pane (merged
+        -- tiling.lua has two break_pane handlers; both must share this
+        -- placement policy).
+        local pty_id = event.data and event.data.pty_id
+        if type(pty_id) ~= "number" then
+            return false
+        end
+
+        -- Opt-out focus-follow. Default true preserves historical behavior;
+        -- callers pass focus = false to break a pane in the background even
+        -- when the source tab is active (e.g. the user is focused on a
+        -- different pane in the same tab and shouldn't be yanked to the new
+        -- tab).
+        local follow_focus = not (event.data and event.data.focus == false)
+
+        -- Capture the placement anchor BEFORE any mutation. Normalize
+        -- state.active_tab through max(1, min(#tabs, active_tab or 1)) so
+        -- nil / 0 / overflow all route to a valid index. Applied to the
+        -- same-session branch below.
+        local anchor = math.max(1, math.min(#state.tabs, state.active_tab or 1))
+        -- Insertion index: empty-tabs degenerate case lands at 1, otherwise
+        -- right of the anchor.
+        local function placement_index()
+            return (#state.tabs == 0) and 1 or (anchor + 1)
+        end
+
+        local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
+        if not src_tab then
+            -- Cross-session break: the pane lives in another session's saved
+            -- JSON. When source_session is provided, both remove and place
+            -- target the SOURCE session — the new tab lands in source's JSON,
+            -- NOT in the viewer's state.tabs. Viewer's session is left
+            -- untouched (mtime not advanced, state.tabs not mutated,
+            -- active_tab unchanged).
+            local source_session = event.data and event.data.source_session
+            prise.log.info(
+                "break_pane: cross-session entry pty="
+                    .. tostring(pty_id)
+                    .. " source="
+                    .. tostring(source_session)
+                    .. " viewer="
+                    .. tostring(prise.get_session_name())
+            )
+            if type(source_session) == "string" and source_session ~= "" then
+                -- cwd is required by prise.place_pty_in_session and is plumbed
+                -- through the manage_pane intent from arthack init.lua
+                -- (params.cwd → break_pane data.cwd). When absent, we cannot
+                -- perform the cross-session place — fail visibly.
+                local cwd = event.data and event.data.cwd
+                if type(cwd) ~= "string" or cwd == "" then
+                    prise.log.warn(
+                        "break_pane: cross-session missing cwd for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " — cannot place into source session"
+                    )
+                    return false
+                end
+                local tab_title = event.data and event.data.tab_title
+                prise.log.info(
+                    "break_pane: cross-session pre-remove pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                )
+                local removed = prise.remove_pty_from_session(source_session, pty_id)
+                if not removed then
+                    prise.log.warn(
+                        "break_pane: cross-session remove failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                    )
+                    return false
+                end
+                prise.log.info(
+                    "break_pane: cross-session post-remove pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                        .. " — placing into source"
+                )
+                -- Place into the SOURCE session's JSON file (matrix-wins:
+                -- C_new lands in alpha, not in the viewer's session). The
+                -- file-based path appends at the end of source's tabs[]
+                -- (server-side appendTabToSessionFile).
+                local placed = prise.place_pty_in_session(source_session, pty_id, cwd, tab_title)
+                if not placed then
+                    prise.log.warn(
+                        "break_pane: cross-session place failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " (orphaned after remove)"
+                    )
+                    return false
+                end
+                prise.log.info(
+                    "break_pane: cross-session done pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                )
+                -- Viewer's session is untouched — no save, no request_frame.
+                return true
+            end
+            return false
+        end
+
+        -- Require the pane to live in the tileable tree (not a floating or
+        -- overlay slot). find_tab_for_pane only walks tab.root, so a non-nil
+        -- src_tab already implies this — find_node_path here is belt-and-
+        -- suspenders and doubles as a handle on the leaf node reference.
+        local src_path = find_node_path(src_tab.root, pty_id)
+        if not src_path then
+            return false
+        end
+        local src_leaf = src_path[#src_path]
+
+        -- Defensive solo-pane no-op. Can't happen under the arthack policy
+        -- (it only breaks when cohabitants exist) but keeps this primitive
+        -- safe for direct callers: breaking the only pane in a tab would
+        -- leave the source empty and just shuffle tab ordering for nothing.
+        if is_pane(src_tab.root) and src_tab.root.id == pty_id then
+            return false
+        end
+
+        -- Reject when removing the pane would empty the source session
+        -- entirely (sole pane in only tab — mirrors move_pane_to_session's
+        -- solo-in-only-tab refusal).
+        if is_pane(src_tab.root) and src_tab.root.id == pty_id and #state.tabs == 1 then
+            return false
+        end
+
+        local was_active = (src_tab_idx == state.active_tab)
+
+        -- Clear any zoom state referencing the moved pane so it doesn't
+        -- follow into the new tab with stale bookkeeping.
+        if state.zoomed_pane_id == pty_id then
+            state.zoomed_pane_id = nil
+        end
+        for _, t in ipairs(state.tabs) do
+            if t.zoomed_pane_id == pty_id then
+                t.zoomed_pane_id = nil
+            end
+        end
+
+        -- Detach the leaf from the source tree. remove_pane_recursive
+        -- collapses any single-child split on the way up, so the survivor
+        -- is automatically promoted.
+        local new_root, next_focus = remove_pane_recursive(src_tab.root, pty_id)
+        src_tab.root = new_root
+
+        -- Defensive: if the tree collapsed to nothing (should not happen —
+        -- the solo-pane guard returns above), close auxiliary panes and
+        -- remove the emptied tab rather than leaving it headless. Under
+        -- the placement policy this branch is unreachable with the solo-
+        -- pane guard active; preserving historical behavior (drop the
+        -- broken pane). If future guard changes make this branch live,
+        -- the captured anchor must be decremented here to keep placement
+        -- consistent: src_tab_idx <= anchor by construction in this
+        -- branch (the removed tab was the pane's host and was <= active).
+        if not new_root and src_tab_idx then
+            close_auxiliary_panes(src_tab)
+            table.remove(state.tabs, src_tab_idx)
+            -- Decrement-on-left-removal: apply the same rule as the main
+            -- path so the anchor keeps pointing at the same logical tab
+            -- after the source collapse. Noted for future callers that
+            -- reach this branch; the early return below means placement
+            -- doesn't fire here today.
+            if src_tab_idx <= anchor then
+                anchor = math.max(0, anchor - 1)
+            end
+            if was_active then
+                -- Keep state.active_tab valid even when follow_focus is
+                -- false — the active tab was just removed, so the index
+                -- must be retargeted regardless.
+                local new_idx = math.min(src_tab_idx, #state.tabs)
+                state.active_tab = new_idx
+                local new_tab = state.tabs[new_idx]
+                if new_tab then
+                    state.zoomed_pane_id = new_tab.zoomed_pane_id
+                    new_tab.zoomed_pane_id = nil
+                end
+                if follow_focus then
+                    local new_focus_id = new_tab and new_tab.last_focused_id
+                    if new_tab and new_focus_id and not find_node_path(new_tab.root, new_focus_id) then
+                        local first = get_first_leaf(new_tab.root)
+                        new_focus_id = first and first.id or nil
+                    end
+                    local old_focused = state.focused_id
+                    state.focused_id = new_focus_id
+                    update_pty_focus(old_focused, new_focus_id)
+                    update_cached_git_branch()
+                end
+            elseif src_tab_idx < state.active_tab then
+                state.active_tab = state.active_tab - 1
+            end
+            prise.save()
+            prise.request_frame()
+            return true
+        end
+
+        -- Fix the source tab's saved focus if it pointed at the moved pane.
+        if src_tab.last_focused_id == pty_id then
+            if next_focus then
+                src_tab.last_focused_id = next_focus
+            else
+                local first = get_first_leaf(src_tab.root)
+                src_tab.last_focused_id = first and first.id or nil
+            end
+        end
+
+        -- Allocate a fresh tab whose root IS the moved leaf.
+        local tab_id = state.next_tab_id
+        state.next_tab_id = tab_id + 1
+        ---@type Tab
+        local new_tab = {
+            id = tab_id,
+            root = src_leaf,
+            last_focused_id = src_leaf.id,
+        }
+        -- Placement: insert at anchor + 1 (right of the focused tab). When
+        -- state.tabs is empty (no-op in practice under current guards, but
+        -- encoded for safety), the new tab becomes the only tab at index 1.
+        local insert_idx = placement_index()
+        table.insert(state.tabs, insert_idx, new_tab)
+
+        if was_active and follow_focus then
+            -- Use the captured (pre-mutation) anchor, not #state.tabs. The
+            -- new tab lives at insert_idx; set_active_tab_index handles
+            -- zoom save/restore on the old tab, picks the new tab's
+            -- last_focused_id, and fires update_pty_focus.
+            set_active_tab_index(insert_idx)
+        end
+        -- When the source tab was inactive OR the caller opted out of focus-
+        -- follow: state.active_tab is preserved. Insert at anchor + 1 always
+        -- lands to the RIGHT of the active tab (insert_idx = active_tab + 1
+        -- after normalization), so inserting doesn't shift the active tab's
+        -- index — it stays at the same position in state.tabs and still
+        -- resolves to the same logical tab. state.focused_id still refers
+        -- to a pane in the still-active tab — in the inactive case, not the
+        -- moved pane by invariant; in the opt-out case, the focused pane is
+        -- a sibling of the moved pane in the (still-active) source tab. No
+        -- focus mutation needed either way.
+
+        prise.save()
+        prise.request_frame()
+        return true
     elseif event.type == "cwd_changed" then
         -- CWD changed for a PTY - update cached git branch
         update_cached_git_branch()
