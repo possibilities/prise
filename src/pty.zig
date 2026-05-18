@@ -168,7 +168,7 @@ pub const Process = struct {
         } else null;
 
         const err = if (env_z) |ez|
-            posix.execvpeZ(argv_z[0].?, @ptrCast(argv_z[0..argv.len :null]), @ptrCast(ez))
+            execvpeFromEnvp(argv_z[0].?, @ptrCast(argv_z[0..argv.len :null]), @ptrCast(ez))
         else
             posix.execveZ(argv_z[0].?, @ptrCast(argv_z[0..argv.len :null]), @ptrCast(std.c.environ));
         log.err("execvpe failed: {}", .{err});
@@ -219,9 +219,122 @@ pub const Process = struct {
     }
 };
 
+/// Like `std.posix.execvpeZ` but searches PATH from the supplied `envp`
+/// instead of the parent process's own environ. This matters when the
+/// parent has a minimal environment (e.g. prise-server launched by launchd
+/// with PATH=/usr/bin:/bin:/usr/sbin:/sbin) but the caller hands us a
+/// richer env that actually contains the target binary's directory.
+///
+/// Mirrors the structure of `std.posix.execvpeZ_expandArg0` in Zig 0.15.x,
+/// with the PATH source swapped from `getenvZ` to a linear walk of `envp`.
+fn execvpeFromEnvp(
+    file: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) posix.ExecveError {
+    const file_slice = std.mem.sliceTo(file, 0);
+
+    // Program name containing a slash is treated as a path — no PATH search.
+    if (std.mem.indexOfScalar(u8, file_slice, '/') != null) {
+        return posix.execveZ(file, argv, envp);
+    }
+
+    // POSIX _PATH_DEFPATH — used only when envp has no PATH= entry at all.
+    const path = findPathInEnvp(envp) orelse "/usr/local/bin:/bin:/usr/bin";
+
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    var it = std.mem.tokenizeScalar(u8, path, ':');
+    var seen_eacces = false;
+    var err: posix.ExecveError = error.FileNotFound;
+
+    while (it.next()) |search_path| {
+        // +1 for the '/' joiner between dir and file, +1 for the NUL.
+        const path_len = search_path.len + 1 + file_slice.len;
+        if (path_buf.len < path_len + 1) return error.NameTooLong;
+
+        @memcpy(path_buf[0..search_path.len], search_path);
+        path_buf[search_path.len] = '/';
+        @memcpy(path_buf[search_path.len + 1 ..][0..file_slice.len], file_slice);
+        path_buf[path_len] = 0;
+        const full_path = path_buf[0..path_len :0].ptr;
+
+        err = posix.execveZ(full_path, argv, envp);
+        switch (err) {
+            error.AccessDenied => seen_eacces = true,
+            error.FileNotFound, error.NotDir => {},
+            else => |e| return e,
+        }
+    }
+
+    // Match glibc execvpe: remembered EACCES wins over a trailing ENOENT so
+    // one unreadable PATH entry doesn't mask a real permission error.
+    if (seen_eacces) return error.AccessDenied;
+    return err;
+}
+
+/// Scans a null-terminated `envp` (as passed to execve) for a `PATH=...`
+/// entry and returns the value, or null if PATH is absent.
+/// Pure — exposed for unit testing.
+fn findPathInEnvp(envp: [*:null]const ?[*:0]const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (envp[i]) |entry| : (i += 1) {
+        const entry_slice = std.mem.sliceTo(entry, 0);
+        if (std.mem.startsWith(u8, entry_slice, "PATH=")) {
+            return entry_slice["PATH=".len..];
+        }
+    }
+    return null;
+}
+
 test "pty constants" {
     const testing = std.testing;
 
     try testing.expect(TIOCSCTTY > 0);
     try testing.expect(TIOCSWINSZ > 0);
+}
+
+test "findPathInEnvp finds PATH" {
+    const testing = std.testing;
+
+    const e0: [*:0]const u8 = "HOME=/root";
+    const e1: [*:0]const u8 = "PATH=/usr/local/bin:/bin";
+    const e2: [*:0]const u8 = "TERM=xterm";
+    var envp_buf = [_:null]?[*:0]const u8{ e0, e1, e2 };
+
+    const path = findPathInEnvp(&envp_buf);
+    try testing.expect(path != null);
+    try testing.expectEqualStrings("/usr/local/bin:/bin", path.?);
+}
+
+test "findPathInEnvp returns null when PATH missing" {
+    const testing = std.testing;
+
+    const e0: [*:0]const u8 = "HOME=/root";
+    const e1: [*:0]const u8 = "TERM=xterm";
+    var envp_buf = [_:null]?[*:0]const u8{ e0, e1 };
+
+    try testing.expectEqual(@as(?[]const u8, null), findPathInEnvp(&envp_buf));
+}
+
+test "findPathInEnvp does not false-match PATH prefix" {
+    const testing = std.testing;
+
+    const e0: [*:0]const u8 = "PATHOLOGICAL=/foo";
+    const e1: [*:0]const u8 = "PATH=/real";
+    var envp_buf = [_:null]?[*:0]const u8{ e0, e1 };
+
+    const path = findPathInEnvp(&envp_buf);
+    try testing.expect(path != null);
+    try testing.expectEqualStrings("/real", path.?);
+}
+
+test "findPathInEnvp handles empty PATH value" {
+    const testing = std.testing;
+
+    const e0: [*:0]const u8 = "PATH=";
+    var envp_buf = [_:null]?[*:0]const u8{e0};
+
+    const path = findPathInEnvp(&envp_buf);
+    try testing.expect(path != null);
+    try testing.expectEqualStrings("", path.?);
 }
