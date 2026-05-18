@@ -1341,6 +1341,9 @@ local function remove_pane_by_id(id)
     tab.root = new_root
 
     if not tab.root then
+        -- Close floating/overlay panes that would be orphaned by
+        -- dropping this tab.
+        close_auxiliary_panes(tab)
         -- Tab is now empty, remove it
         if #state.tabs == 1 then
             table.remove(state.tabs, tab_idx)
