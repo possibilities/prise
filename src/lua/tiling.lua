@@ -182,7 +182,11 @@ local utils = require("utils")
 ---@field type "rename_tab"
 ---@field data { pty_id: number, title: string }
 
----@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|RenameTabEvent
+---@class BreakPaneEvent
+---@field type "break_pane"
+---@field data { pty_id: number, focus?: boolean, source_session?: string, cwd?: string, tab_title?: string }
+
+---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|RenameTabEvent|BreakPaneEvent
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -691,6 +695,150 @@ find_node_path = function(current, target_id, path)
     return nil
 end
 
+---List pty_ids of all main-tree panes sharing a tab with pty_id.
+---Returns nil if pty_id is unknown or lives in a floating/overlay slot
+---rather than the tileable tree. Traversal order matches collect_panes.
+---@param pty_id number
+---@return number[]?
+function M.list_tab_pty_ids(pty_id)
+    local _, tab = find_tab_for_pane(pty_id)
+    if not tab then
+        return nil
+    end
+    -- find_tab_for_pane may resolve floating/overlay panes (held on
+    -- tab.floating, outside tab.root). Filter them out here — this
+    -- primitive only reports main-tileable-tree cohabitants, because
+    -- that is what break_pane can act on. Callers that care about
+    -- floats should reach for tab.floating through a different API.
+    if not find_node_path(tab.root, pty_id) then
+        return nil
+    end
+    local panes = collect_panes(tab.root, {})
+    local ids = {}
+    for _, p in ipairs(panes) do
+        table.insert(ids, p.id)
+    end
+    return ids
+end
+
+---Classify whether a break_pane operation is safe for the given pty_id.
+---Pure read-only — never mutates state. External callers (e.g. the RPC
+---layer) must call this before dispatching the break_pane event to get a
+---structured reason token rather than a plain boolean from the handler.
+---
+---Returns one of:
+---  "ok"                — pty is in tile tree, tab has 2+ panes; break is safe.
+---  "solo_pane"         — pty is the only pane in its tab's tile tree.
+---  "pty_not_tileable"  — pty exists in a floating/overlay slot, not the tree.
+---  "pty_not_in_session"— pty is known (state.ptys) but not in any tab tree or
+---                        floating slot (cross-session / foreign-session case).
+---  "pty_not_found"     — pty_id unknown to this session entirely.
+---
+---@param pty_id number
+---@return "ok"|"solo_pane"|"pty_not_tileable"|"pty_not_in_session"|"pty_not_found"
+function M.classify_break_pane(pty_id)
+    -- Resolve the owning tab. find_tab_for_pane semantics shift across
+    -- branches: on this branch it walks tab.root only, but on arthack-prod
+    -- (after feat/overlay-terminals merges) it also matches tab.floating.
+    -- Don't lean on its tree-only-ness — verify membership explicitly below.
+    local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
+    if src_tab and find_node_path(src_tab.root, pty_id) then
+        -- Pane is in the tileable tree.
+        if is_pane(src_tab.root) and src_tab.root.id == pty_id then
+            return "solo_pane"
+        end
+        _ = src_tab_idx -- suppress unused warning
+        return "ok"
+    end
+
+    -- Not in any tile tree. Check floating/overlay slots across all tabs.
+    for _, tab in ipairs(state.tabs) do
+        if tab.floating and tab.floating.pane and tab.floating.pane.id == pty_id then
+            return "pty_not_tileable"
+        end
+        if tab.overlays then
+            for _, overlay in pairs(tab.overlays) do
+                if overlay.pane and overlay.pane.id == pty_id then
+                    return "pty_not_tileable"
+                end
+            end
+        end
+    end
+
+    -- Not in any tab at all. If the session has a pty registry and the id
+    -- is there, the pane belongs to a different session (cross-session arm).
+    -- state.ptys is not present in v1 live runtime — this arm is reachable
+    -- from tests that inject state.ptys to exercise the token.
+    if state.ptys and state.ptys[pty_id] then
+        return "pty_not_in_session"
+    end
+
+    return "pty_not_found"
+end
+
+---Broker entrypoint for the break_pane RPC. The server picks one
+---attached client (lowest stable Client.id) as broker and asks it via
+---an `app.ui.update({type="break_pane_request",...})` event. We
+---classify, apply on "ok", and reply via `prise.notify("break_pane_reply",...)`.
+---
+---Defensive guard: the inner `M.update({type="break_pane",...})` call
+---is constructed with a clean two-field `data` table — only `pty_id`
+---and `focus`. We never pass through `source_session` or any other
+---field that would route through the `M.update :3317` cross-session
+---arm (which references nil-on-this-branch globals
+---`prise.remove_pty_from_session` / `prise.place_pty_in_session`).
+---That arm stays asleep when `event.data.source_session` is nil/empty.
+---
+---@param pty_id number
+---@param focus boolean
+---@param request_id number
+function M.handle_break_pane_request(pty_id, focus, request_id)
+    local verdict = M.classify_break_pane(pty_id)
+    local ok = verdict == "ok"
+
+    if ok then
+        -- Apply locally first so siblings see the broker's tile-tree
+        -- AFTER the mutation completes. Pass `data` as exactly two
+        -- fields — pty_id and focus — to keep the cross-session bomb
+        -- at tiling.lua:3317 asleep.
+        M.update({
+            type = "break_pane",
+            data = { pty_id = pty_id, focus = focus },
+        })
+    end
+
+    -- Reply to the server. Notification envelope is fire-and-forget —
+    -- no ack expected. The server correlates by request_id and
+    -- forwards the verdict to the originating CLI.
+    prise.notify("break_pane_reply", {
+        request_id = request_id,
+        ok = ok,
+        reason = verdict,
+    })
+end
+
+---Convergence entrypoint for non-broker clients. After the broker
+---applies the break_pane, the server fans out a `break_pane_applied`
+---broadcast to other attached clients so their tile-tree mirrors
+---catch up. We re-run the same mutation locally.
+---
+---Defensive guard: same as `handle_break_pane_request` — `data` is a
+---clean two-field table to keep the cross-session arm asleep.
+---
+---Idempotency: if `pty_id` is unknown to this client (e.g. attached
+---to a different session), `M.update`'s break_pane arm short-circuits
+---on `not src_tab` (with `source_session` nil) and returns false
+---without mutating state. No crash.
+---
+---@param pty_id number
+---@param focus boolean
+function M.handle_break_pane_applied(pty_id, focus)
+    M.update({
+        type = "break_pane",
+        data = { pty_id = pty_id, focus = focus },
+    })
+end
+
 ---@param node? Node
 ---@return Pane?
 local function get_first_leaf(node)
@@ -1061,6 +1209,26 @@ local function swap_tabs(idx1, idx2)
 
     prise.request_frame()
     prise.save()
+end
+
+---Close any floating and overlay panes attached to a tab.
+---Used before dropping a tab whose main-tree root has been emptied,
+---so auxiliary panes don't become orphaned.
+---@param tab Tab
+local function close_auxiliary_panes(tab)
+    if tab.floating and tab.floating.pane then
+        local fp = tab.floating.pane
+        if fp.pty and fp.pty.close then
+            fp.pty:close()
+        end
+    end
+    if tab.overlays then
+        for _, overlay in pairs(tab.overlays) do
+            if overlay.pane and overlay.pane.pty and overlay.pane.pty.close then
+                overlay.pane.pty:close()
+            end
+        end
+    end
 end
 
 ---Remove a pane by id from the appropriate tab
@@ -2076,6 +2244,17 @@ local commands = {
         end,
     },
     {
+        name = "Break Pane",
+        action = function()
+            local focused_id = state.focused_id
+            if not focused_id then
+                prise.log.warn("break_pane: no focused pane")
+                return
+            end
+            M.update({ type = "break_pane", data = { pty_id = focused_id, focus = true } })
+        end,
+    },
+    {
         name = "New Tab",
         shortcut = key_prefix .. " t",
         action = function()
@@ -2397,6 +2576,14 @@ action_handlers = {
             state.zoomed_pane_id = state.focused_id
         end
         prise.request_frame()
+    end,
+    break_pane = function()
+        local focused_id = state.focused_id
+        if not focused_id then
+            prise.log.warn("break_pane: no focused pane")
+            return
+        end
+        M.update({ type = "break_pane", data = { pty_id = focused_id, focus = true } })
     end,
     new_tab = function()
         local pty = get_focused_pty()
@@ -3197,6 +3384,252 @@ function M.update(event)
         if not was_last then
             prise.save()
         end
+    elseif event.type == "break_pane" then
+        -- Move a pane out of its current tab into a brand-new tab of its own.
+        -- Dumb primitive: no "which pane should break?" policy lives here —
+        -- callers decide. Focus follows the moved pane if (and only if) the
+        -- source tab is the currently active tab AND the caller did not opt
+        -- out via data.focus = false; otherwise the operation is silent with
+        -- no focus steal.
+        --
+        -- Cross-session extension (fn-45): when event.data.source_session is
+        -- provided and the pane is not found in state.tabs (viewer is on a
+        -- different session), the destination is the SOURCE session itself —
+        -- the new tab lands in the source session's saved JSON via the
+        -- file-based pair (prise.remove_pty_from_session +
+        -- prise.place_pty_in_session). The viewer's session.tabs is NOT
+        -- mutated. Matrix-wins per fn-45.
+        --
+        -- Placement policy: the new tab is inserted immediately to the RIGHT
+        -- of the focused tab (state.active_tab), not appended to the end.
+        -- The anchor is normalized via max(1, min(#tabs, active_tab or 1))
+        -- with an explicit empty-tabs → index 1 branch. Anchor is CAPTURED AT
+        -- HANDLER ENTRY (before any mutations) and decremented by 1 if a
+        -- subsequent table.remove fires at an index <= anchor, so that
+        -- "right of originally-focused tab" semantics survive intra-handler
+        -- tree mutations.
+        --
+        -- keep in sync with partner handler on feat/break-pane-to-session
+        -- (merged tiling.lua has two break_pane handlers; both must share
+        -- this placement policy).
+        local pty_id = event.data and event.data.pty_id
+        if type(pty_id) ~= "number" then
+            return false
+        end
+
+        -- Opt-out focus-follow. Default true preserves historical behavior;
+        -- callers pass focus = false to break a pane in the background even
+        -- when the source tab is active (e.g. the user is focused on a
+        -- different pane in the same tab and shouldn't be yanked to the new
+        -- tab).
+        local follow_focus = not (event.data and event.data.focus == false)
+
+        local src_tab_idx, src_tab = find_tab_for_pane(pty_id)
+        if not src_tab then
+            -- fn-45 cross-session arm: when source_session is provided, both
+            -- remove and place target the SOURCE session — the new tab lands
+            -- in source's JSON, not in the viewer's state.tabs. Viewer's
+            -- session is left untouched.
+            local source_session = event.data and event.data.source_session
+            prise.log.info(
+                "break_pane: cross-session entry pty="
+                    .. tostring(pty_id)
+                    .. " source="
+                    .. tostring(source_session)
+                    .. " viewer="
+                    .. tostring(prise.get_session_name())
+            )
+            if type(source_session) == "string" and source_session ~= "" then
+                local cwd = event.data and event.data.cwd
+                if type(cwd) ~= "string" or cwd == "" then
+                    prise.log.warn(
+                        "break_pane: cross-session missing cwd for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " — cannot place into source session"
+                    )
+                    return false
+                end
+                local tab_title = event.data and event.data.tab_title
+                prise.log.info(
+                    "break_pane: cross-session pre-remove pty=" .. tostring(pty_id) .. " source=" .. source_session
+                )
+                local removed = prise.remove_pty_from_session(source_session, pty_id)
+                if not removed then
+                    prise.log.warn(
+                        "break_pane: cross-session remove failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                    )
+                    return false
+                end
+                prise.log.info(
+                    "break_pane: cross-session post-remove pty="
+                        .. tostring(pty_id)
+                        .. " source="
+                        .. source_session
+                        .. " — placing into source"
+                )
+                local placed = prise.place_pty_in_session(source_session, pty_id, cwd, tab_title)
+                if not placed then
+                    prise.log.warn(
+                        "break_pane: cross-session place failed for pty="
+                            .. tostring(pty_id)
+                            .. " source="
+                            .. source_session
+                            .. " (orphaned after remove)"
+                    )
+                    return false
+                end
+                prise.log.info(
+                    "break_pane: cross-session done pty=" .. tostring(pty_id) .. " source=" .. source_session
+                )
+                return true
+            end
+            return false
+        end
+
+        -- Require the pane to live in the tileable tree (not a floating or
+        -- overlay slot). find_tab_for_pane only walks tab.root, so a non-nil
+        -- src_tab already implies this — find_node_path here is belt-and-
+        -- suspenders and doubles as a handle on the leaf node reference.
+        local src_path = find_node_path(src_tab.root, pty_id)
+        if not src_path then
+            return
+        end
+        local src_leaf = src_path[#src_path]
+
+        -- Defensive solo-pane no-op. Can't happen under the arthack policy
+        -- (it only breaks when cohabitants exist) but keeps this primitive
+        -- safe for direct callers: breaking the only pane in a tab would
+        -- leave the source empty and just shuffle tab ordering for nothing.
+        if is_pane(src_tab.root) and src_tab.root.id == pty_id then
+            return
+        end
+
+        local was_active = (src_tab_idx == state.active_tab)
+
+        -- Capture the placement anchor BEFORE any mutation. Normalize
+        -- state.active_tab through max(1, min(#tabs, active_tab or 1)) so
+        -- nil / 0 / overflow all route to a valid index. This must happen
+        -- before table.remove below so the decrement-on-left-removal rule
+        -- has something deterministic to fix up (see anchor_adjust below).
+        local anchor = math.max(1, math.min(#state.tabs, state.active_tab or 1))
+
+        -- Clear any zoom state referencing the moved pane so it doesn't
+        -- follow into the new tab with stale bookkeeping.
+        if state.zoomed_pane_id == pty_id then
+            state.zoomed_pane_id = nil
+        end
+        for _, t in ipairs(state.tabs) do
+            if t.zoomed_pane_id == pty_id then
+                t.zoomed_pane_id = nil
+            end
+        end
+
+        -- Detach the leaf from the source tree. remove_pane_recursive
+        -- collapses any single-child split on the way up, so the survivor
+        -- is automatically promoted.
+        local new_root, next_focus = remove_pane_recursive(src_tab.root, pty_id)
+        src_tab.root = new_root
+
+        -- Defensive: if the tree collapsed to nothing (should not happen —
+        -- the solo-pane guard returns above), close auxiliary panes and
+        -- remove the emptied tab rather than leaving it headless. Under
+        -- the placement policy this branch is unreachable with the solo-
+        -- pane guard active; preserving historical behavior (drop the
+        -- broken pane). If future guard changes make this branch live,
+        -- the captured anchor must be decremented here to keep placement
+        -- consistent: src_tab_idx <= anchor by construction in this
+        -- branch (the removed tab was the pane's host and was <= active).
+        if not new_root and src_tab_idx then
+            close_auxiliary_panes(src_tab)
+            table.remove(state.tabs, src_tab_idx)
+            -- Decrement-on-left-removal: apply the same rule as the main
+            -- path so the anchor keeps pointing at the same logical tab
+            -- after the source collapse. Noted for future callers that
+            -- reach this branch; the early return below means placement
+            -- doesn't fire here today.
+            if src_tab_idx <= anchor then
+                anchor = math.max(0, anchor - 1)
+            end
+            if was_active then
+                -- Keep state.active_tab valid even when follow_focus is
+                -- false — the active tab was just removed, so the index
+                -- must be retargeted regardless.
+                local new_idx = math.min(src_tab_idx, #state.tabs)
+                state.active_tab = new_idx
+                local new_tab = state.tabs[new_idx]
+                if new_tab then
+                    state.zoomed_pane_id = new_tab.zoomed_pane_id
+                    new_tab.zoomed_pane_id = nil
+                end
+                if follow_focus then
+                    local new_focus_id = new_tab and new_tab.last_focused_id
+                    if new_tab and new_focus_id and not find_node_path(new_tab.root, new_focus_id) then
+                        local first = get_first_leaf(new_tab.root)
+                        new_focus_id = first and first.id or nil
+                    end
+                    local old_focused = state.focused_id
+                    state.focused_id = new_focus_id
+                    update_pty_focus(old_focused, new_focus_id)
+                    update_cached_git_branch()
+                end
+            elseif src_tab_idx < state.active_tab then
+                state.active_tab = state.active_tab - 1
+            end
+            prise.save()
+            prise.request_frame()
+            return
+        end
+
+        -- Fix the source tab's saved focus if it pointed at the moved pane.
+        if src_tab.last_focused_id == pty_id then
+            if next_focus then
+                src_tab.last_focused_id = next_focus
+            else
+                local first = get_first_leaf(src_tab.root)
+                src_tab.last_focused_id = first and first.id or nil
+            end
+        end
+
+        -- Allocate a fresh tab whose root IS the moved leaf.
+        local tab_id = state.next_tab_id
+        state.next_tab_id = tab_id + 1
+        ---@type Tab
+        local new_tab = {
+            id = tab_id,
+            root = src_leaf,
+            last_focused_id = src_leaf.id,
+        }
+        -- Placement: insert at anchor + 1 (right of the focused tab). When
+        -- state.tabs is empty (no-op in practice under current guards, but
+        -- encoded for safety), the new tab becomes the only tab at index 1.
+        local insert_idx = (#state.tabs == 0) and 1 or (anchor + 1)
+        table.insert(state.tabs, insert_idx, new_tab)
+
+        if was_active and follow_focus then
+            -- Use the captured (pre-mutation) anchor, not #state.tabs. The
+            -- new tab lives at insert_idx; set_active_tab_index handles
+            -- zoom save/restore on the old tab, picks the new tab's
+            -- last_focused_id, and fires update_pty_focus.
+            set_active_tab_index(insert_idx)
+        end
+        -- When the source tab was inactive OR the caller opted out of focus-
+        -- follow: state.active_tab is preserved. Insert at anchor + 1 always
+        -- lands to the RIGHT of the active tab (insert_idx = active_tab + 1
+        -- after normalization), so inserting doesn't shift the active tab's
+        -- index — it stays at the same position in state.tabs and still
+        -- resolves to the same logical tab. state.focused_id still refers
+        -- to a pane in the still-active tab — in the inactive case, not the
+        -- moved pane by invariant; in the opt-out case, the focused pane is
+        -- a sibling of the moved pane in the (still-active) source tab. No
+        -- focus mutation needed either way.
+
+        prise.save()
+        prise.request_frame()
     elseif event.type == "mouse" then
         local d = event.data
 
@@ -3418,6 +3851,17 @@ function M.update(event)
         update_cached_git_branch()
         prise.request_frame()
         prise.save() -- Auto-save on cwd change
+    elseif event.type == "break_pane_request" then
+        -- Server-asked-broker entry: classify + apply + reply via
+        -- prise.notify("break_pane_reply", ...). The handler builds the
+        -- inner break_pane data table from primitives only, keeping the
+        -- cross-session bomb at :3380 (formerly :3317) asleep.
+        M.handle_break_pane_request(event.data.pty_id, event.data.focus, event.data.request_id)
+    elseif event.type == "break_pane_applied" then
+        -- Convergence entry: re-apply the broker's break_pane locally
+        -- so this client's tile-tree mirror catches up. The broker is
+        -- excluded server-side, so this branch never fires on the broker.
+        M.handle_break_pane_applied(event.data.pty_id, event.data.focus)
     end
 end
 
@@ -4496,6 +4940,7 @@ end
 M._test = {
     is_pane = is_pane,
     is_split = is_split,
+    action_handlers = action_handlers,
     collect_panes = collect_panes,
     find_tab_for_pane = find_tab_for_pane,
     find_node_path = find_node_path,

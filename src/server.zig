@@ -36,6 +36,44 @@ pub const LIMITS = struct {
     pub const COLOR_QUERY_MAX: usize = 32;
     pub const RESPONSE_QUEUE_MAX: usize = 64;
     pub const COLOR_QUERY_TIMEOUT_MS: i64 = 5000;
+    /// Defensive ceiling on in-flight client-broker RPC requests
+    /// (e.g. break_pane). Single-user case will never approach 64; the
+    /// limit guards against runaway state from a misbehaving caller.
+    pub const PENDING_MAX: usize = 64;
+    /// Default deadline for a pending broker-RPC: well above local UDS
+    /// RTT, well below "is it broken" user threshold. Sweep timer fires
+    /// `broker_timeout` to the originating CLI when exceeded.
+    pub const PENDING_DEADLINE_MS: i64 = 2000;
+    /// Cadence for the deadline-sweep timer that retires expired
+    /// pending entries. Bounded delay between deadline-exceeded and
+    /// timeout reply.
+    pub const PENDING_SWEEP_MS: u64 = 250;
+};
+
+/// In-flight client-broker RPC request awaiting a reply notification
+/// from the chosen broker client. Currently used only by `break_pane`,
+/// but the shape is method-agnostic — extend with method-specific
+/// fields as more brokered RPCs land.
+const PendingBreak = struct {
+    /// msgid of the original CLI request — needed to build the
+    /// matching Response to the originator when the broker replies
+    /// (or when the deadline sweep / removeClient retires the entry).
+    cli_msgid: u32,
+    /// The CLI client awaiting the reply. We may need to send a
+    /// Response (success/failure) to this client.
+    cli_client: *Client,
+    /// `Client.id` of the chosen broker. Used for matching against
+    /// `removeClient` (broker disconnected → reply `broker_timeout`).
+    broker_id: usize,
+    /// Wall-clock deadline (ms since epoch). Sweep timer compares
+    /// against `std.time.milliTimestamp()`.
+    deadline_ts: i64,
+    /// Pty id from the original request — replayed in the
+    /// `break_pane_applied` broadcast on success.
+    pty_id: u32,
+    /// Focus flag from the original request — replayed in the
+    /// `break_pane_applied` broadcast on success.
+    focus: bool,
 };
 
 var signal_write_fd: posix.fd_t = undefined;
@@ -1082,6 +1120,11 @@ fn buildRedrawMessageFromPty(
 
 const Client = struct {
     fd: posix.fd_t,
+    /// Per-process-lifetime stable id, assigned monotonically at accept-time
+    /// from `Server.next_client_id`. Used as the deterministic broker-pick key
+    /// for the client-broker RPC pattern (lowest id among attached clients).
+    /// Resets on server restart — clients re-attach and pick a new lowest.
+    id: usize = 0,
     server: *Server,
     // 4096 bytes is sufficient for typical RPC messages while staying
     // small enough for stack allocation. Larger messages are handled
@@ -1243,6 +1286,15 @@ const Client = struct {
     fn handleRpcRequest(self: *Client, loop: *io.Loop, req: rpc.Request) !void {
         std.debug.assert(req.method.len > 0);
 
+        // Async-broker requests (currently only `break_pane`) own their own
+        // response lifecycle: they may send the Response synchronously
+        // (refusal short-circuits) OR defer it until the broker replies via
+        // a `break_pane_reply` notification. Returning early here keeps the
+        // synchronous-response wrapper below from sending an extra Response.
+        if (std.mem.eql(u8, req.method, "break_pane")) {
+            return self.server.handleBreakPane(self, req.msgid, req.params);
+        }
+
         const result = self.server.handleRequest(self, req.method, req.params) catch |err| {
             return self.sendErrorResponse(loop, req.msgid, err);
         };
@@ -1279,6 +1331,46 @@ const Client = struct {
         try self.sendData(loop, response_bytes);
     }
 
+    /// Send a `{ok, reason?}` map Response for a `break_pane` request.
+    ///
+    /// Used by every terminal state of the broker dance: synchronous
+    /// `session_not_attached` refusal at request time, broker reply
+    /// arrival (`ok=true` or refusal token), deadline-sweep timeout,
+    /// and broker disconnect. `reason` is omitted when null
+    /// (success replies use `{ok=true}` only).
+    fn sendBreakPaneResponse(self: *Client, loop: *io.Loop, msgid: u32, ok: bool, reason: ?[]const u8) !void {
+        const allocator = self.server.allocator;
+
+        const map_len: usize = if (reason) |_| 2 else 1;
+        const map_items = try allocator.alloc(msgpack.Value.KeyValue, map_len);
+        defer allocator.free(map_items);
+
+        map_items[0] = .{
+            .key = .{ .string = "ok" },
+            .value = .{ .boolean = ok },
+        };
+        if (reason) |r| {
+            map_items[1] = .{
+                .key = .{ .string = "reason" },
+                .value = .{ .string = r },
+            };
+        }
+
+        const response_arr = try allocator.alloc(msgpack.Value, 4);
+        defer allocator.free(response_arr);
+        response_arr[0] = msgpack.Value{ .unsigned = 1 }; // type=Response
+        response_arr[1] = msgpack.Value{ .unsigned = msgid };
+        response_arr[2] = msgpack.Value.nil; // no error
+        response_arr[3] = msgpack.Value{ .map = map_items };
+
+        const response_value = msgpack.Value{ .array = response_arr };
+        const response_bytes = try msgpack.encodeFromValue(allocator, response_value);
+        defer allocator.free(response_bytes);
+
+        std.debug.assert(response_bytes.len <= LIMITS.MESSAGE_SIZE_MAX);
+        try self.sendData(loop, response_bytes);
+    }
+
     /// Dispatch notification to appropriate handler.
     fn handleNotification(self: *Client, notif: rpc.Notification) !void {
         std.debug.assert(notif.method.len > 0);
@@ -1301,6 +1393,8 @@ const Client = struct {
             try self.handleFocusEvent(notif);
         } else if (std.mem.eql(u8, notif.method, "color_response")) {
             try self.handleColorResponse(notif);
+        } else if (std.mem.eql(u8, notif.method, "break_pane_reply")) {
+            try self.server.handleBreakPaneReply(notif);
         }
     }
 
@@ -2040,6 +2134,24 @@ const Server = struct {
     clients: std.ArrayList(*Client),
     ptys: std.AutoHashMap(usize, *Pty),
     next_pty_id: usize = 0,
+    /// Monotonic per-process-lifetime counter for `Client.id`. Bumped at
+    /// accept-time. Lowest assigned id among attached clients is the
+    /// deterministic broker for the client-broker RPC pattern (e.g.
+    /// break_pane). Resets on server restart.
+    next_client_id: usize = 0,
+    /// In-flight client-broker RPC requests, keyed by request_id.
+    /// Capped at `LIMITS.PENDING_MAX`. Entries are dropped when the
+    /// broker replies, when the deadline-sweep timer expires the
+    /// request, or when either end disconnects.
+    pending: std.AutoHashMap(usize, PendingBreak),
+    /// Monotonic counter for the broker-RPC `request_id` field. Lives
+    /// in the notification payload (NOT the msgpack-RPC msgid) to
+    /// correlate the broker's reply back to the originating CLI.
+    next_request_id: usize = 0,
+    /// Handle on the re-arming deadline-sweep timer. `null` until the
+    /// first pending entry triggers timer arm; reset to `null` in the
+    /// timer callback before re-arming.
+    pending_sweep_timer: ?io.Task = null,
     accepting: bool = true,
     accept_task: ?io.Task = null,
     exit_on_idle: bool = false,
@@ -2128,6 +2240,43 @@ const Server = struct {
 
     fn parseClosePtyParams(params: msgpack.Value) !usize {
         return parsePtyId(params);
+    }
+
+    /// Parse `break_pane` request params from a msgpack map.
+    ///
+    /// Wire shape: `{pty_id: u32, focus: bool}` — both fields required.
+    /// `pty_id` accepts the full u32 range; `focus` must be a boolean.
+    ///
+    /// Returns `error.MalformedParams` on missing fields or wrong types
+    /// — same error name the CLI's wire-shape test expects, surfaced
+    /// back to the originating client via `sendErrorResponse`.
+    fn parseBreakPaneParams(params: msgpack.Value) !struct { pty_id: u32, focus: bool } {
+        if (params != .map) return error.MalformedParams;
+
+        var have_pty_id = false;
+        var have_focus = false;
+        var pty_id: u32 = 0;
+        var focus: bool = false;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .unsigned => |u| std.math.cast(u32, u) orelse return error.MalformedParams,
+                    .integer => |i| std.math.cast(u32, i) orelse return error.MalformedParams,
+                    else => return error.MalformedParams,
+                };
+                have_pty_id = true;
+            } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+                if (kv.value != .boolean) return error.MalformedParams;
+                focus = kv.value.boolean;
+                have_focus = true;
+            }
+        }
+
+        if (!have_pty_id or !have_focus) return error.MalformedParams;
+
+        return .{ .pty_id = pty_id, .focus = focus };
     }
 
     fn parseAttachPtyParams(params: msgpack.Value) !struct { pty_id: usize, macos_option_as_alt: key_encode.OptionAsAlt } {
@@ -2358,6 +2507,177 @@ const Server = struct {
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
         }
+    }
+
+    /// Parse a `break_pane_reply` notification payload. The broker
+    /// must include `request_id` (correlator), `ok` (success flag),
+    /// and optionally `reason` (refusal-token string when ok=false).
+    /// Returns `error.MalformedParams` on missing/wrong-type required
+    /// fields. `reason` defaults to null when absent.
+    fn parseBreakPaneReplyParams(params: msgpack.Value) !struct { request_id: usize, ok: bool, reason: ?[]const u8 } {
+        if (params != .map) return error.MalformedParams;
+
+        var have_request_id = false;
+        var have_ok = false;
+        var request_id: usize = 0;
+        var ok: bool = false;
+        var reason: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "request_id")) {
+                request_id = switch (kv.value) {
+                    .unsigned => |u| @intCast(u),
+                    .integer => |i| std.math.cast(usize, i) orelse return error.MalformedParams,
+                    else => return error.MalformedParams,
+                };
+                have_request_id = true;
+            } else if (std.mem.eql(u8, kv.key.string, "ok")) {
+                if (kv.value != .boolean) return error.MalformedParams;
+                ok = kv.value.boolean;
+                have_ok = true;
+            } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+                if (kv.value == .string) {
+                    reason = kv.value.string;
+                }
+            }
+        }
+
+        if (!have_request_id or !have_ok) return error.MalformedParams;
+
+        return .{ .request_id = request_id, .ok = ok, .reason = reason };
+    }
+
+    /// Handle a `break_pane_reply` Notification from the broker.
+    ///
+    /// Looks up the pending entry by `request_id`. On match: drop the
+    /// entry, send the matching Response back to the originating CLI,
+    /// and (on `ok=true`) fan out a `break_pane_applied` broadcast to
+    /// converge non-broker clients (broadcast helper lands in phase 8).
+    /// Unknown `request_id` (timeout already fired, or never existed)
+    /// is logged under the stable event name `rpc.broker.late_reply`
+    /// and silently dropped — never a panic. Malformed payload is
+    /// logged + dropped.
+    fn handleBreakPaneReply(self: *Server, notif: rpc.Notification) !void {
+        const parsed = parseBreakPaneReplyParams(notif.params) catch |err| {
+            log.warn("break_pane_reply: malformed payload: {}", .{err});
+            return;
+        };
+
+        const entry = self.pending.fetchRemove(parsed.request_id) orelse {
+            log.info("event=\"rpc.broker.late_reply\" request_id={} ok={}", .{
+                parsed.request_id,
+                parsed.ok,
+            });
+            return;
+        };
+
+        const cli_client = entry.value.cli_client;
+        const cli_msgid = entry.value.cli_msgid;
+
+        log.info("break_pane_reply: request_id={} ok={} reason={?s}", .{
+            parsed.request_id,
+            parsed.ok,
+            parsed.reason,
+        });
+
+        // Reply to originating CLI BEFORE fanout — siblings can wait;
+        // the CLI is blocked on this Response.
+        try cli_client.sendBreakPaneResponse(self.loop, cli_msgid, parsed.ok, parsed.reason);
+
+        // On ok=true, fan out `break_pane_applied` to non-broker
+        // attached clients so their tile-tree mirrors converge. Best
+        // effort: broadcast send errors do not roll back the CLI
+        // Response (which has already been queued).
+        if (parsed.ok) {
+            self.sendBreakPaneApplied(
+                entry.value.broker_id,
+                entry.value.pty_id,
+                entry.value.focus,
+            ) catch |err| {
+                log.warn("break_pane_reply: sendBreakPaneApplied failed: {}", .{err});
+            };
+        }
+    }
+
+    /// Handle the `break_pane` Request: pick a deterministic broker among
+    /// attached clients, store a pending entry keyed by `request_id`, and
+    /// notify the broker. The synchronous Response is sent only when we
+    /// can refuse without consulting Lua (no attached clients, malformed
+    /// params, or pending-table full); otherwise the eventual Response is
+    /// emitted by `handleBreakPaneReply` when the broker fires its
+    /// notification reply, by the deadline-sweep timer on timeout, or by
+    /// `removeClient` if the broker disconnects.
+    ///
+    /// Owns its own response lifecycle — called from `handleRpcRequest`
+    /// before the value-returning `handleRequest`. Returns an error only
+    /// if the synchronous Response itself fails to send.
+    fn handleBreakPane(self: *Server, client: *Client, msgid: u32, params: msgpack.Value) !void {
+        const parsed = parseBreakPaneParams(params) catch |err| {
+            log.warn("break_pane: malformed params: {}", .{err});
+            return client.sendErrorResponse(self.loop, msgid, err);
+        };
+
+        // Broker-pick: lowest `Client.id` among clients with at least one
+        // attached PTY. Empty result → synchronous `session_not_attached`
+        // refusal (no point queueing for a possibly-never-attaching client).
+        var broker: ?*Client = null;
+        for (self.clients.items) |c| {
+            if (c.attached_ptys.items.len == 0) continue;
+            if (broker) |current| {
+                if (c.id < current.id) broker = c;
+            } else {
+                broker = c;
+            }
+        }
+        const broker_client = broker orelse {
+            log.info("break_pane: no attached clients, refusing with session_not_attached", .{});
+            return client.sendBreakPaneResponse(self.loop, msgid, false, "session_not_attached");
+        };
+
+        // Defensive cap. Single-user case never approaches PENDING_MAX;
+        // a misbehaving caller hitting it gets the same UX as a slow
+        // broker (broker_timeout) so the CLI exit-code map stays single-token.
+        if (self.pending.count() >= LIMITS.PENDING_MAX) {
+            log.warn("break_pane: pending table at limit ({}), refusing with broker_timeout", .{LIMITS.PENDING_MAX});
+            return client.sendBreakPaneResponse(self.loop, msgid, false, "broker_timeout");
+        }
+
+        const request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        const deadline_ts = std.time.milliTimestamp() + LIMITS.PENDING_DEADLINE_MS;
+
+        // Write pending FIRST so a fast broker reply that arrives before
+        // we return finds the entry.
+        try self.pending.put(request_id, .{
+            .cli_msgid = msgid,
+            .cli_client = client,
+            .broker_id = broker_client.id,
+            .deadline_ts = deadline_ts,
+            .pty_id = parsed.pty_id,
+            .focus = parsed.focus,
+        });
+
+        log.info("break_pane: pty_id={} focus={} broker_id={} request_id={} deadline_ts={}", .{
+            parsed.pty_id,
+            parsed.focus,
+            broker_client.id,
+            request_id,
+            deadline_ts,
+        });
+
+        // Emit the broker notification AFTER the pending entry is
+        // written so a fast broker reply finds the entry. If the send
+        // fails (e.g. SendQueueFull, BrokerNotFound from a race with
+        // removeClient), drop the pending entry immediately and reply
+        // `broker_timeout` synchronously rather than wait the full
+        // 2s for the deadline-sweep timer.
+        self.sendBreakPaneRequest(broker_client.id, parsed.pty_id, parsed.focus, request_id) catch |err| {
+            log.warn("break_pane: sendBreakPaneRequest failed: {}, replying broker_timeout", .{err});
+            _ = self.pending.remove(request_id);
+            return client.sendBreakPaneResponse(self.loop, msgid, false, "broker_timeout");
+        };
     }
 
     fn handleAttachPty(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
@@ -2747,15 +3067,17 @@ const Server = struct {
                 const client = try self.allocator.create(Client);
                 client.* = .{
                     .fd = client_fd,
+                    .id = self.next_client_id,
                     .server = self,
                     .msg_buffer = std.ArrayList(u8).empty,
                     .send_queue = std.ArrayList([]u8).empty,
                     .attached_ptys = std.ArrayList(usize).empty,
                     // .style_cache = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(self.allocator),
                 };
+                self.next_client_id += 1;
                 try self.clients.append(self.allocator, client);
                 std.debug.assert(self.clients.items.len <= LIMITS.CLIENTS_MAX);
-                std.log.debug("Total clients: {}", .{self.clients.items.len});
+                std.log.debug("Total clients: {} (assigned id={})", .{ self.clients.items.len, client.id });
 
                 // Start recv to detect disconnect
                 _ = try loop.recv(client_fd, &client.recv_buffer, .{
@@ -2781,6 +3103,60 @@ const Server = struct {
     fn removeClient(self: *Server, client: *Client) void {
         std.log.debug("Removing client fd={}", .{client.fd});
 
+        // Sweep pending broker-RPC entries that mention `client`. A
+        // single pending entry matches at most one of these cases (the
+        // CLI and broker are distinct clients in the normal flow):
+        //
+        //   broker-side (broker_id == client.id): synthesise a
+        //     `broker_timeout` reply to the CLI before its 2s deadline,
+        //     since we know the broker is gone. Drop the entry.
+        //   cli-side  (cli_client == client):     the CLI socket is
+        //     already closing — no Response can be delivered. Drop
+        //     the entry without replying.
+        //
+        // Snapshot-then-iterate to avoid hashmap iterator invalidation
+        // while we mutate via `remove`. Per-CLI send failures are
+        // logged and the loop continues.
+        var to_drop = std.ArrayList(usize).empty;
+        defer to_drop.deinit(self.allocator);
+
+        var pending_it = self.pending.iterator();
+        while (pending_it.next()) |entry| {
+            if (entry.value_ptr.broker_id == client.id or
+                entry.value_ptr.cli_client == client)
+            {
+                to_drop.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    log.warn("removeClient: pending snapshot append failed: {}", .{err});
+                    break;
+                };
+            }
+        }
+
+        for (to_drop.items) |request_id| {
+            const entry = self.pending.fetchRemove(request_id) orelse continue;
+            const broker_gone = entry.value.broker_id == client.id;
+            const cli_gone = entry.value.cli_client == client;
+
+            if (broker_gone and !cli_gone) {
+                log.info("event=\"rpc.broker.disconnect\" request_id={} broker_id={}", .{
+                    request_id,
+                    entry.value.broker_id,
+                });
+                entry.value.cli_client.sendBreakPaneResponse(
+                    self.loop,
+                    entry.value.cli_msgid,
+                    false,
+                    "broker_timeout",
+                ) catch |err| {
+                    log.warn("removeClient: broker_timeout reply failed: {}", .{err});
+                };
+            } else {
+                // cli_gone (or both, in a pathological self-broker case
+                // — drop without replying since the CLI socket is gone).
+                log.info("event=\"rpc.broker.cli_disconnect\" request_id={}", .{request_id});
+            }
+        }
+
         // Remove client from any PTYs it was attached to (but don't kill them)
         for (client.attached_ptys.items) |pty_id| {
             if (self.ptys.get(pty_id)) |pty_instance| {
@@ -2803,6 +3179,196 @@ const Server = struct {
         }
 
         client.finishClose(self.loop);
+    }
+
+    /// Send a `break_pane_request` Notification to the chosen broker.
+    ///
+    /// Mirrors `sendRedraw`'s targeted-send filter pattern: walk all
+    /// clients, skip those whose id doesn't match `broker_id`, send to
+    /// exactly one. The wire envelope is `[2, "break_pane_request",
+    /// {pty_id, focus, request_id}]`. The broker correlates the reply
+    /// via `request_id` in the payload (msgpack-RPC Notifications carry
+    /// no msgid, so correlation must live in the params).
+    ///
+    /// Returns `error.BrokerNotFound` if no client matches `broker_id`
+    /// (raced with `removeClient`); caller drops the pending entry and
+    /// replies `broker_timeout` to the CLI.
+    fn sendBreakPaneRequest(self: *Server, broker_id: usize, pty_id: u32, focus: bool, request_id: usize) !void {
+        var target: ?*Client = null;
+        for (self.clients.items) |c| {
+            if (c.id == broker_id) {
+                target = c;
+                break;
+            }
+        }
+        const broker = target orelse return error.BrokerNotFound;
+
+        const map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{
+            .key = .{ .string = "pty_id" },
+            .value = .{ .unsigned = pty_id },
+        };
+        map_items[1] = .{
+            .key = .{ .string = "focus" },
+            .value = .{ .boolean = focus },
+        };
+        map_items[2] = .{
+            .key = .{ .string = "request_id" },
+            .value = .{ .unsigned = request_id },
+        };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "break_pane_request", params });
+        defer self.allocator.free(msg_bytes);
+
+        log.info("break_pane_request: broker_id={} pty_id={} focus={} request_id={}", .{
+            broker_id,
+            pty_id,
+            focus,
+            request_id,
+        });
+
+        try broker.sendData(self.loop, msg_bytes);
+    }
+
+    /// Broadcast a `break_pane_applied` Notification to all attached
+    /// clients EXCEPT the broker. Mirrors `sendPtyExited`'s loop, but
+    /// gates on `attached_ptys.items.len > 0` (only attached UIs care)
+    /// and skips the broker (which already knows — it just applied
+    /// the change locally and reported `ok=true`).
+    ///
+    /// Wire envelope: `[2, "break_pane_applied", {pty_id, focus}]`.
+    /// Sibling clients use this to converge their tile-tree mirror
+    /// without having to refetch state.
+    ///
+    /// Best-effort per-client: a per-client send failure is logged
+    /// and the loop continues — one stuck client must not block
+    /// convergence on the others.
+    fn sendBreakPaneApplied(self: *Server, broker_id: usize, pty_id: u32, focus: bool) !void {
+        const map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{
+            .key = .{ .string = "pty_id" },
+            .value = .{ .unsigned = pty_id },
+        };
+        map_items[1] = .{
+            .key = .{ .string = "focus" },
+            .value = .{ .boolean = focus },
+        };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "break_pane_applied", params });
+        defer self.allocator.free(msg_bytes);
+
+        log.info("break_pane_applied: pty_id={} focus={} (excluding broker_id={})", .{
+            pty_id,
+            focus,
+            broker_id,
+        });
+
+        for (self.clients.items) |client| {
+            if (client.id == broker_id) continue;
+            if (client.attached_ptys.items.len == 0) continue;
+            client.sendData(self.loop, msg_bytes) catch |err| {
+                log.warn("break_pane_applied: send to client id={} failed: {}", .{ client.id, err });
+            };
+        }
+    }
+
+    /// Sweep `pending` for expired entries and reply `broker_timeout`
+    /// to each originating CLI. Snapshot-then-iterate to avoid
+    /// hashmap iterator invalidation while we mutate via `remove`.
+    ///
+    /// "Expired" means `deadline_ts < now()`. The deadline is set to
+    /// `now() + LIMITS.PENDING_DEADLINE_MS` at `handleBreakPane` time.
+    /// Per-CLI send failures are logged and the loop continues — one
+    /// dead socket must not stall sweep of the others.
+    fn sweepPending(self: *Server) void {
+        const now = std.time.milliTimestamp();
+
+        // Snapshot the request_ids that are expired. We can't call
+        // sendBreakPaneResponse + remove inside the iterator because
+        // sendBreakPaneResponse may queue a send completion that
+        // mutates the loop, and remove invalidates the iterator.
+        var expired = std.ArrayList(usize).empty;
+        defer expired.deinit(self.allocator);
+
+        var it = self.pending.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.deadline_ts < now) {
+                expired.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    log.warn("sweepPending: append failed: {}", .{err});
+                    return;
+                };
+            }
+        }
+
+        for (expired.items) |request_id| {
+            const entry = self.pending.fetchRemove(request_id) orelse continue;
+            log.info("event=\"rpc.broker.timeout\" request_id={} broker_id={}", .{
+                request_id,
+                entry.value.broker_id,
+            });
+            entry.value.cli_client.sendBreakPaneResponse(
+                self.loop,
+                entry.value.cli_msgid,
+                false,
+                "broker_timeout",
+            ) catch |err| {
+                log.warn("sweepPending: sendBreakPaneResponse failed: {}", .{err});
+            };
+        }
+    }
+
+    /// Arm (or re-arm) the deadline-sweep timer at `PENDING_SWEEP_MS`.
+    /// Called once at `startServer`, then re-armed from the timer
+    /// callback. Idempotent: if a timer is already armed, no-op.
+    fn armPendingSweepTimer(self: *Server) !void {
+        if (self.pending_sweep_timer != null) return;
+        self.pending_sweep_timer = try self.loop.timeout(
+            LIMITS.PENDING_SWEEP_MS * std.time.ns_per_ms,
+            .{ .ptr = self, .cb = onPendingSweepTimer },
+        );
+    }
+
+    fn onPendingSweepTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        _ = loop;
+        const self = completion.userdataCast(Server);
+        // Clear the handle BEFORE sweep + re-arm so we don't dedup
+        // ourselves against a timer-id we've already consumed.
+        self.pending_sweep_timer = null;
+        self.sweepPending();
+        // Re-arm only while the server is still accepting. Past
+        // shutdown, the loop is draining; arming again would keep it
+        // alive past the shutdown signal.
+        if (self.accepting) {
+            try self.armPendingSweepTimer();
+        }
+    }
+
+    /// Drain ALL in-flight broker-RPC requests, regardless of
+    /// deadline, with best-effort `broker_timeout` replies. Called
+    /// from `shutdown` BEFORE clients are removed: once the CLI
+    /// client's socket is closed, no Response can be queued on it.
+    ///
+    /// Best-effort means: per-CLI send failures are logged and the
+    /// drain continues. The map is cleared at the end so a second
+    /// shutdown call is a no-op.
+    fn drainPendingForShutdown(self: *Server) void {
+        var it = self.pending.iterator();
+        while (it.next()) |entry| {
+            log.info("event=\"rpc.broker.shutdown_drain\" request_id={}", .{entry.key_ptr.*});
+            entry.value_ptr.cli_client.sendBreakPaneResponse(
+                self.loop,
+                entry.value_ptr.cli_msgid,
+                false,
+                "broker_timeout",
+            ) catch |err| {
+                log.warn("drainPendingForShutdown: reply failed: {}", .{err});
+            };
+        }
+        self.pending.clearRetainingCapacity();
     }
 
     /// Send redraw notification (bytes) to attached clients
@@ -3062,6 +3628,22 @@ const Server = struct {
             self.accept_task = null;
         }
 
+        // Cancel the deadline-sweep timer so the loop can drain. The
+        // sweep callback also gates re-arm on `self.accepting`, so a
+        // race-fire here is safely a no-op.
+        if (self.pending_sweep_timer) |*task| {
+            task.cancel(self.loop) catch {};
+            self.pending_sweep_timer = null;
+        }
+
+        // Drain in-flight broker-RPC requests with best-effort
+        // `broker_timeout` replies BEFORE we tear down clients. Once
+        // a CLI client is removed, the loop can no longer queue a
+        // Response on its fd; replying first gives the CLI a clean
+        // exit instead of a 2s deadline-sweep wait that never fires.
+        // Send failures are logged and the drain continues.
+        self.drainPendingForShutdown();
+
         // Close all clients
         while (self.clients.items.len > 0) {
             const client = self.clients.items[0];
@@ -3293,6 +3875,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .socket_path = socket_path,
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .signal_pipe_fds = signal_pipe_fds,
         .start_time_ms = std.time.milliTimestamp(),
     };
@@ -3307,6 +3890,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         }
         server.clients.deinit(allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     // Start accepting connections
@@ -3320,6 +3904,12 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .ptr = &server,
         .cb = Server.onSignal,
     });
+
+    // Arm the deadline-sweep timer: re-arms itself from its callback
+    // at `LIMITS.PENDING_SWEEP_MS` cadence to retire any expired
+    // pending broker-RPC entries (e.g. break_pane requests whose
+    // broker never replied).
+    try server.armPendingSweepTimer();
 
     // Run until server decides to exit
     try loop.run(.until_done);
@@ -3355,11 +3945,13 @@ test "server lifecycle - shutdown when no clients" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
     defer server.clients.deinit(testing.allocator);
     defer server.ptys.deinit();
+    defer server.pending.deinit();
 
     server.accept_task = try loop.accept(100, .{
         .ptr = &server,
@@ -3388,6 +3980,7 @@ test "server lifecycle - accept client connection" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -3396,6 +3989,7 @@ test "server lifecycle - accept client connection" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3423,6 +4017,7 @@ test "server lifecycle - client disconnect triggers shutdown" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
@@ -3432,6 +4027,7 @@ test "server lifecycle - client disconnect triggers shutdown" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3465,6 +4061,7 @@ test "server lifecycle - multiple clients" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
@@ -3474,6 +4071,7 @@ test "server lifecycle - multiple clients" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3524,6 +4122,7 @@ test "server lifecycle - recv error triggers disconnect" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .exit_on_idle = true,
         .signal_pipe_fds = undefined,
     };
@@ -3533,6 +4132,7 @@ test "server lifecycle - recv error triggers disconnect" {
         }
         server.clients.deinit(testing.allocator);
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -3720,6 +4320,72 @@ test "handleRenameTab validates pty validity and updates title" {
     defer missing.deinit(testing.allocator);
     try testing.expect(missing == .string);
     try testing.expectEqualStrings("PTY not found", missing.string);
+}
+
+test "parseBreakPaneParams - valid params" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 42 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+    const parsed = try Server.parseBreakPaneParams(.{ .map = &params });
+    try testing.expectEqual(@as(u32, 42), parsed.pty_id);
+    try testing.expectEqual(true, parsed.focus);
+
+    // pty_id can also arrive as a positive integer
+    var int_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .integer = 7 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
+    };
+    const int_parsed = try Server.parseBreakPaneParams(.{ .map = &int_params });
+    try testing.expectEqual(@as(u32, 7), int_parsed.pty_id);
+    try testing.expectEqual(false, int_parsed.focus);
+}
+
+test "parseBreakPaneParams - missing pty_id" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - missing focus" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 1 } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - wrong type for focus" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 1 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .string = "true" } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - wrong type for pty_id" {
+    const testing = std.testing;
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .string = "1" } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .map = &params }));
+}
+
+test "parseBreakPaneParams - non-map root" {
+    const testing = std.testing;
+
+    var arr = [_]msgpack.Value{ .{ .unsigned = 1 }, .{ .boolean = true } };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneParams(.{ .array = &arr }));
 }
 
 test "parseAttachPtyParams" {
@@ -3924,6 +4590,942 @@ test "style optimization" {
     try testing.expect(found_row1);
 }
 
+// Test helper: decode the most recent Response sent on `fd` (if any)
+// from the mock Loop's pending send queue. Returns null when no send
+// is queued. Caller owns the returned message and must deinit.
+fn findPendingSendOnFd(allocator: std.mem.Allocator, loop: *io.Loop, fd: posix.fd_t) !?rpc.Message {
+    var it = loop.pending.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.kind == .send and entry.value_ptr.fd == fd) {
+            return try rpc.decodeMessage(allocator, entry.value_ptr.buf);
+        }
+    }
+    return null;
+}
+
+test "parseBreakPaneReplyParams - happy paths and edge cases" {
+    const testing = std.testing;
+
+    var ok_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 5 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    const ok_parsed = try Server.parseBreakPaneReplyParams(.{ .map = &ok_params });
+    try testing.expectEqual(@as(usize, 5), ok_parsed.request_id);
+    try testing.expectEqual(true, ok_parsed.ok);
+    try testing.expectEqual(@as(?[]const u8, null), ok_parsed.reason);
+
+    var refuse_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 5 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = false } },
+        .{ .key = .{ .string = "reason" }, .value = .{ .string = "solo_pane" } },
+    };
+    const refuse_parsed = try Server.parseBreakPaneReplyParams(.{ .map = &refuse_params });
+    try testing.expectEqual(false, refuse_parsed.ok);
+    try testing.expectEqualStrings("solo_pane", refuse_parsed.reason.?);
+
+    var no_id = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneReplyParams(.{ .map = &no_id }));
+
+    var no_ok = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 1 } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneReplyParams(.{ .map = &no_ok }));
+
+    var bad_ok = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 1 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .string = "true" } },
+    };
+    try testing.expectError(error.MalformedParams, Server.parseBreakPaneReplyParams(.{ .map = &bad_ok }));
+}
+
+test "handleBreakPaneReply - non-ok refusal sends Response with reason" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pre-populate a pending entry as if handleBreakPane wrote it.
+    try server.pending.put(0, .{
+        .cli_msgid = 77,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 2000,
+        .pty_id = 7,
+        .focus = false,
+    });
+
+    // Build the broker's reply notification payload.
+    var reply_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = false } },
+        .{ .key = .{ .string = "reason" }, .value = .{ .string = "solo_pane" } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+
+    // Pending dropped, Response queued to CLI fd.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 77), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var got_ok = false;
+    var got_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expect(kv.value.boolean == false);
+            got_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("solo_pane", kv.value.string);
+            got_reason = true;
+        }
+    }
+    try testing.expect(got_ok);
+    try testing.expect(got_reason);
+}
+
+test "handleBreakPaneReply - unknown request_id silently dropped" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Spurious reply for a request_id that was never registered.
+    var reply_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 999 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+
+    // No pending entries created; no spurious sends queued.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+    var any_send = false;
+    var it = loop.pending.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.kind == .send) any_send = true;
+    }
+    try testing.expect(!any_send);
+}
+
+test "handleBreakPaneReply - malformed payload silently dropped" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Missing `ok` field — handler must not panic, must not send.
+    var bad = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &bad } });
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+}
+
+test "handleBreakPaneReply - ok path broadcasts to non-broker attached clients" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Three attached clients: id=1 (broker, fd=201), id=2 (fd=202), id=3 (fd=203).
+    const ids = [_]usize{ 1, 2, 3 };
+    for (ids) |client_id| {
+        const c = try allocator.create(Client);
+        c.* = .{
+            .fd = @intCast(200 + @as(i32, @intCast(client_id))),
+            .id = client_id,
+            .server = &server,
+            .msg_buffer = std.ArrayList(u8).empty,
+            .send_queue = std.ArrayList([]u8).empty,
+            .attached_ptys = std.ArrayList(usize).empty,
+        };
+        try c.attached_ptys.append(allocator, 5);
+        try server.clients.append(allocator, c);
+    }
+
+    // CLI client (originator), unattached (acts as the requester).
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pre-populate a pending entry as if `handleBreakPane` wrote it,
+    // pointing at broker id=1 with pty_id=5, focus=true.
+    try server.pending.put(0, .{
+        .cli_msgid = 77,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 2000,
+        .pty_id = 5,
+        .focus = true,
+    });
+
+    // Broker fires ok=true reply for request_id=0.
+    var reply_params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 0 } },
+        .{ .key = .{ .string = "ok" }, .value = .{ .boolean = true } },
+    };
+    try server.handleBreakPaneReply(.{ .method = "break_pane_reply", .params = .{ .map = &reply_params } });
+
+    // Pending dropped, CLI got its ok=true Response.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+    const cli_msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(cli_msg_opt != null);
+    const cli_msg = cli_msg_opt.?;
+    defer cli_msg.deinit(allocator);
+    try testing.expect(cli_msg == .response);
+
+    // Sibling clients (id=2 fd=202, id=3 fd=203) each got a
+    // break_pane_applied Notification.
+    for ([_]posix.fd_t{ 202, 203 }) |sibling_fd| {
+        const sibling_msg_opt = try findPendingSendOnFd(allocator, &loop, sibling_fd);
+        try testing.expect(sibling_msg_opt != null);
+        const sibling_msg = sibling_msg_opt.?;
+        defer sibling_msg.deinit(allocator);
+        try testing.expect(sibling_msg == .notification);
+        try testing.expectEqualStrings("break_pane_applied", sibling_msg.notification.method);
+
+        var saw_pty_id = false;
+        var saw_focus = false;
+        try testing.expect(sibling_msg.notification.params == .map);
+        for (sibling_msg.notification.params.map) |kv| {
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                try testing.expectEqual(@as(u64, 5), kv.value.unsigned);
+                saw_pty_id = true;
+            } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+                try testing.expectEqual(true, kv.value.boolean);
+                saw_focus = true;
+            }
+        }
+        try testing.expect(saw_pty_id);
+        try testing.expect(saw_focus);
+    }
+
+    // Broker (id=1, fd=201) MUST NOT receive break_pane_applied.
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 201)) == null);
+}
+
+test "sweepPending - expired entries reply broker_timeout and drop" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 400,
+        .id = 7,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // One expired entry (deadline already past), one fresh entry that
+    // should survive the sweep.
+    try server.pending.put(0, .{
+        .cli_msgid = 11,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() - 1000,
+        .pty_id = 5,
+        .focus = false,
+    });
+    try server.pending.put(1, .{
+        .cli_msgid = 12,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 6,
+        .focus = false,
+    });
+
+    server.sweepPending();
+
+    // Expired entry dropped, fresh entry retained.
+    try testing.expectEqual(@as(usize, 1), server.pending.count());
+    try testing.expect(server.pending.get(0) == null);
+    try testing.expect(server.pending.get(1) != null);
+
+    // CLI received a broker_timeout Response for cli_msgid=11.
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 400);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 11), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var saw_ok = false;
+    var saw_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expectEqual(false, kv.value.boolean);
+            saw_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("broker_timeout", kv.value.string);
+            saw_reason = true;
+        }
+    }
+    try testing.expect(saw_ok);
+    try testing.expect(saw_reason);
+}
+
+test "removeClient - broker disconnect replies broker_timeout to CLI" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+        .exit_on_idle = false,
+    };
+    defer {
+        // Survivors only — `removeClient` already tore down the broker.
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Broker (id=1) and an unrelated CLI client (id=99).
+    const broker = try allocator.create(Client);
+    broker.* = .{
+        .fd = 201,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, broker);
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    // Pending entry: broker_id=1, cli_client=cli — broker is the one
+    // about to disappear. Deadline is far in the future to prove the
+    // sweep is purely disconnect-driven, not deadline-driven.
+    try server.pending.put(0, .{
+        .cli_msgid = 55,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 9,
+        .focus = false,
+    });
+
+    server.removeClient(broker);
+
+    // Pending entry dropped.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+
+    // CLI received a broker_timeout Response.
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 300);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 55), msg.response.msgid);
+    try testing.expect(msg.response.result == .map);
+
+    var saw_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expectEqual(false, kv.value.boolean);
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("broker_timeout", kv.value.string);
+            saw_reason = true;
+        }
+    }
+    try testing.expect(saw_reason);
+}
+
+test "drainPendingForShutdown - replies broker_timeout to all and clears" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+        .exit_on_idle = false,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Two distinct CLI clients with two pending broker-RPC entries.
+    const cli_a = try allocator.create(Client);
+    cli_a.* = .{
+        .fd = 401,
+        .id = 11,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli_a);
+
+    const cli_b = try allocator.create(Client);
+    cli_b.* = .{
+        .fd = 402,
+        .id = 12,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli_b);
+
+    try server.pending.put(0, .{
+        .cli_msgid = 71,
+        .cli_client = cli_a,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 5,
+        .focus = false,
+    });
+    try server.pending.put(1, .{
+        .cli_msgid = 72,
+        .cli_client = cli_b,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 6,
+        .focus = false,
+    });
+
+    server.drainPendingForShutdown();
+
+    // Pending fully cleared; both CLIs got broker_timeout Responses.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+
+    for ([_]struct { fd: posix.fd_t, msgid: u32 }{
+        .{ .fd = 401, .msgid = 71 },
+        .{ .fd = 402, .msgid = 72 },
+    }) |expect| {
+        const msg_opt = try findPendingSendOnFd(allocator, &loop, expect.fd);
+        try testing.expect(msg_opt != null);
+        const msg = msg_opt.?;
+        defer msg.deinit(allocator);
+        try testing.expect(msg == .response);
+        try testing.expectEqual(expect.msgid, msg.response.msgid);
+
+        var saw_reason = false;
+        for (msg.response.result.map) |kv| {
+            if (std.mem.eql(u8, kv.key.string, "ok")) {
+                try testing.expectEqual(false, kv.value.boolean);
+            } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+                try testing.expectEqualStrings("broker_timeout", kv.value.string);
+                saw_reason = true;
+            }
+        }
+        try testing.expect(saw_reason);
+    }
+
+    // Idempotent: a second drain on an empty map is a no-op.
+    server.drainPendingForShutdown();
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+}
+
+test "removeClient - cli disconnect drops pending without reply" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+        .exit_on_idle = false,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // CLI (id=99) and a separate broker that survives (id=1).
+    const broker = try allocator.create(Client);
+    broker.* = .{
+        .fd = 201,
+        .id = 1,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, broker);
+
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 300,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    try server.pending.put(0, .{
+        .cli_msgid = 56,
+        .cli_client = cli,
+        .broker_id = 1,
+        .deadline_ts = std.time.milliTimestamp() + 60_000,
+        .pty_id = 9,
+        .focus = false,
+    });
+
+    // Capture pending-send fds BEFORE removeClient so we can prove no
+    // spurious sends were queued by the sweep. cancelByFd will drop
+    // any send queued to the CLI's own fd, which we don't want here.
+    const before_count = blk: {
+        var n: usize = 0;
+        var it = loop.pending.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.kind == .send) n += 1;
+        }
+        break :blk n;
+    };
+
+    server.removeClient(cli);
+
+    // Pending entry dropped.
+    try testing.expectEqual(@as(usize, 0), server.pending.count());
+
+    // No new send queued anywhere (the CLI socket is gone, so no
+    // Response is attempted; the broker is unrelated to this entry).
+    const after_count = blk: {
+        var n: usize = 0;
+        var it = loop.pending.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.kind == .send) n += 1;
+        }
+        break :blk n;
+    };
+    try testing.expectEqual(before_count, after_count);
+}
+
+test "handleBreakPane - zero attached clients sends synchronous session_not_attached" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // CLI client with NO attached PTYs.
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 200,
+        .id = 0,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 1 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
+    };
+    try server.handleBreakPane(cli, 42, .{ .map = &params });
+
+    // Synchronous Response queued; pending stays empty.
+    try testing.expectEqual(@as(u32, 0), @as(u32, @intCast(server.pending.count())));
+
+    const msg_opt = try findPendingSendOnFd(allocator, &loop, 200);
+    try testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(allocator);
+
+    try testing.expect(msg == .response);
+    try testing.expectEqual(@as(u32, 42), msg.response.msgid);
+    try testing.expect(msg.response.err == null);
+    try testing.expect(msg.response.result == .map);
+
+    var got_ok = false;
+    var got_reason = false;
+    for (msg.response.result.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "ok")) {
+            try testing.expect(kv.value.boolean == false);
+            got_ok = true;
+        } else if (std.mem.eql(u8, kv.key.string, "reason")) {
+            try testing.expectEqualStrings("session_not_attached", kv.value.string);
+            got_reason = true;
+        }
+    }
+    try testing.expect(got_ok);
+    try testing.expect(got_reason);
+}
+
+test "handleBreakPane - broker-pick is lowest Client.id among attached" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .signal_pipe_fds = undefined,
+    };
+    defer {
+        for (server.clients.items) |c| {
+            if (c.send_buffer) |buf| allocator.free(buf);
+            for (c.send_queue.items) |buf| allocator.free(buf);
+            c.send_queue.deinit(allocator);
+            c.attached_ptys.deinit(allocator);
+            c.msg_buffer.deinit(allocator);
+            allocator.destroy(c);
+        }
+        server.clients.deinit(allocator);
+        server.ptys.deinit();
+        server.pending.deinit();
+    }
+
+    // Three attached clients with ids 1, 2, 3 (registered out of insert
+    // order to verify the comparator looks at id, not insert order).
+    const ids = [_]usize{ 3, 1, 2 };
+    for (ids) |client_id| {
+        const c = try allocator.create(Client);
+        c.* = .{
+            .fd = @intCast(200 + @as(i32, @intCast(client_id))),
+            .id = client_id,
+            .server = &server,
+            .msg_buffer = std.ArrayList(u8).empty,
+            .send_queue = std.ArrayList([]u8).empty,
+            .attached_ptys = std.ArrayList(usize).empty,
+        };
+        try c.attached_ptys.append(allocator, 7);
+        try server.clients.append(allocator, c);
+    }
+
+    // Add a CLI client with no attachment so it's never the broker.
+    const cli = try allocator.create(Client);
+    cli.* = .{
+        .fd = 999,
+        .id = 99,
+        .server = &server,
+        .msg_buffer = std.ArrayList(u8).empty,
+        .send_queue = std.ArrayList([]u8).empty,
+        .attached_ptys = std.ArrayList(usize).empty,
+    };
+    try server.clients.append(allocator, cli);
+
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
+        .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
+    };
+
+    try server.handleBreakPane(cli, 1, .{ .map = &params });
+
+    try testing.expectEqual(@as(usize, 1), server.pending.count());
+    try testing.expectEqual(@as(usize, 1), server.next_request_id);
+
+    const entry_v0 = server.pending.get(0) orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expectEqual(@as(usize, 1), entry_v0.broker_id);
+    try testing.expectEqual(@as(u32, 7), entry_v0.pty_id);
+    try testing.expectEqual(false, entry_v0.focus);
+    try testing.expectEqual(@as(u32, 1), entry_v0.cli_msgid);
+    try testing.expect(entry_v0.cli_client == cli);
+
+    // The broker (id=1, fd=201) should have received exactly one
+    // break_pane_request notification — no other client should see one.
+    const broker1_msg_opt = try findPendingSendOnFd(allocator, &loop, 201);
+    try testing.expect(broker1_msg_opt != null);
+    const broker1_msg = broker1_msg_opt.?;
+    defer broker1_msg.deinit(allocator);
+    try testing.expect(broker1_msg == .notification);
+    try testing.expectEqualStrings("break_pane_request", broker1_msg.notification.method);
+    try testing.expect(broker1_msg.notification.params == .map);
+    var saw_pty_id = false;
+    var saw_focus = false;
+    var saw_request_id = false;
+    for (broker1_msg.notification.params.map) |kv| {
+        if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+            try testing.expectEqual(@as(u64, 7), kv.value.unsigned);
+            saw_pty_id = true;
+        } else if (std.mem.eql(u8, kv.key.string, "focus")) {
+            try testing.expectEqual(false, kv.value.boolean);
+            saw_focus = true;
+        } else if (std.mem.eql(u8, kv.key.string, "request_id")) {
+            try testing.expectEqual(@as(u64, 0), kv.value.unsigned);
+            saw_request_id = true;
+        }
+    }
+    try testing.expect(saw_pty_id);
+    try testing.expect(saw_focus);
+    try testing.expect(saw_request_id);
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 202)) == null);
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 203)) == null);
+    try testing.expect((try findPendingSendOnFd(allocator, &loop, 999)) == null);
+
+    // Detach client 1 and re-fire — broker should become id 2.
+    // (Mutating attached_ptys directly bypasses the detach RPC to keep
+    // the test focused on broker selection.)
+    for (server.clients.items) |c| {
+        if (c.id == 1) {
+            c.attached_ptys.clearRetainingCapacity();
+            break;
+        }
+    }
+
+    try server.handleBreakPane(cli, 2, .{ .map = &params });
+
+    try testing.expectEqual(@as(usize, 2), server.pending.count());
+    try testing.expectEqual(@as(usize, 2), server.next_request_id);
+
+    const entry_v1 = server.pending.get(1) orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expectEqual(@as(usize, 2), entry_v1.broker_id);
+
+    // Broker now id=2 (fd=202) — verify a notification went there.
+    const broker2_msg_opt = try findPendingSendOnFd(allocator, &loop, 202);
+    try testing.expect(broker2_msg_opt != null);
+    const broker2_msg = broker2_msg_opt.?;
+    defer broker2_msg.deinit(allocator);
+    try testing.expect(broker2_msg == .notification);
+    try testing.expectEqualStrings("break_pane_request", broker2_msg.notification.method);
+}
+
 test "server - pty exit notification" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -3938,6 +5540,7 @@ test "server - pty exit notification" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -3952,6 +5555,7 @@ test "server - pty exit notification" {
         server.clients.deinit(allocator);
         // PTY is now cleaned up by onPtyDirty when it exits, so just deinit the map
         server.ptys.deinit();
+        server.pending.deinit();
     }
 
     // Add a client

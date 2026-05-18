@@ -360,6 +360,9 @@ Splitting a zoomed pane exits zoom first so the new pane is visible immediately.
 
 Zoom state is remembered per tab and restored when you switch back to that tab.
 
+**break_pane**
+:   Break the focused pane out of its tab into a new tab in the same session. No-op when focused pane is alone in its tab. Same-session only.
+
 ## Focus Navigation
 
 **focus_left**
