@@ -299,10 +299,7 @@ assert(no_cwd_ret == false, "break_pane_to_session no-cwd: returns false when cw
 assert(#remove_calls == 0, "break_pane_to_session no-cwd: remove NOT called when cwd missing (avoid orphan)")
 assert(#place_calls == 0, "break_pane_to_session no-cwd: place NOT called when cwd missing")
 assert(#warn_calls == 1, "break_pane_to_session no-cwd: warn logged")
-assert(
-    warn_calls[1]:find("missing cwd", 1, true),
-    "break_pane_to_session no-cwd: warn mentions missing cwd"
-)
+assert(warn_calls[1]:find("missing cwd", 1, true), "break_pane_to_session no-cwd: warn mentions missing cwd")
 
 -- === break_pane_to_session: back-compat — absent source_session falls through ===
 -- When source_session is not provided and the pane is not in viewer state,

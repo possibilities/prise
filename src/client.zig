@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const vaxis = @import("vaxis");
+const crash_context = @import("crash_context.zig");
 const io = @import("io.zig");
 const lua_event = @import("lua_event.zig");
 const msgpack = @import("msgpack.zig");
@@ -339,6 +340,7 @@ pub const ClientLogic = struct {
                         std.mem.eql(u8, err_val.string, "PTY not found")))
                 {
                     log.info("PTY {} not found, spawning new PTY with cwd", .{attach_info.pty_id});
+                    crash_context.record("attach fallback spawn old_pty_id={d}", .{attach_info.pty_id});
                     return .{ .spawn_pty_with_cwd = .{
                         .cwd = attach_info.cwd,
                         .old_pty_id = @intCast(attach_info.pty_id),
@@ -363,30 +365,30 @@ pub const ClientLogic = struct {
             return switch (entry.value) {
                 .spawn => |spawn_info| handleSpawnResult(state, result, spawn_info.cwd, spawn_info.old_pty_id),
                 .attach => |attach_info| {
-                    // Successful attach returns a PTY ID (unsigned or non-negative integer).
-                    // Guard against string or other non-integer results that would indicate
+                    // Successful attach returns a map {pty_id, cwd}. Guard
+                    // against string or other unexpected results indicating
                     // a server-side error leaked as a result value.
-                    if (result != .unsigned and !(result == .integer and result.integer >= 0)) {
+                    if (result != .map) {
                         log.warn("attach failed for PTY {}: unexpected result {}", .{ attach_info.pty_id, result });
                         return .{ .spawn_pty_with_cwd = .{ .cwd = attach_info.cwd } };
                     }
                     state.pty_id = attach_info.pty_id;
                     state.attached = true;
+                    crash_context.setCurrentPty(@intCast(attach_info.pty_id));
+                    crash_context.record("attached existing pty_id={d}", .{attach_info.pty_id});
                     // Server returns a map with pty_id and cwd; prefer the
                     // server's live cwd over the client-side attach_info.cwd
                     // (only populated on session restore).
                     var server_cwd: ?[]const u8 = null;
-                    if (result == .map) {
-                        for (result.map) |kv| {
-                            if (kv.key != .string) continue;
-                            if (std.mem.eql(u8, kv.key.string, "cwd") and kv.value == .string) {
-                                server_cwd = kv.value.string;
-                            }
+                    for (result.map) |kv| {
+                        if (kv.key != .string) continue;
+                        if (std.mem.eql(u8, kv.key.string, "cwd") and kv.value == .string) {
+                            server_cwd = kv.value.string;
                         }
                     }
-                    const effective_cwd = server_cwd orelse attach_info.cwd;
+                    const effective_cwd = nonEmptyCwd(server_cwd) orelse nonEmptyCwd(attach_info.cwd);
                     var cwd_for_event: ?[]const u8 = null;
-                    if (nonEmptyCwd(effective_cwd)) |c| {
+                    if (effective_cwd) |c| {
                         const owned_cwd = state.allocator.dupe(u8, c) catch return .{ .attached = .{ .new_pty_id = attach_info.pty_id } };
                         state.cwd_map.put(attach_info.pty_id, owned_cwd) catch {
                             state.allocator.free(owned_cwd);
@@ -429,6 +431,8 @@ pub const ClientLogic = struct {
                     else => continue,
                 };
                 state.pty_validity = validity;
+                crash_context.setPtyValidity(validity);
+                crash_context.record("server info pty_validity={d}", .{validity});
                 log.info("Got pty_validity: {}", .{validity});
                 return .{ .server_info = .{ .pty_validity = validity } };
             }
@@ -446,6 +450,8 @@ pub const ClientLogic = struct {
         if (id >= 0) {
             state.pty_id = id;
             state.attached = true;
+            crash_context.setCurrentPty(@intCast(id));
+            crash_context.record("attached pty_id={d} old_pty_id={?}", .{ id, old_pty_id });
             if (nonEmptyCwd(cwd)) |c| {
                 const owned_cwd = state.allocator.dupe(u8, c) catch return .{ .attached = .{ .new_pty_id = id, .old_pty_id = old_pty_id } };
                 state.cwd_map.put(id, owned_cwd) catch {
@@ -2579,6 +2585,7 @@ pub const App = struct {
                 app.fd = fd;
                 app.connected = true;
                 log.info("Connected! fd={}", .{app.fd});
+                crash_context.record("client connected fd={d}", .{app.fd});
 
                 if (!app.state.should_quit) {
                     // Start receiving from the server
@@ -2597,8 +2604,10 @@ pub const App = struct {
             .err => |err| {
                 if (err == error.ConnectionRefused) {
                     app.state.connection_refused = true;
+                    crash_context.record("client connection refused", .{});
                 } else {
                     log.err("Connection failed: {}", .{err});
+                    crash_context.record("client connection failed: {s}", .{@errorName(err)});
                 }
             },
             else => unreachable,
@@ -2661,6 +2670,7 @@ pub const App = struct {
         // The tab bar stays on whatever set_tab_shell last painted — callers
         // see the failure in the log and decide whether to retry.
         log.err("Session switch cancelled: {s}", .{reason});
+        crash_context.record("session switch cancelled: {s}", .{reason});
         self.finishSessionSwitch();
     }
 
@@ -2668,6 +2678,7 @@ pub const App = struct {
     /// When all requests have completed (success or failure), finish the
     /// restore so session_switch_in_progress doesn't stay true forever.
     fn handleRestoreAttachFailure(self: *App) void {
+        crash_context.record("session restore attach failed", .{});
         const plan = if (self.prepared_restore_plan) |*value| value else return;
         if (plan.remaining_attach_count == 0) return;
         plan.remaining_attach_count -= 1;
@@ -2797,6 +2808,8 @@ pub const App = struct {
         if (self.attach_session) |session_name| {
             // Use the attached session name
             log.info("Setting current_session_name to: {s}", .{session_name});
+            crash_context.setSessionName(session_name);
+            crash_context.record("attach session {s}", .{session_name});
             try self.setCurrentSessionName(session_name);
             var plan = try self.preflightSessionRestore(session_name);
             var plan_stored = false;
@@ -2808,11 +2821,15 @@ pub const App = struct {
         } else if (self.new_session_name) |name| {
             // User specified a name for new session
             try self.setCurrentSessionName(name);
+            crash_context.setSessionName(name);
+            crash_context.record("new session {s}", .{name});
             log.info("Starting new session with user-specified name: {s}", .{name});
             try self.spawnInitialPty();
         } else {
             // Generate a new session name for fresh launch
             self.current_session_name = try self.ui.getNextSessionName();
+            crash_context.setSessionName(self.current_session_name.?);
+            crash_context.record("generated session {s}", .{self.current_session_name.?});
             log.info("Starting new session: {s}", .{self.current_session_name.?});
             try self.spawnInitialPty();
         }
@@ -2954,10 +2971,12 @@ pub const App = struct {
         plan.remaining_attach_count = plan.pty_ids.len;
 
         log.info("Attaching to {} PTYs from session {s}", .{ plan.pty_ids.len, plan.session_name });
+        crash_context.record("session restore attaching count={d}", .{plan.pty_ids.len});
         for (plan.pty_ids) |pty_id| {
             const cwd = nonEmptyCwd(plan.pty_id_cwd.get(pty_id));
 
             if (!plan.validity_matches) {
+                crash_context.record("session restore spawn fallback", .{});
                 const msgid = self.state.next_msgid;
                 self.state.next_msgid += 1;
                 try self.state.pending_requests.put(msgid, .{ .spawn = .{ .cwd = cwd, .old_pty_id = pty_id } });
@@ -2998,6 +3017,7 @@ pub const App = struct {
         errdefer self.cancelSessionSwitch("restore completion failed");
 
         log.info("All PTYs attached, restoring session state", .{});
+        crash_context.record("session restore complete", .{});
         if (self.prepared_restore_plan) |plan| {
             try self.ui.setStateFromJson(plan.session_json, ptyLookup, self);
         }
@@ -3697,6 +3717,21 @@ pub const App = struct {
         return self.state.cwd_map.get(id);
     }
 
+    pub fn writeCrashBundle(self: *App, reason: []const u8) void {
+        if (self.current_session_name) |name|
+            crash_context.setSessionName(name);
+        crash_context.setPtyValidity(self.state.pty_validity);
+        if (self.state.pty_id) |pty_id| {
+            if (pty_id >= 0) crash_context.setCurrentPty(@intCast(pty_id));
+        }
+        const json = self.ui.getStateJson(&cwdLookup, self) catch {
+            crash_context.writeBundle(reason, null, null);
+            return;
+        };
+        defer self.allocator.free(json);
+        crash_context.writeBundle(reason, json, null);
+    }
+
     pub fn requestCopySelection(self: *App, pty_id: u32) !void {
         const msgid = self.state.next_msgid;
         self.state.next_msgid += 1;
@@ -3909,6 +3944,7 @@ pub const App = struct {
         self.prepared_restore_plan = plan;
         plan_stored = true;
         self.session_switch_in_progress = true;
+        crash_context.record("session switch to {s}", .{target_session});
         var pre_detach_phase = true;
         errdefer {
             if (pre_detach_phase and self.session_switch_in_progress) {
@@ -4578,7 +4614,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
             .{ .key = .{ .string = "request_id" }, .value = .{ .unsigned = 42 } },
@@ -4606,7 +4642,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 7 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .boolean = true } },
         };
@@ -4627,7 +4663,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 11 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .boolean = false } },
         };
@@ -4654,7 +4690,7 @@ test "ClientLogic - processServerMessage" {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
 
-        const map_items = [_]msgpack.Value.KeyValue{
+        var map_items = [_]msgpack.Value.KeyValue{
             .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = 11 } },
             .{ .key = .{ .string = "focus" }, .value = .{ .unsigned = 1 } },
         };
