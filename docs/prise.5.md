@@ -598,6 +598,11 @@ The **data** table uses the same fields as PTY mouse events:
 - **action** - Optional mouse action such as press, release, or move
 - **ctrl**, **alt**, **shift** - Optional modifier flags
 
+**ui.execute_action(name)**
+:   Execute a built-in action by its string name. This is useful when custom
+    Lua code needs to trigger the same action handlers used by keybinds and the
+    command palette.
+
 Example:
 
 ```lua
@@ -611,6 +616,8 @@ if tab then
         tab.index, tab.title, pane_idx or 0, tab.pane_count,
         tostring(pane_id)))
 end
+
+ui.execute_action("close_tab")
 ```
 
 # SEE ALSO
