@@ -76,8 +76,21 @@ pub const UI = struct {
     exit_ctx: *anyopaque = undefined,
     spawn_callback: ?*const fn (ctx: *anyopaque, opts: SpawnOptions) anyerror!void = null,
     spawn_ctx: *anyopaque = undefined,
-    redraw_callback: ?*const fn (ctx: *anyopaque) void = null,
-    redraw_ctx: *anyopaque = undefined,
+    /// Called by the requestFrame Lua binding (`prise.request_frame()`) to
+    /// queue a render. The app-side implementation sets a pending flag that
+    /// is drained from the event-loop tick, outside any outer ui.update
+    /// pcall frame.
+    ///
+    /// Render must not fire synchronously from this callback: the binding is
+    /// reached from tiling.lua's tiling-update handlers (rename_tab,
+    /// break_pane, and most dispatch types) running inside the outer
+    /// ui.update pcall. `App.scheduleRender` calls `render()` synchronously
+    /// past its 8 ms throttle, which walks the widget tree off that Lua
+    /// stack — if any widget is mid-teardown (session just switched,
+    /// overlay orphaned, TextInputWidget.vaxis_input freed) we read poison
+    /// bytes and segfault.
+    queue_frame_request_callback: ?*const fn (ctx: *anyopaque) void = null,
+    queue_frame_request_ctx: *anyopaque = undefined,
     detach_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
     detach_ctx: *anyopaque = undefined,
     save_callback: ?*const fn (ctx: *anyopaque) void = null,
@@ -252,9 +265,9 @@ pub const UI = struct {
         self.spawn_callback = cb;
     }
 
-    pub fn setRedrawCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
-        self.redraw_ctx = ctx;
-        self.redraw_callback = cb;
+    pub fn setQueueFrameRequestCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
+        self.queue_frame_request_ctx = ctx;
+        self.queue_frame_request_callback = cb;
     }
 
     pub fn setDetachCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void) void {
@@ -629,8 +642,17 @@ pub const UI = struct {
         };
         lua.pop(1); // pop ui ptr
 
-        if (ui.redraw_callback) |cb| {
-            cb(ui.redraw_ctx);
+        // Queue the render via the deferred callback rather than invoking it
+        // synchronously. This binding is reached from tiling.lua's
+        // tiling-update handlers (rename_tab, break_pane, and most dispatch
+        // types) running inside the outer ui.update pcall — a synchronous
+        // render from here walks the widget tree off that Lua stack, and if
+        // any widget is mid-teardown (session just switched, overlay
+        // orphaned, TextInputWidget.vaxis_input freed) we read poison bytes
+        // and segfault. The callback stashes a flag that is drained from
+        // the event-loop tick, after the pcall has returned.
+        if (ui.queue_frame_request_callback) |cb| {
+            cb(ui.queue_frame_request_ctx);
         }
         return 0;
     }
@@ -1915,4 +1937,39 @@ test "cell_substring: combining marks travel with their base" {
     // for the whole cluster. Window [0, 1) must emit both bytes, not just 'a'.
     const nfd_a_acute = "a\u{0301}";
     try expectCellSubstring(nfd_a_acute, nfd_a_acute, 0, 1);
+}
+
+test "requestFrame defers to queue callback (no synchronous render re-entry)" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const lua = try ziglua.Lua.init(allocator);
+    defer lua.deinit();
+
+    var local_tz = try zeit.local(allocator, null);
+    defer local_tz.deinit();
+
+    var ui: UI = .{
+        .allocator = allocator,
+        .lua = lua,
+        .local_tz = local_tz,
+        .text_inputs = std.AutoHashMap(u32, *TextInput).init(allocator),
+    };
+    defer ui.text_inputs.deinit();
+
+    lua.pushLightUserdata(&ui);
+    lua.setField(ziglua.registry_index, "prise_ui_ptr");
+
+    var queue_calls: u32 = 0;
+    ui.setQueueFrameRequestCallback(&queue_calls, struct {
+        fn cb(ctx: *anyopaque) void {
+            const count: *u32 = @ptrCast(@alignCast(ctx));
+            count.* += 1;
+        }
+    }.cb);
+
+    _ = UI.requestFrame(lua);
+    _ = UI.requestFrame(lua);
+
+    try testing.expectEqual(@as(u32, 2), queue_calls);
 }
