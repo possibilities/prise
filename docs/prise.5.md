@@ -525,6 +525,28 @@ call directly.
     to reference the focused pane by its actual identifier rather than by
     position within a tab.
 
+**ui.send_key_to_focused(data)**
+:   Send a key event to the focused pane, or to the visible floating pane when
+    one is open.
+
+The **data** table uses the same fields as PTY key events:
+
+- **key** - Key text to send
+- **code** - Optional key code name
+- **ctrl**, **alt**, **shift**, **super** - Optional modifier flags
+- **release** - Optional key release flag
+
+**ui.send_mouse_to_focused(data)**
+:   Send a mouse event to the focused pane, or to the visible floating pane
+    when one is open.
+
+The **data** table uses the same fields as PTY mouse events:
+
+- **col**, **row** - Optional pane-relative coordinates
+- **button** - Optional mouse button name
+- **action** - Optional mouse action such as press, release, or move
+- **ctrl**, **alt**, **shift** - Optional modifier flags
+
 Example:
 
 ```lua
