@@ -4824,21 +4824,19 @@ function M.update(event)
         local data = event.data
         prise.log.info("Lua: pty_spawned " .. data.id)
 
-        -- Cross-session placement: switch to target session, or create it if absent.
+        -- Cross-session placement: silent — write the PTY into the target
+        -- session's saved-state file without switching the viewer. The target
+        -- session's file is created if absent (handled by place_pty_in_session
+        -- via writeNewSessionFile). Programmatic spawns must not steal focus.
         if data.session then
             local current = prise.get_session_name()
             if current ~= data.session then
-                if not prise.switch_session(data.session) then
-                    -- Session doesn't exist — hand off to create_session; the new
-                    -- session's event loop will receive the PTY on attachment.
-                    prise.create_session(data.session)
-                    return
-                end
                 local ok = prise.place_pty_in_session(data.session, data.id, data.cwd, data.title)
                 if ok then
                     prise.log.info("Placed PTY " .. data.id .. " in session " .. data.session)
+                else
+                    prise.log.warn("pty_spawned: place failed for pty=" .. data.id .. " session=" .. data.session)
                 end
-                prise.request_frame()
                 return
             end
         end
@@ -4849,7 +4847,9 @@ function M.update(event)
             if data.tab and data.tab ~= "new" then
                 local idx = find_tab_by_title(data.tab)
                 if idx then
-                    set_active_tab_index(idx)
+                    if data.focus == true then
+                        set_active_tab_index(idx)
+                    end
                     new_tab = false
                 end
             end
