@@ -2259,6 +2259,96 @@ local function move_focus(direction, wrap)
     end
 end
 
+---Find the leaf in `direction` from the focused pane, or nil when there
+---is nowhere to go (single pane, or at the layout edge). Walks the same
+---path as move_focus but returns the target leaf instead of mutating
+---focus state, so it's reusable for any operation that needs a
+---directional neighbor.
+---@param direction "left"|"right"|"up"|"down"
+---@return Pane?
+local function find_directional_leaf(direction)
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return nil
+    end
+
+    local path = find_node_path(root, state.focused_id)
+    if not path then
+        return nil
+    end
+
+    local target_split_type = (direction == "left" or direction == "right") and "row" or "col"
+    local forward = (direction == "right" or direction == "down")
+
+    local sibling_node = nil
+
+    for i = #path - 1, 1, -1 do
+        local node = path[i]
+        local child = path[i + 1]
+
+        if node.type == "split" and node.direction == target_split_type then
+            local idx = 0
+            for k, c in ipairs(node.children) do
+                if c == child then
+                    idx = k
+                    break
+                end
+            end
+
+            if forward then
+                if idx < #node.children then
+                    sibling_node = node.children[idx + 1]
+                    break
+                end
+            else
+                if idx > 1 then
+                    sibling_node = node.children[idx - 1]
+                    break
+                end
+            end
+        end
+    end
+
+    if not sibling_node then
+        return nil
+    end
+
+    if forward then
+        return get_first_leaf(sibling_node)
+    else
+        return get_last_leaf(sibling_node)
+    end
+end
+
+---Swap the focused pane's content with the directional neighbor. The
+---two leaves trade `(id, pty)` so focus follows content: state.focused_id
+---is unchanged, but the leaf carrying that id now sits in the neighbor's
+---former position. Per-position state on the leaf (`ratio`) stays put.
+---@param direction "left"|"right"|"up"|"down"
+local function swap_pane(direction)
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return
+    end
+
+    local source_path = find_node_path(root, state.focused_id)
+    if not source_path then
+        return
+    end
+    local source_leaf = source_path[#source_path]
+
+    local target_leaf = find_directional_leaf(direction)
+    if not target_leaf or target_leaf.id == source_leaf.id then
+        return
+    end
+
+    source_leaf.id, target_leaf.id = target_leaf.id, source_leaf.id
+    source_leaf.pty, target_leaf.pty = target_leaf.pty, source_leaf.pty
+
+    prise.request_frame()
+    prise.save()
+end
+
 local function get_tab_display_name(tab_index)
     local tab = state.tabs[tab_index]
     if not tab then
@@ -2779,6 +2869,18 @@ action_handlers = {
             return
         end
         M.update({ type = "break_pane", data = { pty_id = focused_id, focus = true } })
+    end,
+    swap_pane_left = function()
+        swap_pane("left")
+    end,
+    swap_pane_right = function()
+        swap_pane("right")
+    end,
+    swap_pane_up = function()
+        swap_pane("up")
+    end,
+    swap_pane_down = function()
+        swap_pane("down")
     end,
     new_tab = function()
         local pty = get_focused_pty()
