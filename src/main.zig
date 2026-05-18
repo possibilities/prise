@@ -118,6 +118,49 @@ pub fn main() !void {
         if (result.attach_session) |s| allocator.free(s);
         if (result.new_session_name) |s| allocator.free(s);
     }
+    // Detect nesting: if PRISE_PTY is set, we're inside a prise session
+    if (posix.getenv("PRISE_PTY")) |pty_id_str| {
+        const target_session = result.new_session_name orelse result.attach_session orelse {
+            const current = posix.getenv("PRISE_SESSION") orelse "unknown";
+            var err_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&err_buf,
+                \\Already inside prise session '{s}'.
+                \\Use 'prise -s <name>' to create and switch to a new session.
+                \\
+            , .{current}) catch return;
+            std.fs.File.stderr().writeAll(msg) catch {};
+            return;
+        };
+
+        const pty_id = std.fmt.parseInt(u32, pty_id_str, 10) catch {
+            std.fs.File.stderr().writeAll("error: invalid PRISE_PTY value\n") catch {};
+            return;
+        };
+
+        // If this is a new session (-s <name> where name didn't exist),
+        // create a minimal session file so the client can switch to it
+        if (result.new_session_name != null) {
+            createMinimalSession(allocator, target_session) catch |err| {
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "error: failed to create session '{s}': {s}\n", .{ target_session, @errorName(err) }) catch return;
+                std.fs.File.stderr().writeAll(msg) catch {};
+                return;
+            };
+        }
+
+        requestNestedSessionSwitch(allocator, socket_path, target_session, pty_id) catch |err| {
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "error: failed to switch session: {s}\n", .{@errorName(err)}) catch return;
+            std.fs.File.stderr().writeAll(msg) catch {};
+            return;
+        };
+
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Switching to session '{s}'...\n", .{target_session}) catch return;
+        std.fs.File.stdout().writeAll(msg) catch {};
+        return;
+    }
+
     runClient(allocator, socket_path, result) catch |err| {
         var log_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 
@@ -172,12 +215,18 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?ParseResul
                 return err;
             };
             if (sessionExists(allocator, name)) {
-                var err_buf: [128]u8 = undefined;
-                const msg = std.fmt.bufPrint(&err_buf, "error: session '{s}' already exists\n", .{name}) catch return error.SessionAlreadyExists;
-                printSessionNameError(msg);
-                return error.SessionAlreadyExists;
+                // When nested, -s switches to the existing session
+                if (posix.getenv("PRISE_PTY") != null) {
+                    result.attach_session = try allocator.dupe(u8, name);
+                } else {
+                    var err_buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&err_buf, "error: session '{s}' already exists\n", .{name}) catch return error.SessionAlreadyExists;
+                    printSessionNameError(msg);
+                    return error.SessionAlreadyExists;
+                }
+            } else {
+                result.new_session_name = try allocator.dupe(u8, name);
             }
-            result.new_session_name = try allocator.dupe(u8, name);
         } else if (std.mem.eql(u8, arg, "serve")) {
             initLogFile("server.log");
             try server.startServer(allocator, socket_path);
@@ -1019,6 +1068,123 @@ fn findMostRecentSession(allocator: std.mem.Allocator) ![]const u8 {
 
     log.err("No session files found", .{});
     return error.NoSessionsFound;
+}
+
+/// Create a minimal session JSON file so the client can switch to a new session.
+/// Uses pty_validity=0 to ensure the client spawns fresh PTYs.
+fn createMinimalSession(allocator: std.mem.Allocator, name: []const u8) !void {
+    const result = getSessionsDir(allocator) catch |err| {
+        if (err == error.NoSessionsFound) {
+            // Create the sessions directory
+            const home = posix.getenv("HOME") orelse return error.NoHomeDirectory;
+            const state_dir = try std.fs.path.join(allocator, &.{ home, ".local", "state", "prise", "sessions" });
+            defer allocator.free(state_dir);
+            const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
+            std.fs.makeDirAbsolute(parent) catch |e| {
+                if (e != error.PathAlreadyExists) return e;
+            };
+            std.fs.makeDirAbsolute(state_dir) catch |e| {
+                if (e != error.PathAlreadyExists) return e;
+            };
+            // Retry opening
+            var dir = try std.fs.openDirAbsolute(state_dir, .{ .iterate = true });
+            // Can't use getSessionsDir return type easily, just write directly
+            defer dir.close();
+            var filename_buf: [256]u8 = undefined;
+            const filename = std.fmt.bufPrint(&filename_buf, "{s}.json", .{name}) catch return error.NameTooLong;
+            const file = try dir.createFile(filename, .{});
+            defer file.close();
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cwd = posix.getcwd(&cwd_buf) catch "/tmp";
+            var json_buf: [1024]u8 = undefined;
+            const json = std.fmt.bufPrint(&json_buf,
+                \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":{f}}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
+            , .{std.json.fmt(cwd, .{})}) catch return error.NameTooLong;
+            try file.writeAll(json);
+            return;
+        }
+        return err;
+    };
+    defer allocator.free(result.path);
+    var dir = result.dir;
+    defer dir.close();
+
+    var filename_buf: [256]u8 = undefined;
+    const filename = std.fmt.bufPrint(&filename_buf, "{s}.json", .{name}) catch return error.NameTooLong;
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = posix.getcwd(&cwd_buf) catch "/tmp";
+
+    var json_buf: [1024]u8 = undefined;
+    const json = std.fmt.bufPrint(&json_buf,
+        \\{{"pty_validity":0,"tabs":[{{"id":1,"root":{{"type":"pane","id":1,"pty_id":0,"cwd":{f}}}}}],"active_tab":1,"next_split_id":2,"next_tab_id":2}}
+    , .{std.json.fmt(cwd, .{})}) catch return error.NameTooLong;
+
+    const file = try dir.createFile(filename, .{});
+    defer file.close();
+    try file.writeAll(json);
+}
+
+/// Send a session_switch RPC to the server, which notifies the client
+/// owning the given PTY to switch to the target session.
+fn requestNestedSessionSwitch(allocator: std.mem.Allocator, socket_path: []const u8, session_name: []const u8, pty_id: u32) !void {
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        return error.SocketError;
+    };
+    defer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            return error.ServerNotRunning;
+        }
+        return err;
+    };
+
+    // Build session_switch RPC: [0, msgid, "session_switch", {pty_id: <id>, session: "<name>"}]
+    var map_items: [2]msgpack.Value.KeyValue = .{
+        .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } },
+        .{ .key = .{ .string = "session" }, .value = .{ .string = session_name } },
+    };
+    var msg_items: [4]msgpack.Value = .{
+        .{ .unsigned = 0 },
+        .{ .unsigned = 1 },
+        .{ .string = "session_switch" },
+        .{ .map = &map_items },
+    };
+
+    const request = try msgpack.encodeFromValue(allocator, .{ .array = &msg_items });
+    defer allocator.free(request);
+
+    _ = try posix.write(sock, request);
+
+    // Read response
+    var response_buf: [16384]u8 = undefined;
+    const n = try posix.read(sock, &response_buf);
+    if (n == 0) return error.NoResponse;
+
+    const response = rpc.decodeMessage(allocator, response_buf[0..n]) catch return error.DecodeError;
+    defer response.deinit(allocator);
+
+    if (response != .response) return error.UnexpectedResponse;
+    if (response.response.err) |err_val| {
+        if (err_val == .string) {
+            log.err("Server error: {s}", .{err_val.string});
+        }
+        return error.ServerError;
+    }
+
+    // String result indicates an application-level error
+    if (response.response.result == .string) {
+        var err_buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&err_buf, "error: {s}\n", .{response.response.result.string}) catch return error.SessionSwitchFailed;
+        std.fs.File.stderr().writeAll(msg) catch {};
+        return error.SessionSwitchFailed;
+    }
 }
 
 const testing = std.testing;
