@@ -34,6 +34,7 @@ ui.setup({
     keybinds = { ... },
     layouts = { ... },
     default_layout = "...",
+    keep_attached = true,
 })
 
 return ui
@@ -250,6 +251,27 @@ Example:
 ```lua
 ui.setup({
     macos_option_as_alt = "true",
+})
+```
+
+# KEEP ATTACHED
+
+**keep_attached**
+:   When the last pane in the last tab exits, switch to another session instead
+    of exiting. When no other sessions exist, prise exits normally. Default:
+    **true**
+
+NOTE: when switching via **keep_attached**, the departing session's state file
+is removed before the switch; it is not saved to disk. Without this the save
+branch of the session-switch path would re-create the file in between the
+last pane's exit and the async pty_exited notification, leaving an empty
+phantom session that shows up in **list_sessions** and the session picker.
+
+Example:
+
+```lua
+ui.setup({
+    keep_attached = false,  -- Exit when last pane closes
 })
 ```
 
