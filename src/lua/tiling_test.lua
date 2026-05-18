@@ -292,16 +292,6 @@ assert(
         or (state_upvalue.pending_spawns[6] and state_upvalue.pending_spawns[6].new_tab == true),
     "pty_spawned: tab=<new> sets pending_new_tab"
 )
-state_upvalue.pending_title_renames = {}
-state_upvalue.pending_new_tab = false
-tiling.update({ type = "pty_spawned", data = { id = 5, title = "editor" } })
-assert(state_upvalue.pending_title_renames[5] == "editor", "pty_spawned: title queues pending rename")
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: nil tab creates new tab")
-
--- Test: pty_spawned with tab=<new> sets pending_new_tab
-state_upvalue.pending_new_tab = false
-tiling.update({ type = "pty_spawned", data = { id = 6, tab = "<new>" } })
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: tab=<new> sets pending_new_tab")
 
 -- Test: pty_spawned without placement fields is no-op
 state_upvalue.pending_new_tab = false
@@ -368,8 +358,6 @@ assert(
         or (state_upvalue.pending_spawns[21] and state_upvalue.pending_spawns[21].new_tab == true),
     "pty_spawned: unknown tab name creates new tab"
 )
-tiling.update({ type = "pty_spawned", data = { id = 21, tab = "unknown" } })
-assert(state_upvalue.pending_new_tab == true, "pty_spawned: unknown tab name creates new tab")
 
 -- === pty_spawned with missing session ===
 
@@ -1635,9 +1623,6 @@ end
 -- Cleanup: leave renderer config nil + warn latch reset for any tests that follow.
 t.set_tab_bar_render(nil)
 t.reset_tab_bar_render_warned()
--- Cleanup: leave renderer config nil + warn latch reset for any tests that follow.
-t.set_tab_bar_render(nil)
-t.reset_tab_bar_render_warned()
 
 -- === serialize_node ===
 
@@ -1676,3 +1661,310 @@ assert(live_serialized ~= nil, "serialize_node live: returns non-nil")
 assert(live_serialized.type == "pane", "serialize_node live: type is pane")
 assert(live_serialized.pty_id == 7, "serialize_node live: pty_id from pty:id()")
 assert(live_serialized.id == 7, "serialize_node live: id from node.id")
+
+-- === Overlay System ===
+
+local mock_tracked_pty = helpers.mock_tracked_pty
+
+-- Helper: set up a tab with overlay config
+---@param overlay_configs table<string, OverlayConfig>
+---@param root? Pane|Split
+local function setup_overlay_test(overlay_configs, root)
+    root = root or mock_pane(1)
+    -- Clear overlay state AND config from prior tests. tiling.setup merges
+    -- into config.overlays rather than replacing it, so without resetting
+    -- config here, a malformed-input rejection test would leave a bad entry
+    -- behind that breaks the next test's setup pass.
+    local pre_st = t.get_state()
+    pre_st.overlay_state = {}
+    pre_st.active_overlay_name = nil
+    pre_st.overlay_resize_mode = false
+    t.reset_config_overlays()
+    -- Configure overlays via setup
+    tiling.setup({ overlays = overlay_configs })
+    -- Set up a tab
+    t.set_state({
+        tabs = { { id = 1, root = root, last_focused_id = 1 } },
+        active_tab = 1,
+        focused_id = 1,
+    })
+    -- Clear all pending flags (in case prior tests left residue)
+    local st = t.get_state()
+    for _, ost in pairs(st.overlay_state) do
+        ost.pending = false
+    end
+end
+
+-- Test: overlay config initialization — setup creates overlay_state entries
+setup_overlay_test({
+    floating = { key = "<leader>f", width = 100, height = 30 },
+    lazygit = { key = "<leader>g", cmd = "lazygit", width = 140, height = 40 },
+})
+local st = t.get_state()
+assert(st.overlay_state.floating ~= nil, "overlay: floating state created")
+assert(st.overlay_state.floating.width == 100, "overlay: floating width from config")
+assert(st.overlay_state.floating.height == 30, "overlay: floating height from config")
+assert(st.overlay_state.floating.pending == false, "overlay: floating not pending")
+assert(st.overlay_state.lazygit ~= nil, "overlay: lazygit state created")
+assert(st.overlay_state.lazygit.width == 140, "overlay: lazygit width from config")
+assert(st.overlay_state.lazygit.height == 40, "overlay: lazygit height from config")
+
+-- Test: overlay defaults — width/height default to "60%" / "70%" (pct-mode)
+setup_overlay_test({
+    minimal = { key = "<leader>m" },
+})
+st = t.get_state()
+assert(st.overlay_state.minimal ~= nil, "overlay defaults: state created")
+assert(st.overlay_state.minimal.width_pct == 60, "overlay defaults: width_pct is 60")
+assert(st.overlay_state.minimal.height_pct == 70, "overlay defaults: height_pct is 70")
+-- Resolved cells come from the seed screen dims (80x24) and the MIN clamps.
+-- 60% of 80 cols = 48 (above FLOATING_MIN_WIDTH = 40).
+-- 70% of 24 rows = 16 (above FLOATING_MIN_HEIGHT = 10).
+assert(st.overlay_state.minimal.width == 48, "overlay defaults: width resolves to 48 cells")
+assert(st.overlay_state.minimal.height == 16, "overlay defaults: height resolves to 16 cells")
+
+-- Test: percentage strings parse into width_pct / height_pct
+setup_overlay_test({
+    pct = { key = "<leader>p", width = "80%", height = "50%" },
+})
+st = t.get_state()
+assert(st.overlay_state.pct.width_pct == 80, "overlay pct: width_pct parsed")
+assert(st.overlay_state.pct.height_pct == 50, "overlay pct: height_pct parsed")
+
+-- Test: malformed percentage strings raise from setup
+local ok_garbage = pcall(function()
+    setup_overlay_test({ bad = { key = "<leader>z", width = "abc" } })
+end)
+assert(not ok_garbage, "overlay pct: non-numeric string rejected")
+local ok_no_pct = pcall(function()
+    setup_overlay_test({ bad = { key = "<leader>z", width = "50" } })
+end)
+assert(not ok_no_pct, "overlay pct: bare number string (no percent sign) rejected")
+local ok_out_of_range = pcall(function()
+    setup_overlay_test({ bad = { key = "<leader>z", width = "200%" } })
+end)
+assert(not ok_out_of_range, "overlay pct: percentage outside [10, 100] rejected")
+
+-- Test: winsize event re-resolves percent-mode overlays immediately
+setup_overlay_test({
+    tracker = { key = "<leader>y", width = "50%", height = "50%" },
+})
+st = t.get_state()
+st.screen_cols = 100
+st.screen_rows = 30
+tiling.update({ type = "winsize", data = { cols = 200, rows = 60 } })
+st = t.get_state()
+-- 50% of 200 = 100 (clamped by FLOATING_MAX_WIDTH = 200, no change)
+-- 50% of 60 = 30 (clamped by FLOATING_MAX_HEIGHT = 50, no change)
+assert(st.overlay_state.tracker.width == 100, "overlay winsize: width resolves to 100 cells")
+assert(st.overlay_state.tracker.height == 30, "overlay winsize: height resolves to 30 cells")
+assert(st.overlay_state.tracker.width_pct == 50, "overlay winsize: width_pct preserved")
+
+-- Test: percent-mode clamped by absolute MAX bounds
+setup_overlay_test({
+    huge = { key = "<leader>H", width = "100%", height = "100%" },
+})
+st = t.get_state()
+st.screen_cols = 400
+st.screen_rows = 120
+tiling.update({ type = "winsize", data = { cols = 400, rows = 120 } })
+st = t.get_state()
+assert(st.overlay_state.huge.width == 200, "overlay pct clamp: width capped at FLOATING_MAX_WIDTH")
+assert(st.overlay_state.huge.height == 50, "overlay pct clamp: height capped at FLOATING_MAX_HEIGHT")
+
+-- Test: floating_increase_pct steps percentages and re-resolves
+setup_overlay_test({
+    step = { key = "<leader>S", width = "50%", height = "50%" },
+})
+st = t.get_state()
+st.screen_cols = 100
+st.screen_rows = 40
+st.active_overlay_name = "step"
+t.action_handlers.floating_increase_pct()
+st = t.get_state()
+assert(st.overlay_state.step.width_pct == 55, "floating_increase_pct: width_pct steps by 5")
+assert(st.overlay_state.step.height_pct == 55, "floating_increase_pct: height_pct steps by 5")
+assert(st.overlay_state.step.width == 55, "floating_increase_pct: width resolved against cols=100")
+assert(st.overlay_state.step.height == 22, "floating_increase_pct: height resolved against rows=40")
+t.action_handlers.floating_decrease_pct()
+st = t.get_state()
+assert(st.overlay_state.step.width_pct == 50, "floating_decrease_pct: width_pct steps back")
+assert(st.overlay_state.step.height_pct == 50, "floating_decrease_pct: height_pct steps back")
+
+-- Test: floating_increase_size drops pct tracking (cell-mode takeover)
+setup_overlay_test({
+    cell = { key = "<leader>C", width = "50%", height = "50%" },
+})
+st = t.get_state()
+st.active_overlay_name = "cell"
+local prev_width = st.overlay_state.cell.width
+t.action_handlers.floating_increase_size()
+st = t.get_state()
+assert(st.overlay_state.cell.width_pct == nil, "floating_increase_size: clears width_pct")
+assert(st.overlay_state.cell.height_pct == nil, "floating_increase_size: clears height_pct")
+assert(st.overlay_state.cell.width == prev_width + 5, "floating_increase_size: +5 cells")
+
+-- Test: floating_increase_pct upconverts a cell-mode overlay to percent-mode
+setup_overlay_test({
+    upconv = { key = "<leader>U", width = 100, height = 20 },
+})
+st = t.get_state()
+st.screen_cols = 200
+st.screen_rows = 40
+st.active_overlay_name = "upconv"
+-- Before: width = 100 cells on 200-col screen = 50%, step to 55%.
+t.action_handlers.floating_increase_pct()
+st = t.get_state()
+assert(st.overlay_state.upconv.width_pct == 55, "upconvert: width_pct computed from cells and stepped")
+assert(st.overlay_state.upconv.height_pct == 55, "upconvert: height_pct computed from cells and stepped")
+
+-- Test: persistence round-trips width_pct / height_pct
+setup_overlay_test({
+    saved = { key = "<leader>V", width = "60%", height = "70%" },
+})
+local exported = tiling.get_state()
+local found = nil
+for name, settings in pairs(exported.overlay_settings) do
+    if name == "saved" then
+        found = settings
+    end
+end
+assert(found ~= nil, "persistence: saved settings exist")
+assert(found.width_pct == 60, "persistence: width_pct serialized")
+assert(found.height_pct == 70, "persistence: height_pct serialized")
+
+-- Test: toggle_overlay spawns when no overlay pane exists
+local spawn_calls = {}
+local prise_mock = package.loaded["prise"]
+prise_mock.spawn = function(opts)
+    table.insert(spawn_calls, opts)
+end
+setup_overlay_test({
+    test_overlay = { key = "<leader>t", cmd = "htop", width = 80, height = 20 },
+})
+spawn_calls = {}
+tiling.set_overlay("test_overlay")
+st = t.get_state()
+assert(st.overlay_state.test_overlay.pending == true, "toggle spawn: sets pending")
+assert(#spawn_calls == 1, "toggle spawn: calls prise.spawn")
+assert(spawn_calls[1].cmd == "exec htop", "toggle spawn: wraps cmd in exec by default")
+
+-- Test: toggle_overlay with shell = true passes cmd through unchanged
+setup_overlay_test({
+    shelled = { key = "<leader>w", cmd = "lazygit", shell = true, width = 80, height = 20 },
+})
+spawn_calls = {}
+tiling.set_overlay("shelled")
+assert(#spawn_calls == 1, "toggle shell opt-in: calls prise.spawn")
+assert(spawn_calls[1].cmd == "lazygit", "toggle shell opt-in: cmd not wrapped when shell = true")
+
+-- Test: toggle_overlay with nil cmd is unaffected by exec wrapping
+setup_overlay_test({
+    bare = { key = "<leader>b", width = 80, height = 20 },
+})
+spawn_calls = {}
+tiling.set_overlay("bare")
+assert(#spawn_calls == 1, "toggle nil cmd: calls prise.spawn")
+assert(spawn_calls[1].cmd == nil, "toggle nil cmd: cmd stays nil (no exec prefix)")
+
+-- Test: toggle_overlay with argv bypasses cmd/exec-wrap entirely
+setup_overlay_test({
+    argv_overlay = {
+        key = "<leader>a",
+        argv = { "prisectl-ui", "plug-status" },
+        width = 80,
+        height = 20,
+    },
+})
+spawn_calls = {}
+tiling.set_overlay("argv_overlay")
+assert(#spawn_calls == 1, "toggle argv: calls prise.spawn")
+assert(spawn_calls[1].cmd == nil, "toggle argv: cmd is nil")
+assert(type(spawn_calls[1].argv) == "table", "toggle argv: argv passed as table")
+assert(#spawn_calls[1].argv == 2, "toggle argv: argv length preserved")
+assert(spawn_calls[1].argv[1] == "prisectl-ui", "toggle argv: argv[1] preserved")
+assert(spawn_calls[1].argv[2] == "plug-status", "toggle argv: argv[2] preserved")
+
+-- Test: toggle_overlay toggles visibility when pane exists
+setup_overlay_test({
+    test_vis = { key = "<leader>v", width = 80, height = 20 },
+})
+tab = st.tabs[1]
+tab.overlays = {
+    test_vis = { pane = mock_pane(42), visible = true },
+}
+tiling.set_overlay("test_vis")
+assert(tab.overlays.test_vis.visible == false, "toggle vis: hides visible overlay")
+tiling.set_overlay("test_vis")
+assert(tab.overlays.test_vis.visible == true, "toggle vis: shows hidden overlay")
+
+-- Test: active_overlay_name tracks last toggled visible
+setup_overlay_test({
+    ov_a = { key = "<leader>a", width = 80, height = 20 },
+    ov_b = { key = "<leader>b", width = 80, height = 20 },
+})
+st = t.get_state()
+tab = st.tabs[1]
+tab.overlays = {
+    ov_a = { pane = mock_pane(10), visible = false },
+    ov_b = { pane = mock_pane(20), visible = false },
+}
+tiling.set_overlay("ov_a")
+assert(st.active_overlay_name == "ov_a", "active overlay: set on toggle visible")
+tiling.set_overlay("ov_b")
+assert(st.active_overlay_name == "ov_b", "active overlay: updated to latest")
+tiling.set_overlay("ov_b")
+assert(st.active_overlay_name == nil, "active overlay: cleared on toggle hidden")
+
+-- Test: get_active_overlay returns active visible overlay
+setup_overlay_test({
+    ov_x = { key = "<leader>x", width = 80, height = 20 },
+})
+st = t.get_state()
+tab = st.tabs[1]
+local pty_x = mock_tracked_pty(50)
+tab.overlays = {
+    ov_x = { pane = { type = "pane", id = 50, pty = pty_x }, visible = true },
+}
+st.active_overlay_name = "ov_x"
+local name, overlay = t.get_active_overlay()
+assert(name == "ov_x", "get_active_overlay: returns active name")
+assert(overlay ~= nil, "get_active_overlay: returns overlay")
+assert(overlay.pane.id == 50, "get_active_overlay: correct pane")
+
+-- Test: get_active_overlay returns nil when no overlays visible
+tab.overlays.ov_x.visible = false
+st.active_overlay_name = nil
+name, overlay = t.get_active_overlay()
+assert(name == nil, "get_active_overlay: nil when none visible")
+assert(overlay == nil, "get_active_overlay: nil overlay when none visible")
+
+-- Test: pty_attach assigns to pending overlay
+setup_overlay_test({
+    attach_test = { key = "<leader>a", width = 80, height = 20 },
+})
+st = t.get_state()
+st.overlay_state.attach_test.pending = true
+local attach_pty = helpers.mock_pty(99)
+tiling.update({ type = "pty_attach", data = { pty = attach_pty } })
+tab = st.tabs[1]
+assert(tab.overlays ~= nil, "pty_attach overlay: overlays table created")
+assert(tab.overlays.attach_test ~= nil, "pty_attach overlay: overlay assigned")
+assert(tab.overlays.attach_test.pane.id == 99, "pty_attach overlay: correct pane id")
+assert(tab.overlays.attach_test.visible == true, "pty_attach overlay: starts visible")
+assert(st.overlay_state.attach_test.pending == false, "pty_attach overlay: pending cleared")
+assert(st.active_overlay_name == "attach_test", "pty_attach overlay: becomes active")
+
+-- Test: pty_exited cleans up overlay
+setup_overlay_test({
+    exit_test = { key = "<leader>e", width = 80, height = 20 },
+})
+st = t.get_state()
+tab = st.tabs[1]
+tab.overlays = {
+    exit_test = { pane = mock_pane(77), visible = true },
+}
+st.active_overlay_name = "exit_test"
+tiling.update({ type = "pty_exited", data = { id = 77 } })
+assert(tab.overlays.exit_test == nil, "pty_exited overlay: overlay removed")
+assert(st.active_overlay_name == nil, "pty_exited overlay: active cleared")
