@@ -370,7 +370,6 @@ const Pty = struct {
         self.clients.deinit(allocator);
         self.title.deinit(allocator);
         self.cwd.deinit(allocator);
-        if (self.cmd) |c| allocator.free(c);
         allocator.destroy(self);
     }
 
@@ -1233,19 +1232,20 @@ fn buildRedrawMessageFromPty(
 }
 
 const Client = struct {
-    /// Monotonic id assigned by the server at onAccept time. Stable for
-    /// the lifetime of the connection and never reused. Exposed to plugs
-    /// via the client_connected / client_disconnected / pty_attach /
-    /// pty_detach notifications and addressable through notify_plug_client.
-    /// Default is 0 so the hand-rolled Client literals in tests keep
-    /// compiling — the production path always overwrites it in onAccept.
-    id: u64 = 0,
-    fd: posix.fd_t,
-    /// Per-process-lifetime stable id, assigned monotonically at accept-time
-    /// from `Server.next_client_id`. Used as the deterministic broker-pick key
-    /// for the client-broker RPC pattern (lowest id among attached clients).
+    /// Monotonic id assigned by the server at onAccept time, sourced from
+    /// `Server.next_client_id`. Stable for the lifetime of the connection
+    /// and never reused. Two consumers:
+    ///   1. Plug lifecycle events: exposed to plugs via the
+    ///      client_connected / client_disconnected / pty_attach /
+    ///      pty_detach notifications and addressable through
+    ///      notify_plug_client.
+    ///   2. The deterministic broker-pick key for the client-broker RPC
+    ///      pattern (lowest id among attached clients).
     /// Resets on server restart — clients re-attach and pick a new lowest.
+    /// Default is 0 so hand-rolled Client literals in tests keep compiling —
+    /// the production path always overwrites it in onAccept.
     id: usize = 0,
+    fd: posix.fd_t,
     server: *Server,
     // 4096 bytes is sufficient for typical RPC messages while staying
     // small enough for stack allocation. Larger messages are handled
@@ -2402,10 +2402,14 @@ const Server = struct {
     ptys: std.AutoHashMap(usize, *Pty),
     next_pty_id: usize = 0,
     /// Monotonic per-process-lifetime counter for `Client.id`. Bumped at
-    /// accept-time. Lowest assigned id among attached clients is the
-    /// deterministic broker for the client-broker RPC pattern (e.g.
-    /// break_pane). Resets on server restart.
-    next_client_id: usize = 0,
+    /// accept-time. Two consumers:
+    ///   1. Plug lifecycle events: id is exposed to plugs via the
+    ///      client_connected / client_disconnected notifications.
+    ///   2. The deterministic broker-pick key for the client-broker RPC
+    ///      pattern (lowest id among attached clients drives e.g.
+    ///      break_pane). Resets on server restart. Starts at 1 so 0 can
+    ///      encode "unknown client" in payloads if ever needed.
+    next_client_id: usize = 1,
     /// In-flight client-broker RPC requests, keyed by request_id.
     /// Capped at `LIMITS.PENDING_MAX`. Entries are dropped when the
     /// broker replies, when the deadline-sweep timer expires the
@@ -2441,9 +2445,6 @@ const Server = struct {
     sweep_timer_task: ?io.Task = null,
     /// Set true during shutdown to gate restart timer callbacks.
     shutting_down: bool = false,
-    /// Monotonic allocator for Client.id. Starts at 1 so 0 can encode
-    /// "unknown client" in payloads if ever needed.
-    next_client_id: u64 = 1,
 
     const ParsedSpawnPty = struct {
         size: pty.Winsize,
@@ -3674,7 +3675,7 @@ const Server = struct {
     /// Send a single client_connected notification to one specific plug.
     /// Used by the register-time replay path so the new plug sees an event
     /// for every existing non-plug client without re-broadcasting.
-    fn sendClientConnectedTo(self: *Server, plug_client: *Client, client_id: u64) void {
+    fn sendClientConnectedTo(self: *Server, plug_client: *Client, client_id: usize) void {
         var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
             log.err("Failed to alloc client_connected replay: {}", .{err});
             return;
@@ -4010,7 +4011,7 @@ const Server = struct {
     fn handleNotifyPlugClient(self: *Server, params: msgpack.Value) !msgpack.Value {
         if (params != .map) return error.InvalidParams;
 
-        var client_id: ?u64 = null;
+        var client_id: ?usize = null;
         var method: ?[]const u8 = null;
         var notif_params: msgpack.Value = .nil;
 
@@ -4400,14 +4401,12 @@ const Server = struct {
                 client.* = .{
                     .id = assigned_id,
                     .fd = client_fd,
-                    .id = self.next_client_id,
                     .server = self,
                     .msg_buffer = std.ArrayList(u8).empty,
                     .send_queue = std.ArrayList([]u8).empty,
                     .attached_ptys = std.ArrayList(usize).empty,
                     // .style_cache = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(self.allocator),
                 };
-                self.next_client_id += 1;
                 try self.clients.append(self.allocator, client);
                 std.debug.assert(self.clients.items.len <= LIMITS.CLIENTS_MAX);
                 std.log.debug("Total clients: {} (assigned id={})", .{ self.clients.items.len, client.id });
@@ -4858,7 +4857,7 @@ const Server = struct {
     /// plugs under the given event name. Used for client_connected and
     /// client_disconnected. Allocation failures are logged and swallowed —
     /// one missed event does not warrant unwinding the caller.
-    fn forwardClientEvent(self: *Server, event_name: []const u8, client_id: u64) void {
+    fn forwardClientEvent(self: *Server, event_name: []const u8, client_id: usize) void {
         var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 1) catch |err| {
             log.err("Failed to alloc {s} forward: {}", .{ event_name, err });
             return;
@@ -4879,7 +4878,7 @@ const Server = struct {
     /// Encode `{client_id, pty_id}` and forward it to subscribed plugs. Used
     /// for pty_attach and pty_detach — a plug subscribed to either gets the
     /// pair that lets it reconstruct which client is holding which pty.
-    fn forwardPtyClientEvent(self: *Server, event_name: []const u8, client_id: u64, pty_id: usize) void {
+    fn forwardPtyClientEvent(self: *Server, event_name: []const u8, client_id: usize, pty_id: usize) void {
         var map_items = self.allocator.alloc(msgpack.Value.KeyValue, 2) catch |err| {
             log.err("Failed to alloc {s} forward: {}", .{ event_name, err });
             return;
@@ -4967,72 +4966,6 @@ const Server = struct {
 
         // Forward to subscribed plugs
         self.forwardToSubscribedPlugs("pty_spawned", msg_bytes, null);
-    }
-
-    /// Place a PTY into a session state file so it is discovered on next attach.
-    /// Used when no TUI client is connected to receive the pty_spawned event.
-    fn placePtyInSessionFile(self: *Server, session_name: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8) !void {
-        // Validate session name (no path traversal)
-        if (session_name.len == 0) return error.InvalidSessionName;
-        if (std.mem.indexOfAny(u8, session_name, "/\\") != null) return error.InvalidSessionName;
-        if (std.mem.indexOf(u8, session_name, "..") != null) return error.InvalidSessionName;
-        if (std.mem.indexOfScalar(u8, session_name, 0) != null) return error.InvalidSessionName;
-
-        const home = posix.getenv("HOME") orelse return error.NoHomeDirectory;
-        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
-        defer self.allocator.free(state_dir);
-
-        // Ensure directory exists
-        std.fs.makeDirAbsolute(state_dir) catch |err| {
-            if (err != error.PathAlreadyExists) {
-                const parent = std.fs.path.dirname(state_dir) orelse return error.NoHomeDirectory;
-                std.fs.makeDirAbsolute(parent) catch |e| {
-                    if (e != error.PathAlreadyExists) return e;
-                };
-                std.fs.makeDirAbsolute(state_dir) catch |e| {
-                    if (e != error.PathAlreadyExists) return e;
-                };
-            }
-        };
-
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
-        defer self.allocator.free(filename);
-
-        const path = try std.fs.path.join(self.allocator, &.{ state_dir, filename });
-        defer self.allocator.free(path);
-
-        const validity = self.start_time_ms;
-
-        // Try to read existing file
-        if (std.fs.openFileAbsolute(path, .{})) |file| {
-            defer file.close();
-            const existing = try file.readToEndAlloc(self.allocator, 1024 * 1024);
-            defer self.allocator.free(existing);
-            try self.appendTabToSessionFile(path, existing, pty_id, cwd, tab_title, validity);
-        } else |_| {
-            try self.writeNewSessionFile(path, pty_id, cwd, tab_title, validity);
-        }
-
-        log.info("Placed PTY {d} in session file '{s}' (no TUI clients)", .{ pty_id, session_name });
-    }
-
-    /// Create a new session file with a single tab containing the given PTY.
-    fn writeNewSessionFile(self: *Server, path: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
-        const Pane = struct { type: []const u8, id: u32, pty_id: usize, cwd: []const u8 };
-        const Tab = struct { id: u32, title: ?[]const u8, root: Pane, last_focused_id: u32 };
-        const Session = struct { pty_validity: i64, tabs: []const Tab, active_tab: u32, next_split_id: u32, next_tab_id: u32 };
-
-        const pane: Pane = .{ .type = "pane", .id = 1, .pty_id = pty_id, .cwd = cwd };
-        const tab: Tab = .{ .id = 1, .title = tab_title, .root = pane, .last_focused_id = 1 };
-        const tabs = [_]Tab{tab};
-        const session: Session = .{ .pty_validity = validity, .tabs = &tabs, .active_tab = 1, .next_split_id = 2, .next_tab_id = 2 };
-
-        const json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(session, .{})});
-        defer self.allocator.free(json);
-
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(json);
     }
 
     /// Append a new tab to an existing session JSON file.
@@ -5202,46 +5135,6 @@ const Server = struct {
         return false;
     }
 
-    /// Build and send pty_spawned notification to all clients
-    fn sendPtySpawned(self: *Server, pty_id: usize, cwd: []const u8, session: ?[]const u8, tab: ?[]const u8, title: ?[]const u8) !void {
-        var field_count: usize = 2; // id + cwd always present
-        if (session != null) field_count += 1;
-        if (tab != null) field_count += 1;
-        if (title != null) field_count += 1;
-
-        const params = try self.allocator.alloc(msgpack.Value.KeyValue, field_count);
-        defer self.allocator.free(params);
-
-        var idx: usize = 0;
-        params[idx] = .{ .key = .{ .string = "id" }, .value = .{ .unsigned = pty_id } };
-        idx += 1;
-        params[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
-        idx += 1;
-        if (session) |s| {
-            params[idx] = .{ .key = .{ .string = "session" }, .value = .{ .string = s } };
-            idx += 1;
-        }
-        if (tab) |t| {
-            params[idx] = .{ .key = .{ .string = "tab" }, .value = .{ .string = t } };
-            idx += 1;
-        }
-        if (title) |t| {
-            params[idx] = .{ .key = .{ .string = "title" }, .value = .{ .string = t } };
-            idx += 1;
-        }
-
-        const params_value = msgpack.Value{ .map = params };
-        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "pty_spawned", params_value });
-        defer self.allocator.free(msg_bytes);
-
-        log.info("Sending pty_spawned for pty {}", .{pty_id});
-
-        // Send to all clients
-        for (self.clients.items) |client| {
-            try client.sendData(self.loop, msg_bytes);
-        }
-    }
-
     /// Describes a "split into existing tab" placement: the new PTY becomes
     /// a sibling of the targeted pane inside its tab's existing pane tree,
     /// not a brand-new tab. Honored only by the detached-mode write path
@@ -5341,95 +5234,6 @@ const Server = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(json);
-    }
-
-    /// Append a new tab to an existing session JSON file.
-    fn appendTabToSessionFile(self: *Server, path: []const u8, existing_json: []const u8, pty_id: usize, cwd: []const u8, tab_title: ?[]const u8, validity: i64) !void {
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, existing_json, .{});
-        defer parsed.deinit();
-
-        var root = &parsed.value.object;
-        const arena = parsed.arena.allocator();
-
-        const tabs_val = root.getPtr("tabs") orelse return error.InvalidSessionFile;
-        if (tabs_val.* != .array) return error.InvalidSessionFile;
-
-        // No-op-on-duplicate (parity with the client-side appendTabToSessionFile
-        // in src/client.zig on feat/plug-system). If the exact pty_id is
-        // already present anywhere in the tab tree, this call is a redundant
-        // placement; skip the write. Sits alongside the remap-on-collision
-        // logic below, which handles the bounced-server scenario where a new
-        // PTY happens to reuse an old, dead PTY's id.
-        if (tabsContainPtyId(tabs_val.*, @intCast(pty_id))) |host_tab_id| {
-            log.warn(
-                "appendTabToSessionFile: pty_id={d} already in session file {s} at tab_id={d} — skipping write",
-                .{ pty_id, path, host_tab_id },
-            );
-            return;
-        }
-
-        // Extract and bump counters
-        const next_tab_val = root.get("next_tab_id") orelse return error.InvalidSessionFile;
-        const next_split_val = root.get("next_split_id") orelse return error.InvalidSessionFile;
-        const new_tab_id = if (next_tab_val == .integer) next_tab_val.integer else return error.InvalidSessionFile;
-        const new_split_id = if (next_split_val == .integer) next_split_val.integer else return error.InvalidSessionFile;
-
-        // Ensure unique pty_id within the file. When the server bounces,
-        // the new PTY can get the same ID as an old tab's PTY. The client's
-        // spawn-fallback remap keys by pty_id, so duplicates cause one
-        // mapping to clobber the other → two tabs share one PTY → crash.
-        var file_pty_id: i64 = @intCast(pty_id);
-        for (tabs_val.array.items) |tab_entry| {
-            if (tab_entry != .object) continue;
-            const root_pane = tab_entry.object.get("root") orelse continue;
-            if (root_pane != .object) continue;
-            const existing_id = root_pane.object.get("pty_id") orelse continue;
-            if (existing_id == .integer and existing_id.integer >= file_pty_id) {
-                file_pty_id = existing_id.integer + 1;
-            }
-        }
-
-        // Build the new tab as a Value tree
-        var pane_obj = std.json.ObjectMap.init(arena);
-        try pane_obj.put("type", .{ .string = "pane" });
-        try pane_obj.put("id", .{ .integer = new_split_id });
-        try pane_obj.put("pty_id", .{ .integer = file_pty_id });
-        try pane_obj.put("cwd", .{ .string = cwd });
-
-        var tab_obj = std.json.ObjectMap.init(arena);
-        try tab_obj.put("id", .{ .integer = new_tab_id });
-        if (tab_title) |t| {
-            try tab_obj.put("title", .{ .string = t });
-        } else {
-            try tab_obj.put("title", .null);
-        }
-        try tab_obj.put("root", .{ .object = pane_obj });
-        try tab_obj.put("last_focused_id", .{ .integer = new_split_id });
-
-        // Insert the new tab right of the focused tab, mirroring the Lua
-        // break_pane placement policy. The anchor is sourced from the JSON
-        // active_tab field (1-based). Missing key, explicit null, and
-        // wrong-type reads all normalize to 1 via the helper. Empty tabs
-        // array is handled explicitly (std.json.Array.insert at index > len
-        // panics, unlike Lua's forgiving table.insert). The target session's
-        // active_tab field is NOT modified here — it stays pointing at
-        // whatever tab the viewer had focused before the place fired; only
-        // the list shape changes.
-        const insert_idx = computeSessionFileInsertIndex(root.get("active_tab"), tabs_val.array.items.len);
-        try tabs_val.array.insert(insert_idx, .{ .object = tab_obj });
-
-        // Update counters and validity
-        try root.put("next_tab_id", .{ .integer = new_tab_id + 1 });
-        try root.put("next_split_id", .{ .integer = new_split_id + 1 });
-        try root.put("pty_validity", .{ .integer = validity });
-
-        // Serialize back
-        const output = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
-        defer self.allocator.free(output);
-
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(output);
     }
 
     /// Split the tab containing `spec.target_pty_id` into a two-pane split,
@@ -5657,84 +5461,6 @@ const Server = struct {
             else => {},
         }
         return max_seen;
-    }
-
-    /// Compute the 0-based insert index for a new tab in a session file's
-    /// `tabs` array, mirroring the Lua break_pane anchor + 1 rule:
-    ///   - empty tabs → index 0 (new tab becomes the only tab)
-    ///   - otherwise  → clamp(active_tab, 1..len) as the 1-based anchor,
-    ///                  converted to 0-based insert index (= clamped),
-    ///                  which puts the new tab right of the focused tab.
-    ///
-    /// active_tab_val is the result of `obj.get("active_tab")`: null when
-    /// missing, `.null` when explicitly JSON null, `.integer` when valid,
-    /// anything else is treated as an out-of-contract read. Missing / null
-    /// / wrong-type / zero / negative all normalize to 1.
-    fn computeSessionFileInsertIndex(active_tab_val: ?std.json.Value, tabs_len: usize) usize {
-        if (tabs_len == 0) return 0;
-
-        const active_tab: i64 = blk: {
-            if (active_tab_val) |v| {
-                if (v == .integer) break :blk v.integer;
-            }
-            // Missing key, explicit .null, or wrong-type → normalize to 1.
-            break :blk 1;
-        };
-
-        const len_i64: i64 = @intCast(tabs_len);
-        // max(1, min(len, active_tab or 1)) with explicit guard for
-        // zero/negative active_tab values (which route to 1).
-        const floored: i64 = if (active_tab < 1) 1 else active_tab;
-        const clamped: i64 = if (floored > len_i64) len_i64 else floored;
-        // Convert 1-based anchor to 0-based insert index; insertion at
-        // (anchor) in 0-based terms lands right of the 1-based anchor.
-        return @intCast(clamped);
-    }
-
-    /// Returns the tab id that already hosts pty_id (anywhere in its pane
-    /// tree), or null if no tab in `tabs_val` references pty_id. The tab id
-    /// is used purely for the diagnostic warn; if the matched tab is missing
-    /// an integer id field we return 0 rather than null so the caller can
-    /// still detect the duplicate.
-    fn tabsContainPtyId(tabs_val: std.json.Value, pty_id: i64) ?i64 {
-        if (tabs_val != .array) return null;
-        for (tabs_val.array.items) |tab_val| {
-            if (!paneSubtreeContainsPtyId(tab_val, pty_id)) continue;
-            if (tab_val == .object) {
-                if (tab_val.object.get("id")) |id_val| {
-                    if (id_val == .integer) return id_val.integer;
-                }
-            }
-            return 0;
-        }
-        return null;
-    }
-
-    fn paneSubtreeContainsPtyId(value: std.json.Value, pty_id: i64) bool {
-        switch (value) {
-            .object => |obj| {
-                if (obj.get("type")) |type_val| {
-                    if (type_val == .string and std.mem.eql(u8, type_val.string, "pane")) {
-                        if (obj.get("pty_id")) |pid_val| {
-                            if (pid_val == .integer and pid_val.integer == pty_id) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    if (paneSubtreeContainsPtyId(entry.value_ptr.*, pty_id)) return true;
-                }
-            },
-            .array => |arr| {
-                for (arr.items) |item| {
-                    if (paneSubtreeContainsPtyId(item, pty_id)) return true;
-                }
-            },
-            else => {},
-        }
-        return false;
     }
 
     fn sendCwdChanged(self: *Server, pty_instance: *Pty, cwd: []const u8) !void {
@@ -7040,6 +6766,7 @@ fn initRenameTestServer(allocator: std.mem.Allocator, loop: *io.Loop, start_time
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .signal_pipe_fds = .{ -1, -1 },
         .start_time_ms = start_time_ms,
+        .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
     };
 }
@@ -7474,6 +7201,7 @@ test "handleBreakPaneReply - non-ok refusal sends Response with reason" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7561,6 +7289,7 @@ test "handleBreakPaneReply - unknown request_id silently dropped" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7609,6 +7338,7 @@ test "handleBreakPaneReply - malformed payload silently dropped" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7640,6 +7370,7 @@ test "handleBreakPaneReply - ok path broadcasts to non-broker attached clients" 
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7755,6 +7486,7 @@ test "sweepPending - expired entries reply broker_timeout and drop" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -7848,6 +7580,7 @@ test "removeClient - broker disconnect replies broker_timeout to CLI" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
         .exit_on_idle = false,
     };
@@ -7942,6 +7675,7 @@ test "drainPendingForShutdown - replies broker_timeout to all and clears" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
         .exit_on_idle = false,
     };
@@ -8047,6 +7781,7 @@ test "removeClient - cli disconnect drops pending without reply" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
         .exit_on_idle = false,
     };
@@ -8141,6 +7876,7 @@ test "handleBreakPane - zero attached clients sends synchronous session_not_atta
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -8218,6 +7954,7 @@ test "handleBreakPane - broker-pick is lowest Client.id among attached" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .pending = std.AutoHashMap(usize, PendingBreak).init(allocator),
+        .pending_forwards = std.AutoHashMap(u32, PendingForward).init(allocator),
         .signal_pipe_fds = undefined,
     };
     defer {
@@ -8941,6 +8678,7 @@ test "handleSpawnPlug - idempotent with same managed cmd" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -8993,6 +8731,7 @@ test "handleSpawnPlug - config conflict for external plug" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9035,6 +8774,7 @@ test "handleSpawnPlug - config conflict with different managed cmd" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9085,6 +8825,7 @@ test "handleSpawnPlug - config conflict with different restart policy" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9136,6 +8877,7 @@ test "handleSpawnPlug - stopped plug is removed for re-spawn" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9194,6 +8936,7 @@ test "handleSpawnPlug - config-owned name rejected with PlugConfigOwned" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9246,6 +8989,7 @@ test "handleSpawnPlug - rpc-owned name keeps existing dedup behavior" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9316,6 +9060,7 @@ test "onPlugExit - reaps exited process" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9373,6 +9118,7 @@ test "onPlugExit - no restart when killed_by_server" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9429,6 +9175,7 @@ test "onPlugExit - no restart when shutting_down" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
         .shutting_down = true,
     };
@@ -9484,6 +9231,7 @@ test "handleRegisterPlug - valid token succeeds" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9555,6 +9303,7 @@ test "handleRegisterPlug - missing token returns error" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9601,6 +9350,7 @@ test "handleRegisterPlug - wrong token returns PermissionDenied" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9665,6 +9415,7 @@ test "handleRegisterPlug - unknown plug name returns PermissionDenied" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9712,6 +9463,7 @@ test "handleRegisterPlug - already registered returns error" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9759,6 +9511,7 @@ test "onPlugExit - defers when registered" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9821,6 +9574,7 @@ test "onPlugExit - proceeds when not registered" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9886,6 +9640,7 @@ test "finishClose - deferred restart when pid null" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -9959,6 +9714,7 @@ test "handleSpawnPlug - registered but pidless treated as active" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -10026,6 +9782,7 @@ test "handleRegisterPlug - cancels pending restart timer on late registration" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -10123,6 +9880,7 @@ test "next_client_id is monotonic and unique" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -10141,9 +9899,9 @@ test "next_client_id is monotonic and unique" {
     const third = server.next_client_id;
     server.next_client_id += 1;
 
-    try testing.expectEqual(@as(u64, 1), first);
-    try testing.expectEqual(@as(u64, 2), second);
-    try testing.expectEqual(@as(u64, 3), third);
+    try testing.expectEqual(@as(usize, 1), first);
+    try testing.expectEqual(@as(usize, 2), second);
+    try testing.expectEqual(@as(usize, 3), third);
     try testing.expect(first != second and second != third and first != third);
 }
 
@@ -10162,6 +9920,7 @@ test "handleNotifyPlugClient - delivers to exact client" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -10238,6 +9997,7 @@ test "handleNotifyPlugClient - unknown client_id returns error" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -10272,6 +10032,7 @@ test "forwardPtyClientEvent - delivers to subscribed plug" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
@@ -10335,6 +10096,7 @@ test "handleRegisterPlug - replays client_connected for existing clients" {
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .signal_pipe_fds = undefined,
         .plugs = std.StringHashMap(*Client).init(testing.allocator),
+        .pending = std.AutoHashMap(usize, PendingBreak).init(testing.allocator),
         .pending_forwards = std.AutoHashMap(u32, PendingForward).init(testing.allocator),
     };
     defer {
