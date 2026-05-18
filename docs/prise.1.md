@@ -62,6 +62,11 @@ Manage tabs.
 
 # OPTIONS
 
+**-d**, **--detached**
+:   Used with **-s**: create the session without attaching to it. A detached PTY
+    is spawned on the server and a session file is written. Attach later with
+    **prise session attach** *name*.
+
 **-h**, **--help**
 :   Show help message.
 
