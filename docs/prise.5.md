@@ -163,52 +163,94 @@ The **tab_bar** table configures the tab bar.
 :   Show the tab bar even with only one tab. Default: **false**
 
 **render**
-:   Optional custom renderer function. It receives **(tabs, screen_width,
-    theme)** and must return an array of segments compatible with
-    **prise.Text()**.
+:   Optional custom tab bar renderer. Overrides the default design.
+    Signature: `function(tabs, screen_width, theme, ctx, opts) -> TabBarLayout`.
+    Returns a structured layout with three required slots plus two
+    optional renderer-owned gutter fields:
+
+    **prefix**
+    :   List of styled segments drawn at the left edge. Never clipped.
+        Core reserves this width before measuring tabs — use it for
+        session headers, mode indicators, or any fixed-position content
+        that must always be visible.
+
+    **tabs**
+    :   List of `{tab_index = N, label_segments = {...}}` entries, one
+        per tab. `tab_index` is the tab's index in the full unsliced
+        `tabs` input and drives click-region mapping. `label_segments`
+        carries the tab's label segments only — the inter-tab separator
+        is a 1-cell space injected by the core compositor between
+        adjacent visible tabs and is not part of a tab's segment list
+        or clippable width. Core applies centered-focus windowing (tmux
+        `format_draw_put_list`-style) to this slot: the active tab stays
+        visually centered when space permits, with cell-precise clipping
+        of boundary tabs that only partially fit.
+
+    **suffix**
+    :   List of styled segments drawn at the right edge. Never clipped.
+        May be empty. Reserved width mirrors **prefix**: use for status
+        segments, clocks, or other right-anchored content.
+
+    **gutter_left**, **gutter_right** (optional)
+    :   When the renderer wants to own the gutter glyph, spacing, and
+        theming, return both fields — each is either a single
+        `{text = string, style = table?}` segment or a list of such
+        segments. The two fields are all-or-nothing: returning one
+        without the other is malformed and triggers the whole-bar kill
+        path. Core still owns show/hide: whichever side's tabs fit
+        receives no gutter; whichever side overflows gets the renderer's
+        segment(s) spliced verbatim. When both fields are absent, core
+        falls back to the plain-string `gutter_left` / `gutter_right`
+        config glyphs.
+
+    The `ctx` argument is reserved for future fields and is currently
+    empty. `opts` is a filtered table carrying only
+    `{gutter_left, gutter_right}` — the plain-string glyph values from
+    `tab_bar` config — so renderers can author themed gutter segments
+    from the same source of truth as the fallback path. `tabs` is always
+    the full unsliced list — core handles windowing from the returned
+    `TabBarLayout`. Width math must use `prise.gwidth`; `#str` miscounts
+    wide graphemes. On renderer error (non-table return, missing slot,
+    malformed gutter field, pcall failure) the tab strip draws empty for
+    the frame and a single warn is logged via `prise.log.warn`
+    (subsequent failures are silent — log hygiene at 60fps).
+
+**measure**
+:   Required when a custom **render** is set and the tab strip may overflow.
+    Signature: `function(tab) -> cells` — returns the integer label-only
+    cell-width the renderer will draw for the given tab (tabs slot only;
+    **prefix** and **suffix** widths are measured directly from their
+    returned segments). Must NOT include the inter-tab separator — core
+    injects a 1-cell space between adjacent visible tabs and accounts for
+    it internally. Core calls this once per tab per frame to compute the
+    centered-focus window: the active tab stays centered when possible;
+    boundary tabs clip cell-precise against the available budget. Width
+    math must use `prise.gwidth`; `#str` miscounts wide graphemes.
+    Returning `0` marks the tab as zero-width (windowing skips over it).
+    If **measure** is absent when **render** is set, a warn is logged and
+    the tab strip draws empty — existing renderers must return
+    `TabBarLayout` and provide **measure**.
+
+**gutter_left**
+:   Plain-string glyph rendered at the left edge when one or more tabs
+    are hidden off the left side of the viewport. Only appears when tabs
+    are actually hidden — never shown when the full strip fits.
+    Signature: `string`. Default: **"<"**. Cell-width is measured via
+    `prise.gwidth`, so multi-cell glyphs work correctly. Used by the
+    built-in renderer and as the fallback when a custom **render**
+    returns no gutter fields; custom renderers that want themed gutter
+    segments should return them via `TabBarLayout.gutter_left` /
+    `gutter_right` instead.
+
+**gutter_right**
+:   Plain-string glyph rendered at the right edge when one or more tabs
+    are hidden off the right side of the viewport. Mirrors **gutter_left**:
+    only appears when tabs are actually hidden. Signature: `string`.
+    Default: **">"**.
 
 **format_title**
-:   Optional function that formats automatically-derived tab titles before they
-    are passed to the renderer. Explicitly renamed tab titles are not reformatted.
-
-When **render** is provided, each tab entry includes:
-
-- **index** - 1-based tab index
-- **title** - Display title for the tab
-- **is_explicit_title** - True when the title was set explicitly
-- **is_active** - True for the active tab
-- **is_hovered** - True when the pointer is hovering over the tab
-- **is_close_hovered** - True when the pointer is hovering over the tab close button
-- **pane_count** - Number of panes in the tab
-- **is_zoomed** - True when the tab currently has a zoomed pane
-
-Returned segments may include **tab_index** to mark which tab they belong to.
-This lets hover and click regions match the rendered tab structure exactly.
-
-Example:
-
-```lua
-ui.setup({
-    tab_bar = {
-        render = function(tabs, screen_width, theme)
-            local segments = {}
-            for _, tab in ipairs(tabs) do
-                local label = string.format(" %d:%s (%d) ", tab.index, tab.title, tab.pane_count)
-                table.insert(segments, {
-                    text = label,
-                    tab_index = tab.index,
-                    style = {
-                        bg = tab.is_active and theme.bg4 or theme.bg2,
-                        fg = theme.fg_bright,
-                        bold = tab.is_zoomed,
-                    },
-                })
-            end
-            return segments
-        end,
-    },
-})
-```
+:   Optional `function(title, tab_index) -> string` applied to auto-derived
+    tab titles (not explicit renamed titles). Default: no formatting.
 
 # LAYOUTS
 

@@ -173,6 +173,21 @@ Custom UIs may also expose optional helpers used by configuration code:
 - **execute_action(name)**: Run a built-in action handler by name
 - **setup(opts)**: Apply UI-specific configuration before the UI is returned
 
+The built-in tiling UI's `tab_bar.render` returns a structured layout with
+three slots — `{prefix, tabs, suffix}` — so renderers declare fixed left/right
+content separately from the windowed tab list. Per-tab entries carry
+`label_segments` (label only); core injects a 1-cell separator between each
+adjacent pair of visible tabs so separators are never part of a tab's
+clippable width. Core applies centered-focus windowing and cell-precise edge
+clipping to the `tabs` slot only; `prefix` and `suffix` are never clipped.
+Renderers can also emit themed gutter segments via optional `gutter_left` /
+`gutter_right` fields on the returned `TabBarLayout` (symmetric,
+all-or-nothing); core still decides which side to show based on overflow,
+then splices the renderer's segment(s) verbatim. The `tab_bar` config's
+plain-string `gutter_left` / `gutter_right` fields drive the fallback when
+the renderer emits no gutter fields. See **prise**(5) for the full
+`TabBarLayout` definition.
+
 # SEE ALSO
 
 [prise(1)](prise.1.html), [prise(5)](prise.5.html)

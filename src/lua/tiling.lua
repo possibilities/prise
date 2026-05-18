@@ -249,9 +249,39 @@ local POWERLINE_SYMBOLS = {
 ---@field pane_count number Number of panes in this tab
 ---@field is_zoomed boolean True if this tab has a zoomed pane
 
+---Viewport context passed to custom render functions
+---@class TabRenderContext
+---@field scroll_offset number Cells from the left edge of the full strip that the visible slice starts at
+
+---Structured tab bar layout returned by custom render functions
+---@class TabBarLayout
+---@field prefix table[]   -- styled segments drawn at left edge, never clipped
+---@field tabs table[]     -- [{ tab_index = N, label_segments = {...} }, ...]; label segments only; the inter-tab separator is owned by the core compositor and is never part of a tab's clippable width.
+---@field suffix table[]   -- styled segments drawn at right edge (may be empty)
+---@field gutter_left? table|table[]  -- single segment or segment list; core still owns show/hide by overflow. All-or-nothing with gutter_right.
+---@field gutter_right? table|table[] -- single segment or segment list; core still owns show/hide by overflow. All-or-nothing with gutter_left.
+
+---Filtered opts passed as the 5th arg to TabRenderFunction. Carries only the
+---plain-string gutter glyphs from `config.tab_bar` — tight contract, expand
+---only when future items demand new fields.
+---@class TabRenderOpts
+---@field gutter_left string
+---@field gutter_right string
+
 ---Custom render function for tab bar
----Must return an array of segments compatible with prise.Text()
----@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme): table[]
+---Must return a TabBarLayout with prefix/tabs/suffix slots. The core composes
+---the final strip from these three slots and applies centered-focus windowing
+---plus cell-precise edge clipping to the tabs slot. When the renderer emits
+---optional `gutter_left` + `gutter_right` segment fields (symmetric, all-or-
+---nothing), core splices them verbatim on the sides that actually need a
+---gutter (overflow) and drops them on sides that don't.
+---@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme, ctx?: TabRenderContext, opts?: TabRenderOpts): TabBarLayout
+
+---Measure function for tab bar viewport fit
+---Must return the integer cell-width the renderer will draw for a single tab.
+---Called once per tab per frame when viewport scrolling is active; missing when
+---no custom `render` is set, or when the renderer opts out of scrolling.
+---@alias TabMeasureFunction fun(tab: TabInfo): integer
 
 ---Optional function to format tab titles for display
 ---@alias TabFormatFunction fun(title: string, tab_index: number): string
@@ -259,6 +289,9 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseTabBarConfig
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
 ---@field render? TabRenderFunction Custom tab bar renderer (overrides default design)
+---@field measure? TabMeasureFunction Cell-width oracle for viewport scrolling (custom renderer only)
+---@field gutter_left? string Glyph shown at the left edge when tabs are hidden off-screen; plain-string only (default: "<")
+---@field gutter_right? string Glyph shown at the right edge when tabs are hidden off-screen; plain-string only (default: ">")
 ---@field format_title? TabFormatFunction Optional function to format tab titles (default: no formatting)
 
 ---Keybinds are a map from key_string to action name
@@ -338,6 +371,8 @@ local config = {
     tab_bar = {
         show_single_tab = false,
         render = nil, -- Use default built-in design
+        gutter_left = "<", -- Glyph shown when tabs are hidden off the left edge
+        gutter_right = ">", -- Glyph shown when tabs are hidden off the right edge
         format_title = nil, -- Use titles as-is
     },
     floating = {
@@ -444,9 +479,16 @@ local state = {
         rename_target = nil, -- The session being renamed
     },
     -- Tab bar hit regions: array of {start_x, end_x, tab_index}
+    -- Recorded in on-screen coordinates (0..screen_cols) AFTER any viewport
+    -- shift, so the mouse consumer at `d.x < 1` compares directly.
     tab_regions = {},
     -- Tab close button regions: array of {start_x, end_x, tab_index}
     tab_close_regions = {},
+    -- Latch for `config.tab_bar.render` callback failure. Once the callback
+    -- errors / returns a malformed layout (missing prefix/tabs/suffix, bad tab
+    -- entries), we log warn ONCE and render an empty strip for the rest of
+    -- the session. Session-scoped so a config hot-reload via M.setup() resets.
+    tab_bar_render_warned = false,
     -- Currently hovered tab index (nil if none)
     hovered_tab = nil,
     -- Currently hovered close button tab index (nil if none)
@@ -5391,102 +5433,616 @@ local function build_custom_tab_infos()
     return tab_infos
 end
 
----Build tab bar with custom renderer
----Calculates actual tab positions from rendered segments to ensure hover detection works correctly
----@return table
+---Compute the focus-centre windowing offset into the tab strip.
+---Pure function: takes tab widths + active index + cell budget, returns the
+---start offset (cells from left of the full strip) and total width. Mirrors
+---tmux's `format_draw_put_list`: when the strip overflows the budget, centre
+---the active tab in the window; when the focus-centre minus half-budget would
+---underflow, clamp start to 0; when it would overrun the tail, clamp to the
+---max.
+---@param tab_widths integer[]
+---@param active_idx integer 1-based; out-of-range → treated as 1.
+---@param budget integer Cell budget for tabs. Non-positive → treated as 1.
+---@return { start: integer, total_width: integer }
+local function compute_focus_window(tab_widths, active_idx, budget)
+    local n = #tab_widths
+    if n == 0 then
+        return { start = 0, total_width = 0 }
+    end
+    local cols = (budget and budget >= 1) and budget or 1
+
+    -- Total strip width = sum(label_widths) + (N-1) core-injected separators.
+    local total_width = 0
+    for i = 1, n do
+        local w = tab_widths[i] or 0
+        if w < 0 then
+            w = 0
+        end
+        total_width = total_width + w
+    end
+    if n > 1 then
+        total_width = total_width + (n - 1)
+    end
+
+    if total_width <= cols then
+        return { start = 0, total_width = total_width }
+    end
+
+    local a = active_idx
+    if type(a) ~= "number" or a < 1 or a > n then
+        a = 1
+    end
+
+    -- Focus-start accounts for separators between tabs 1..a-1.
+    local focus_start = 0
+    for i = 1, a - 1 do
+        local w = tab_widths[i] or 0
+        if w < 0 then
+            w = 0
+        end
+        focus_start = focus_start + w + 1 -- +1 for the separator after tab i
+    end
+    local active_w = tab_widths[a] or 0
+    if active_w < 0 then
+        active_w = 0
+    end
+    local focus_end = focus_start + active_w
+    local focus_centre = focus_start + math.floor((focus_end - focus_start) / 2)
+
+    -- Explicit underflow branch — not a post-hoc math.max clamp. See risks.
+    local half = math.floor(cols / 2)
+    local start
+    if focus_centre >= half then
+        start = focus_centre - half
+    else
+        start = 0
+    end
+    local max_start = total_width - cols
+    if max_start < 0 then
+        max_start = 0
+    end
+    if start > max_start then
+        start = max_start
+    end
+
+    return { start = start, total_width = total_width }
+end
+
+---Cumulative label-start cell of tab `idx` (1-based), accounting for the
+---core-injected separators between each prior adjacent pair. Local helper
+---for the visible-range math; separator width is hard-coded to 1 cell.
+---@param tab_widths integer[]
+---@param idx integer
+---@return integer
+local function cum_label_start(tab_widths, idx)
+    local c = 0
+    for i = 1, idx - 1 do
+        local w = tab_widths[i] or 0
+        if w < 0 then
+            w = 0
+        end
+        c = c + w + 1 -- +1 for the separator between tab i and tab i+1
+    end
+    return c
+end
+
+---Walk cumulative widths to derive the 1-based inclusive visible tab range
+---plus the leading/trailing cell clips for the boundary tabs. Accounts for
+---the core-injected 1-cell inter-tab separator (never before first, never
+---after last). Honors the snap-past-separator rule: if `start` lands in a
+---separator cell, advance to the next tab's first cell; if `window_end`
+---lands in a separator cell, clip back to the previous tab's last cell.
+---@param tab_widths integer[] Label-only widths; separators added internally.
+---@param start integer Cells from left of the full strip where window begins.
+---@param effective_budget integer Cell width of the (gutter-adjusted) window.
+---@return { first_idx: integer, last_idx: integer, leading_clip: integer, trailing_clip: integer }
+local function derive_visible_range(tab_widths, start, effective_budget)
+    local n = #tab_widths
+    if n == 0 or effective_budget <= 0 then
+        return { first_idx = 0, last_idx = 0, leading_clip = 0, trailing_clip = 0 }
+    end
+
+    local window_end = start + effective_budget
+    local first_idx, last_idx = nil, nil
+    local first_cum_start, last_cum_end = 0, 0
+    local cursor = 0
+    for i = 1, n do
+        local w = tab_widths[i] or 0
+        if w < 0 then
+            w = 0
+        end
+        if cursor + w > start and cursor < window_end then
+            if not first_idx then
+                first_idx = i
+                first_cum_start = cursor
+            end
+            last_idx = i
+            last_cum_end = cursor + w
+        end
+        cursor = cursor + w + (i < n and 1 or 0)
+    end
+
+    if not first_idx then
+        return { first_idx = 0, last_idx = 0, leading_clip = 0, trailing_clip = 0 }
+    end
+
+    local leading_clip = math.max(0, start - first_cum_start)
+    local trailing_clip = math.max(0, last_cum_end - window_end)
+
+    -- Snap-past-separator (left): leading clip consumed the whole first tab
+    -- → `start` sat inside the following separator cell. Advance to next tab.
+    local first_w = tab_widths[first_idx] or 0
+    if first_w > 0 and leading_clip >= first_w and first_idx < last_idx then
+        first_idx = first_idx + 1
+        first_cum_start = cum_label_start(tab_widths, first_idx)
+        leading_clip = math.max(0, start - first_cum_start)
+    end
+
+    -- Snap-past-separator (right): trailing clip consumed the whole last tab
+    -- → `window_end` sat inside the preceding separator cell. Clip back.
+    local last_w = tab_widths[last_idx] or 0
+    if last_w > 0 and trailing_clip >= last_w and first_idx < last_idx then
+        last_idx = last_idx - 1
+        local w = tab_widths[last_idx] or 0
+        if w < 0 then
+            w = 0
+        end
+        last_cum_end = cum_label_start(tab_widths, last_idx) + w
+        trailing_clip = math.max(0, last_cum_end - window_end)
+    end
+
+    return {
+        first_idx = first_idx,
+        last_idx = last_idx,
+        leading_clip = leading_clip,
+        trailing_clip = trailing_clip,
+    }
+end
+
+---Decide whether to show the left/right gutter glyphs and narrow the tab
+---window to make room for them. Gutters appear only when tabs are hidden on
+---that side. If the combined gutter width exceeds budget, drop both.
+---@param start integer
+---@param effective_budget integer
+---@param total_width integer
+---@param gutter_left_w integer
+---@param gutter_right_w integer
+---@return { show_left: boolean, show_right: boolean, adjusted_start: integer, adjusted_budget: integer }
+local function apply_gutters(start, effective_budget, total_width, gutter_left_w, gutter_right_w)
+    local show_left = start > 0
+    local show_right = (start + effective_budget) < total_width
+
+    -- Narrow-terminal guard: if we couldn't fit the glyphs plus at least one
+    -- cell of tab, drop both gutters rather than let them dominate.
+    if effective_budget < gutter_left_w + gutter_right_w + 1 then
+        show_left = false
+        show_right = false
+    end
+
+    local left_w = show_left and gutter_left_w or 0
+    local right_w = show_right and gutter_right_w or 0
+    local adjusted_budget = effective_budget - left_w - right_w
+    if adjusted_budget < 0 then
+        adjusted_budget = 0
+    end
+    local adjusted_start = start + left_w
+
+    return {
+        show_left = show_left,
+        show_right = show_right,
+        adjusted_start = adjusted_start,
+        adjusted_budget = adjusted_budget,
+    }
+end
+
+---Clip a boundary tab's segments by cell-precise leading/trailing counts via
+---`prise.cell_substring`. Flattens segments into a single string for the
+---slice, preserving the first segment's style on the returned segment.
+---@param segments table[] Array of `{ text = string, style = table? }`.
+---@param leading_clip_cells integer
+---@param trailing_clip_cells integer
+---@return table[] Single-entry segment list (or empty array if the clip empties it).
+local function clip_boundary_tab(segments, leading_clip_cells, trailing_clip_cells)
+    if not segments or #segments == 0 then
+        return {}
+    end
+    local parts = {}
+    for _, seg in ipairs(segments) do
+        parts[#parts + 1] = seg.text or ""
+    end
+    local flat = table.concat(parts)
+    local total_cells = prise.gwidth(flat)
+
+    if leading_clip_cells > 0 then
+        flat = prise.cell_substring(flat, leading_clip_cells, total_cells)
+    end
+    if trailing_clip_cells > 0 then
+        local current = prise.gwidth(flat)
+        local new_end = current - trailing_clip_cells
+        if new_end < 0 then
+            new_end = 0
+        end
+        flat = prise.cell_substring(flat, 0, new_end)
+    end
+
+    local style = segments[1] and segments[1].style or {}
+    return { { text = flat, style = style } }
+end
+
+---True when `v` is a segment list (array of `{text=...}` entries) rather than
+---a single segment. Distinguishes `{text="x"}` (single) from `{{text="x"}}`
+---(list) by the presence of a `text` field at the top level.
+---@param v table
+---@return boolean
+local function is_segment_list(v)
+    return v[1] ~= nil and v.text == nil
+end
+
+---Append a gutter slot's segments — accepts either a single segment or a list
+---of segments. Nil skips entirely.
+---@param out table[]
+---@param slot table|table[]|nil
+local function append_gutter_slot(out, slot)
+    if slot == nil then
+        return
+    end
+    if is_segment_list(slot) then
+        for _, s in ipairs(slot) do
+            out[#out + 1] = s
+        end
+    else
+        out[#out + 1] = slot
+    end
+end
+
+---Concatenate prefix + optional left gutter + visible-tab segments + optional
+---right gutter + suffix into a single flat segment list for `prise.Text`. A
+---single-cell `" "` separator is injected between each adjacent pair of
+---visible tabs (never before the first, never after the last). Zero-width
+---boundary tabs (label clipped to 0 cells) get no adjacent separator on
+---their inner side — the snap-past-separator rule in `derive_visible_range`
+---prevents this shape from arising, and we defensively skip separators next
+---to empty tab segment lists here too.
+---Gutter slots accept single segment OR segment list (renderer-owned gutters).
+---@param prefix_segs table[]
+---@param gutter_l_seg table|table[]|nil nil to skip
+---@param visible_tab_segs_list table[][] Array of each visible tab's segments.
+---@param gutter_r_seg table|table[]|nil nil to skip
+---@param suffix_segs table[]
+---@return table[]
+local function compose_layout_segments(prefix_segs, gutter_l_seg, visible_tab_segs_list, gutter_r_seg, suffix_segs)
+    local out = {}
+    for _, s in ipairs(prefix_segs or {}) do
+        out[#out + 1] = s
+    end
+    append_gutter_slot(out, gutter_l_seg)
+    local tab_list = visible_tab_segs_list or {}
+    for i, tab_segs in ipairs(tab_list) do
+        if i > 1 and #tab_segs > 0 and #tab_list[i - 1] > 0 then
+            out[#out + 1] = { text = " ", style = {} }
+        end
+        for _, s in ipairs(tab_segs) do
+            out[#out + 1] = s
+        end
+    end
+    append_gutter_slot(out, gutter_r_seg)
+    for _, s in ipairs(suffix_segs or {}) do
+        out[#out + 1] = s
+    end
+    return out
+end
+
+---Walk the visible tabs and emit on-screen click regions keyed by each tab's
+---original `tab_index`. x-offset starts at `prefix_w + gutter_l_w`; advances
+---by `tab.width + 1` between visible tabs (the core-injected inter-tab
+---separator) and by `tab.width` on the last. Gutters and separator cells are
+---NOT clickable — half-open semantics (`start_x` inclusive, `end_x` exclusive)
+---keep separator cells out of every region.
+---@param prefix_w integer
+---@param gutter_l_w integer 0 when the left gutter is hidden.
+---@param visible_tabs { tab_index: integer, width: integer }[]
+---@param gutter_r_w integer Unused in x-math but documents the layout.
+---@return { start_x: integer, end_x: integer, tab_index: integer }[]
+local function derive_click_regions(prefix_w, gutter_l_w, visible_tabs, gutter_r_w)
+    local _ = gutter_r_w -- doc only
+    local tabs = visible_tabs or {}
+    local regions = {}
+    local x = prefix_w + gutter_l_w
+    for i, tab in ipairs(tabs) do
+        regions[#regions + 1] = {
+            start_x = x,
+            end_x = x + tab.width,
+            tab_index = tab.tab_index,
+        }
+        -- Advance past the tab; inject separator spacing between adjacent tabs
+        -- (never after the last). Zero-width tabs contribute no separator.
+        x = x + tab.width
+        if i < #tabs and tab.width > 0 and tabs[i + 1].width > 0 then
+            x = x + 1
+        end
+    end
+    return regions
+end
+
+---Measure a tab's on-screen cell width by concatenating its segments' text.
+---Local helper — not exposed; tests drive the segment layout directly.
+---@param segments table[]
+---@return integer
+local function measure_tab_segments(segments)
+    local n = 0
+    for _, seg in ipairs(segments or {}) do
+        n = n + prise.gwidth(seg.text or "")
+    end
+    return n
+end
+
+---Emit a gutter segment from a plain-string config value. Returns nil when
+---the config value is absent or empty — caller treats nil as "no gutter".
+---Width is derived via `prise.gwidth`. Default-renderer fallback only; the
+---styled-segment form used to live here and is now expressed through the
+---renderer's `TabBarLayout.gutter_left`/`gutter_right` fields instead.
+---@param gutter_cfg string|nil
+---@return table? segment, integer width
+local function build_gutter_segment(gutter_cfg)
+    if gutter_cfg == nil or gutter_cfg == "" then
+        return nil, 0
+    end
+    if type(gutter_cfg) == "string" then
+        return { text = gutter_cfg, style = {} }, prise.gwidth(gutter_cfg)
+    end
+    return nil, 0
+end
+
+---Warn-once (latched on `state.tab_bar_render_warned`) + return an empty
+---composed strip for malformed renderer output or runtime errors. Keeps the
+---tab bar blank for the rest of the session rather than flickering warns.
+---@param msg string
+---@param prefix_segs table[]?
+---@param suffix_segs table[]?
+---@return table[]
+local function degraded_tab_bar(msg, prefix_segs, suffix_segs)
+    if not state.tab_bar_render_warned then
+        state.tab_bar_render_warned = true
+        prise.log.warn(msg)
+    end
+    state.tab_regions = {}
+    state.tab_close_regions = {}
+    -- Compose prefix + suffix when they're structurally valid; callers pass
+    -- nil when even that isn't safe.
+    return compose_layout_segments(prefix_segs or {}, nil, {}, nil, suffix_segs or {})
+end
+
+---Validate a single segment shape: table with string `text` and optional
+---table `style`. Returns nil on success or a reason string on failure.
+---@param seg any
+---@return string?
+local function validate_segment_shape(seg)
+    if type(seg) ~= "table" then
+        return "not a table"
+    end
+    if type(seg.text) ~= "string" then
+        return "segment.text not a string"
+    end
+    if seg.style ~= nil and type(seg.style) ~= "table" then
+        return "segment.style not a table"
+    end
+    return nil
+end
+
+---Validate an optional gutter-slot value: either a single segment or a list
+---of segments (array where each entry passes `validate_segment_shape`).
+---Nil is accepted by the caller — this only runs when the field is present.
+---@param gutter any
+---@param field_name string For error context ("gutter_left" / "gutter_right").
+---@return string?
+local function validate_gutter_field(gutter, field_name)
+    if type(gutter) ~= "table" then
+        return "render()." .. field_name .. " not a table"
+    end
+    -- List form: detect via numeric first entry with no top-level `text`.
+    if gutter[1] ~= nil and gutter.text == nil then
+        for i, seg in ipairs(gutter) do
+            local bad = validate_segment_shape(seg)
+            if bad then
+                return "render()." .. field_name .. "[" .. tostring(i) .. "] " .. bad
+            end
+        end
+        return nil
+    end
+    -- Single-segment form.
+    local bad = validate_segment_shape(gutter)
+    if bad then
+        return "render()." .. field_name .. " " .. bad
+    end
+    return nil
+end
+
+---Validate the layout shape returned by the custom renderer. Returns a
+---reason string on failure or nil on success.
+---@param layout any
+---@return string?
+local function validate_tab_bar_layout(layout)
+    if type(layout) ~= "table" then
+        return "render() returned non-table"
+    end
+    if type(layout.prefix) ~= "table" then
+        return "render().prefix not a table"
+    end
+    if type(layout.tabs) ~= "table" then
+        return "render().tabs not a table"
+    end
+    if type(layout.suffix) ~= "table" then
+        return "render().suffix not a table"
+    end
+    for i, tab in ipairs(layout.tabs) do
+        if
+            type(tab) ~= "table"
+            or type(tab.tab_index) ~= "number"
+            or math.floor(tab.tab_index) ~= tab.tab_index
+            or type(tab.label_segments) ~= "table"
+        then
+            return "render().tabs[" .. tostring(i) .. "] malformed"
+        end
+    end
+    -- All-or-nothing gutters: asymmetric presence is malformed. Renderer
+    -- proposes both sides; core decides which to show via overflow gate.
+    local has_left = layout.gutter_left ~= nil
+    local has_right = layout.gutter_right ~= nil
+    if has_left ~= has_right then
+        return "render() gutter_left/gutter_right must both be set or both absent"
+    end
+    if has_left then
+        local bad_l = validate_gutter_field(layout.gutter_left, "gutter_left")
+        if bad_l then
+            return bad_l
+        end
+        local bad_r = validate_gutter_field(layout.gutter_right, "gutter_right")
+        if bad_r then
+            return bad_r
+        end
+    end
+    return nil
+end
+
+---Slice `tabs` by visible range, clip boundary tabs by cell-precise leading /
+---trailing counts, and emit the flattened segment list + per-tab click-region
+---metadata. Local helper for `build_tab_bar_custom` — not exposed. Consumes
+---`tab.label_segments` (label-only; inter-tab separators are core-injected).
+---@param tabs { tab_index: integer, label_segments: table[] }[]
+---@param tab_widths integer[]
+---@param vr { first_idx: integer, last_idx: integer, leading_clip: integer, trailing_clip: integer }
+---@return table[][] visible_tab_segs_list, { tab_index: integer, width: integer }[] visible_tabs_meta
+local function slice_and_clip_visible(tabs, tab_widths, vr)
+    local segs_list = {}
+    local meta = {}
+    for i = vr.first_idx, vr.last_idx do
+        local tab = tabs[i]
+        local segs = tab.label_segments
+        local lead = (i == vr.first_idx) and vr.leading_clip or 0
+        local trail = (i == vr.last_idx) and vr.trailing_clip or 0
+        local width = tab_widths[i] - lead - trail
+        if width < 0 then
+            width = 0
+        end
+        if lead > 0 or trail > 0 then
+            segs = clip_boundary_tab(segs, lead, trail)
+        end
+        segs_list[#segs_list + 1] = segs
+        meta[#meta + 1] = { tab_index = tab.tab_index, width = width }
+    end
+    return segs_list, meta
+end
+
+---Measure a gutter slot's cell width when the renderer emits a segment or a
+---segment list. Mirrors `measure_tab_segments` but accepts the single-segment
+---shape too. Returns 0 for nil.
+---@param slot table|table[]|nil
+---@return integer
+local function measure_gutter_slot(slot)
+    if slot == nil then
+        return 0
+    end
+    if slot[1] ~= nil and slot.text == nil then
+        return measure_tab_segments(slot)
+    end
+    return prise.gwidth(slot.text or "")
+end
+
+---Pick gutter slots + widths for composition. Prefers renderer-owned gutters
+---when the layout carries them (all-or-nothing, validator-enforced); falls
+---back to the plain-string config glyphs otherwise.
+---@param layout table Validated TabBarLayout.
+---@return table|table[]|nil left_slot, table|table[]|nil right_slot, integer left_w, integer right_w
+local function pick_gutter_slots(layout)
+    if layout.gutter_left ~= nil then
+        return layout.gutter_left,
+            layout.gutter_right,
+            measure_gutter_slot(layout.gutter_left),
+            measure_gutter_slot(layout.gutter_right)
+    end
+    local left, left_w = build_gutter_segment(config.tab_bar.gutter_left)
+    local right, right_w = build_gutter_segment(config.tab_bar.gutter_right)
+    return left, right, left_w, right_w
+end
+
+---Build tab bar with custom renderer (structured layout).
+---Contract: renderer returns `{ prefix, tabs, suffix, gutter_left?, gutter_right? }`
+---where tabs is a list of `{ tab_index, label_segments }`. Core measures each
+---tab's label-only width, centres the focus window (accounting for the core-
+---injected 1-cell separators between adjacent visible tabs), decides gutter
+---visibility by overflow, splices renderer-owned gutter segments verbatim
+---(falling back to plain-string config glyphs when the renderer returns none),
+---applies cell-precise boundary clipping, injects inter-tab separators, and
+---emits click regions keyed by `tab_index`. Any renderer error / malformed
+---layout → warn-once + empty strip (latched on `state.tab_bar_render_warned`).
+---@return table[]
 local function build_tab_bar_custom()
-    local tab_infos = build_custom_tab_infos()
-
-    -- Enhanced custom renderer wrapper that tracks tab boundaries
-    local x_pos = 0
-
-    -- First, render segments and calculate their actual widths
-    local original_segments = config.tab_bar.render(tab_infos, state.screen_cols, THEME)
-
-    -- Build click regions from rendered segments
     state.tab_regions = {}
     state.tab_close_regions = {}
 
-    -- Check if custom renderer annotated segments with tab_index
-    local has_annotations = false
-    for _, seg in ipairs(original_segments) do
-        if seg.tab_index then
-            has_annotations = true
-            break
-        end
+    local tab_infos = build_custom_tab_infos()
+    local screen_cols = state.screen_cols
+    if screen_cols < 1 then
+        screen_cols = 1
     end
 
-    if has_annotations then
-        -- Use explicit annotations — renderer knows its own structure
-        local ax_pos = 0
-        for _, seg in ipairs(original_segments) do
-            local width = prise.gwidth(seg.text)
-            if seg.tab_index then
-                table.insert(state.tab_regions, {
-                    start_x = ax_pos,
-                    end_x = ax_pos + width,
-                    tab_index = seg.tab_index,
-                })
-            end
-            ax_pos = ax_pos + width
-        end
-    else
-        -- Fallback: existing heuristic for unannotated renderers
-        local segment_positions = {}
-        for _, seg in ipairs(original_segments) do
-            local width = prise.gwidth(seg.text)
-            table.insert(segment_positions, {
-                start_x = x_pos,
-                end_x = x_pos + width,
-            })
-            x_pos = x_pos + width
-        end
-
-        local tab_count = #tab_infos
-        local segment_count = #original_segments
-
-        if segment_count >= tab_count then
-            local segments_per_tab = segment_count / tab_count
-            local is_alternating = (segments_per_tab >= 1.5 and segments_per_tab <= 2.5)
-
-            if is_alternating then
-                for tab_idx = 1, tab_count do
-                    local seg_idx = (tab_idx - 1) * 2 + 1
-                    if seg_idx <= segment_count then
-                        local tab_start = segment_positions[seg_idx].start_x
-                        local sep_seg_idx = seg_idx + 1
-                        local tab_end
-                        if sep_seg_idx <= segment_count and tab_idx < tab_count then
-                            tab_end = segment_positions[sep_seg_idx].end_x
-                        else
-                            tab_end = segment_positions[seg_idx].end_x
-                        end
-
-                        table.insert(state.tab_regions, {
-                            start_x = tab_start,
-                            end_x = tab_end,
-                            tab_index = tab_idx,
-                        })
-                    end
-                end
-            else
-                for tab_idx = 1, tab_count do
-                    local first_seg = math.floor((tab_idx - 1) * segment_count / tab_count) + 1
-                    local last_seg = math.floor(tab_idx * segment_count / tab_count)
-
-                    if first_seg <= segment_count then
-                        table.insert(state.tab_regions, {
-                            start_x = segment_positions[first_seg].start_x,
-                            end_x = segment_positions[math.min(last_seg, segment_count)].end_x,
-                            tab_index = tab_idx,
-                        })
-                    end
-                end
-            end
-        end
+    local render_opts = {
+        gutter_left = config.tab_bar.gutter_left or "",
+        gutter_right = config.tab_bar.gutter_right or "",
+    }
+    local ok, layout = pcall(config.tab_bar.render, tab_infos, screen_cols, THEME, { scroll_offset = 0 }, render_opts)
+    if not ok then
+        return degraded_tab_bar("tab_bar.render raised: " .. tostring(layout))
+    end
+    local bad = validate_tab_bar_layout(layout)
+    if bad then
+        return degraded_tab_bar("tab_bar.render layout invalid: " .. bad)
     end
 
-    return original_segments
+    local prefix_segs, tabs, suffix_segs = layout.prefix, layout.tabs, layout.suffix
+    local prefix_w = measure_tab_segments(prefix_segs)
+    local suffix_w = measure_tab_segments(suffix_segs)
+
+    if prefix_w + suffix_w >= screen_cols then
+        return compose_layout_segments(prefix_segs, nil, {}, nil, suffix_segs)
+    end
+    local tab_budget = screen_cols - prefix_w - suffix_w
+    ---@cast tab_budget integer
+
+    local tab_widths = {}
+    for i, tab in ipairs(tabs) do
+        tab_widths[i] = measure_tab_segments(tab.label_segments)
+    end
+
+    local active_idx = state.active_tab
+    if type(active_idx) ~= "number" or active_idx < 1 or active_idx > #tabs then
+        active_idx = 1
+    end
+    local fw = compute_focus_window(tab_widths, active_idx, tab_budget)
+
+    local gutter_l_slot, gutter_r_slot, gutter_left_w, gutter_right_w = pick_gutter_slots(layout)
+    local ag = apply_gutters(fw.start, tab_budget, fw.total_width, gutter_left_w, gutter_right_w)
+
+    local vr = derive_visible_range(tab_widths, ag.adjusted_start, ag.adjusted_budget)
+    if vr.first_idx == 0 then
+        return compose_layout_segments(prefix_segs, nil, {}, nil, suffix_segs)
+    end
+
+    local visible_tab_segs_list, visible_tabs_meta = slice_and_clip_visible(tabs, tab_widths, vr)
+
+    state.tab_regions = derive_click_regions(
+        prefix_w,
+        ag.show_left and gutter_left_w or 0,
+        visible_tabs_meta,
+        ag.show_right and gutter_right_w or 0
+    )
+    return compose_layout_segments(
+        prefix_segs,
+        ag.show_left and gutter_l_slot or nil,
+        visible_tab_segs_list,
+        ag.show_right and gutter_r_slot or nil,
+        suffix_segs
+    )
 end
 
 ---Build the tab bar UI
@@ -5959,6 +6515,30 @@ M._test = {
     close_tab = close_tab,
     remove_pane_by_id = remove_pane_by_id,
     set_active_tab_index = set_active_tab_index,
+    compute_focus_window = compute_focus_window,
+    derive_visible_range = derive_visible_range,
+    apply_gutters = apply_gutters,
+    clip_boundary_tab = clip_boundary_tab,
+    compose_layout_segments = compose_layout_segments,
+    derive_click_regions = derive_click_regions,
+    build_tab_bar_custom = build_tab_bar_custom,
+    validate_tab_bar_layout = validate_tab_bar_layout,
+    measure_gutter_slot = measure_gutter_slot,
+    -- Test-only setters for the warn-once latch + render callback so tests
+    -- can drive the renderer-error posture without relying on test ordering.
+    reset_tab_bar_render_warned = function()
+        state.tab_bar_render_warned = false
+    end,
+    set_tab_bar_render = function(cb)
+        config.tab_bar.render = cb
+    end,
+    set_tab_bar_gutters = function(left, right)
+        config.tab_bar.gutter_left = left
+        config.tab_bar.gutter_right = right
+    end,
+    set_screen_cols = function(cols)
+        state.screen_cols = cols
+    end,
     set_state = function(test_state)
         state.tabs = test_state.tabs or {}
         state.active_tab = test_state.active_tab or 1
@@ -5970,6 +6550,7 @@ M._test = {
         state.hovered_close_tab = nil
         state.tab_regions = {}
         state.tab_close_regions = {}
+        state.tab_bar_render_warned = false
         state.pending_split = nil
         state.next_split_id = test_state.next_split_id or 1
     end,
